@@ -93,6 +93,11 @@ class MCPClient:
             "SP_SERVICE_URL",
             "IP_SHARED_DIR",
             "ANNOTATION_SERVICE_URL",
+            # Read by validate_pose and by the cofolding check in
+            # boltz_structure, and missing from this list until now -- so both
+            # fell back to the Compose hostname http://posebusters:8080 no
+            # matter what the pod's environment said.
+            "POSEBUSTERS_SERVICE_URL",
             # GPU access for the MCP server + the RL worker it spawns. Under
             # Apptainer --nv/--rocm, LD_LIBRARY_PATH points at the injected
             # driver libs (libcuda.so, ...); dropping it makes torch report
