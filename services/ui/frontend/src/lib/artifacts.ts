@@ -1,0 +1,282 @@
+// Copyright Advanced Micro Devices, Inc.
+// SPDX-License-Identifier: MIT
+
+import type {
+  InteractionsPanel,
+  MoleculePanel,
+  Panel,
+  PropertiesPanel,
+  StructurePanel,
+  TablePanel,
+  Turn,
+  TurnBlock,
+} from "../types/api";
+
+type ToolStep = Extract<TurnBlock, { kind: "tool" }>;
+
+export interface Sourced<T> {
+  item: T;
+  /** The tool that produced it. */
+  tool: string;
+  /** Epoch ms of the step that produced it. */
+  at: number;
+}
+
+export interface Artifacts {
+  structures: Sourced<StructurePanel>[];
+  molecules: Sourced<MoleculePanel>[];
+  tables: Sourced<TablePanel>[];
+  properties: Sourced<PropertiesPanel>[];
+  interactions: Sourced<InteractionsPanel>[];
+  steps: ToolStep[];
+}
+
+/**
+ * Whether a panel of a tool's result is a result. Older sessions stored a
+ * contact profile's fragments (an ester, a benzene) as molecules, and a
+ * listing of the shared volume names every complex ever predicted; those
+ * stay in the Assets tab.
+ */
+export function isResultPanel(tool: string, panel: Panel): boolean {
+  if (panel.kind === "molecule" && tool === "profile_interactions") return false;
+  if (panel.kind === "structure" && tool === "list_shared_assets") return false;
+  return true;
+}
+
+/** One key per distinct result, so a result shown twice is shown once. */
+export function panelKey(panel: Panel): string {
+  switch (panel.kind) {
+    case "structure":
+      return `s:${panel.path}`;
+    case "molecule":
+      return `m:${panel.smiles}`;
+    case "interactions":
+      return `i:${panel.structurePath ?? ""}:${panel.smiles ?? ""}:${panel.totalContacts}`;
+    case "properties":
+      return `p:${panel.tool}:${panel.molecules.map((m) => m.smiles).join(".")}`;
+    case "table":
+      return `t:${panel.tool}:${JSON.stringify(panel.columns)}:${panel.rows.length}`;
+  }
+}
+
+/**
+ * Everything the conversation produced, newest first and without duplicates:
+ * a structure by path, a molecule by SMILES, a contact profile by the
+ * structure it was measured on. Tables and predictions are kept per step,
+ * since two calls of the same tool are two different results.
+ */
+export function collectArtifacts(turns: Turn[]): Artifacts {
+  const structures = new Map<string, Sourced<StructurePanel>>();
+  const molecules = new Map<string, Sourced<MoleculePanel>>();
+  const interactions = new Map<string, Sourced<InteractionsPanel>>();
+  const tables: Sourced<TablePanel>[] = [];
+  const properties: Sourced<PropertiesPanel>[] = [];
+  const steps: ToolStep[] = [];
+
+  const latest = <T>(map: Map<string, Sourced<T>>, key: string, value: Sourced<T>) => {
+    map.delete(key);
+    map.set(key, value);
+  };
+
+  for (const turn of turns) {
+    if (turn.role !== "agent") continue;
+    for (const block of turn.blocks) {
+      if (block.kind !== "tool") continue;
+      steps.push(block);
+      for (const panel of block.result?.panels ?? []) {
+        if (!isResultPanel(block.name, panel)) continue;
+        const sourced = { tool: block.name, at: block.at };
+        switch (panel.kind) {
+          case "structure":
+            latest(structures, panel.path, { item: panel, ...sourced });
+            break;
+          case "molecule":
+            latest(molecules, panel.smiles, { item: panel, ...sourced });
+            break;
+          case "interactions":
+            // A complex profiled again replaces its earlier profile.
+            latest(interactions, panel.structurePath ?? panel.smiles ?? "", { item: panel, ...sourced });
+            break;
+          case "properties":
+            properties.push({ item: panel, ...sourced });
+            break;
+          case "table":
+            tables.push({ item: panel, ...sourced });
+            break;
+        }
+      }
+    }
+  }
+
+  // A profile of a complex predicted in another conversation still makes
+  // that complex part of this one, so its contacts can be shown on it.
+  for (const { item, tool, at } of interactions.values()) {
+    const path = item.structurePath;
+    if (!path || structures.has(path)) continue;
+    const name = path.split("/").pop() ?? path;
+    const format = /\.(cif|mmcif)$/i.test(name) ? "cif" : "pdb";
+    const structure: StructurePanel = { kind: "structure", tool, name, path, url: `/api/artifacts/${path}`, format };
+    if (item.smiles) structure.smiles = item.smiles;
+    structures.set(path, { item: structure, tool, at });
+  }
+
+  return {
+    structures: [...structures.values()].reverse(),
+    molecules: [...molecules.values()].reverse(),
+    tables: tables.reverse(),
+    properties: properties.reverse(),
+    interactions: [...interactions.values()].reverse(),
+    steps: steps.reverse(),
+  };
+}
+
+/**
+ * *next*, keeping each list of *previous* that holds the same results, and
+ * *previous* itself when nothing changed. Most events (thinking, text) add
+ * no result, so the panels memoised on these lists skip their work.
+ */
+export function keepUnchanged(previous: Artifacts, next: Artifacts): Artifacts {
+  const kept: Artifacts = {
+    structures: sameResults(previous.structures, next.structures),
+    molecules: sameResults(previous.molecules, next.molecules),
+    tables: sameResults(previous.tables, next.tables),
+    properties: sameResults(previous.properties, next.properties),
+    interactions: sameResults(previous.interactions, next.interactions),
+    steps: previous.steps.length === next.steps.length && previous.steps.every((step, i) => step === next.steps[i]) ? previous.steps : next.steps,
+  };
+  const keys = Object.keys(kept) as (keyof Artifacts)[];
+  return keys.every((key) => kept[key] === previous[key]) ? previous : kept;
+}
+
+/** Structures made up from a contact profile are new objects on every pass, so equal keys count as the same result. */
+function sameResults<T extends Panel>(previous: Sourced<T>[], next: Sourced<T>[]): Sourced<T>[] {
+  const same = (a: Sourced<T>, b: Sourced<T>) => a.tool === b.tool && a.at === b.at && (a.item === b.item || panelKey(a.item) === panelKey(b.item));
+  return previous.length === next.length && previous.every((entry, i) => same(entry, next[i])) ? previous : next;
+}
+
+/** The run a job file belongs to, from its path: "out_6b5e3f1a686f" or "job_d0cbeb98" give the id's first 8 characters. */
+export function runOf(path: string): string | null {
+  const match = /(?:^|\/)(?:out|job|batch)_([0-9a-f]{6,})/i.exec(path.replace(/\\/g, "/"));
+  return match ? match[1].slice(0, 8) : null;
+}
+
+/** What to call a structure: its ligand's name, or its file name without the extension. */
+export function structureTitle(panel: StructurePanel): string {
+  return panel.label || panel.name.replace(/\.(cif|mmcif|pdb)$/i, "");
+}
+
+/**
+ * Two paths to the same job file. Tools report them with different
+ * prefixes ("/shared/predictions/out_x/…" or "predictions/out_x/…"), so one
+ * must end with the other. Every run names its files mol_0_model_0.pdb, so
+ * the shared end must reach the run directory.
+ */
+export function sameFile(a: string, b: string): boolean {
+  if (a === b) return true;
+  const parts = (path: string) => path.replace(/\\/g, "/").split("/").filter(Boolean);
+  const [short, long] = [parts(a), parts(b)].sort((x, y) => x.length - y.length);
+  const tail = long.slice(-short.length);
+  return short.length >= 2 && short.every((part, i) => part === tail[i]) && (runOf(a) === runOf(b) || short.length === long.length);
+}
+
+/** Which of a ligand's poses a file holds: "model_0" for mol_3_model_0.pdb, whatever batch index the run gave the ligand. */
+const poseOf = (path: string) => (path.split("/").pop() ?? path).replace(/\.(cif|mmcif|pdb)$/i, "").replace(/^mol_\d+_/, "");
+
+interface StructureGroup {
+  panel: StructurePanel;
+  paths: string[];
+}
+
+const holds = (group: StructureGroup, path: string) => group.paths.some((known) => sameFile(known, path));
+const sameLigand = (group: StructureGroup, smiles: string | null | undefined, path: string) =>
+  !!smiles && group.panel.smiles === smiles && poseOf(group.panel.path) === poseOf(path);
+
+/**
+ * *older* updated by *newer*. One file mentioned again keeps what was known
+ * of it; another run of the same ligand replaces it, unless that is only a
+ * mention (a contact profile names the file it read but scores nothing).
+ */
+function updated(older: StructurePanel, newer: StructurePanel): StructurePanel {
+  const smiles = newer.smiles ?? older.smiles;
+  const label = newer.label || older.label;
+  const named = { ...(smiles && { smiles }), ...(label && { label }) };
+  if (!sameFile(older.path, newer.path)) return !newer.metrics && older.metrics ? older : { ...newer, ...named };
+  const metrics = older.metrics || newer.metrics ? { ...older.metrics, ...newer.metrics } : undefined;
+  const base = newer.metrics ? { ...older, ...newer } : { ...newer, ...older };
+  return { ...base, ...named, ...(metrics && { metrics }) };
+}
+
+/**
+ * The results of one turn, one card per result with its newest data, in the
+ * order they first came. A ligand scored again (another run, the same pose)
+ * is one structure; a complex profiled again is one contact profile, also
+ * when it was the other run of that ligand that was profiled.
+ */
+export function mergeTurnPanels(panels: Panel[]): Panel[] {
+  const groups: StructureGroup[] = [];
+  const groupOf = new Map<Panel, StructureGroup>();
+  for (const panel of panels) {
+    if (panel.kind !== "structure") continue;
+    let group = groups.find((known) => holds(known, panel.path) || sameLigand(known, panel.smiles, panel.path));
+    if (group) {
+      group.panel = updated(group.panel, panel);
+      if (!holds(group, panel.path)) group.paths.push(panel.path);
+    } else {
+      group = { panel, paths: [panel.path] };
+      groups.push(group);
+    }
+    groupOf.set(panel, group);
+  }
+
+  const out: Panel[] = [];
+  const placed = new Set<StructureGroup>();
+  const profiles: { slot: number; group: StructureGroup | undefined; paths: string[]; ligand: string }[] = [];
+  const slots = new Map<string, number>();
+  for (const panel of panels) {
+    if (panel.kind === "structure") {
+      const group = groupOf.get(panel) as StructureGroup;
+      if (placed.has(group)) continue;
+      placed.add(group);
+      out.push(group.panel);
+    } else if (panel.kind === "interactions") {
+      const path = panel.structurePath;
+      const group = path ? groups.find((known) => holds(known, path) || sameLigand(known, panel.smiles, path)) : undefined;
+      const ligand = `${panel.smiles ?? ""}:${panel.name ?? ""}`;
+      const known = profiles.find(
+        (profile) =>
+          (group && profile.group === group) ||
+          (path ? profile.paths.some((seen) => sameFile(seen, path)) : profile.paths.length === 0 && profile.ligand === ligand),
+      );
+      if (!known) {
+        profiles.push({ slot: out.length, group, paths: path ? [path] : [], ligand });
+        out.push(panel);
+        continue;
+      }
+      const older = out[known.slot] as InteractionsPanel;
+      // A failed re-profile does not hide the contacts already measured.
+      if (!panel.error || older.error) out[known.slot] = panel;
+      if (path) known.paths.push(path);
+    } else {
+      const key = panelKey(panel);
+      const slot = slots.get(key);
+      if (slot === undefined) {
+        slots.set(key, out.length);
+        out.push(panel);
+      } else {
+        out[slot] = panel;
+      }
+    }
+  }
+  return out;
+}
+
+/** The contact profile of a structure: measured on that file, or failing that on the same ligand in the same run. */
+export function contactsFor(structure: StructurePanel, all: Sourced<InteractionsPanel>[]): InteractionsPanel | null {
+  const byPath = all.find(({ item }) => item.structurePath && sameFile(item.structurePath, structure.path));
+  if (byPath) return byPath.item;
+  const run = runOf(structure.path);
+  const bySmiles = structure.smiles
+    ? all.find(({ item }) => item.smiles === structure.smiles && item.structurePath && runOf(item.structurePath) === run)
+    : undefined;
+  return bySmiles?.item ?? null;
+}

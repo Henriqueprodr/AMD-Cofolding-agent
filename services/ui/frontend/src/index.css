@@ -1,0 +1,396 @@
+/*
+ * Copyright Advanced Micro Devices, Inc.
+ * SPDX-License-Identifier: MIT
+ */
+
+@import "tailwindcss";
+
+/*
+ * Dark mode is driven by a class on <html>, not by the media query alone, so
+ * the user can override the system preference. index.html sets the class
+ * before React mounts; useTheme keeps it in step afterwards.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * `touch:` targets devices driven by a finger rather than a mouse.
+ *
+ * Tap targets are sized by INPUT TYPE, not by screen width. A 768px tablet is
+ * a touch device and needs large targets; a 768px browser window on a desktop
+ * does not. Sizing them at a width breakpoint gets one of those two wrong.
+ */
+@custom-variant touch (@media (pointer: coarse));
+
+/*
+ * Design tokens
+ * -------------
+ * Semantic names, not colour names, so light and dark are two values of the
+ * same idea and no component has to know which theme is active.
+ *
+ * "accent" is AMD red and is reserved for brand and primary actions.
+ * "science" colours label the three non-text data kinds and are reused by the
+ * cards, the badges and the 3D viewer, so a structure always reads as a
+ * structure wherever it appears.
+ */
+@theme {
+  --font-sans: Arial, "Helvetica Neue", Helvetica, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, "SF Mono", Menlo, monospace;
+
+  /* AMD corporate palette: red #ED1C24, orange #F26522, cyan #00C2DE, gold #C1A968. */
+  --color-accent: #ed1c24;
+  --color-accent-strong: #c8141b;
+  --color-accent-soft: #fde8e9;
+
+  --color-structure: #008ba0;
+  --color-molecule: #d9531a;
+  --color-table: #a38a3e;
+
+  /* Status: a check that passed, a healthy job, a live connection. */
+  --color-ok: #1f9d6a;
+  --color-warn: #c27c00;
+}
+
+/*
+ * Surfaces and text. Declared as plain custom properties (not @theme) because
+ * they change with the theme; Tailwind utilities reach them through the
+ * bg-surface / text-body style aliases registered below.
+ */
+@layer base {
+  :root {
+    --surface-page: #ffffff;
+    --surface-raised: #ffffff;
+    --surface-sunken: #f6f6f7;
+    --surface-inset: #f0f0f2;
+    --border-subtle: #eaeaed;
+    --border-strong: #d7d7dc;
+    --text-body: #0a0a0b;
+    --text-muted: #5e5e5e;
+    --text-faint: #85878a;
+    --shadow-card: 0 1px 2px rgb(0 0 0 / 0.04), 0 6px 20px rgb(0 0 0 / 0.05);
+  }
+
+  .dark {
+    --surface-page: #000000;
+    --surface-raised: #121214;
+    --surface-sunken: #0b0b0c;
+    --surface-inset: #1a1a1d;
+    --border-subtle: #212125;
+    --border-strong: #303036;
+    --text-body: #f4f4f5;
+    --text-muted: #9d9fa2;
+    --text-faint: #7a7c80;
+    --shadow-card: 0 1px 0 rgb(255 255 255 / 0.03), 0 8px 24px rgb(0 0 0 / 0.4);
+
+    /* Pure AMD red reads as text on black only when lifted a little. */
+    --color-accent: #ed1c24;
+    --color-accent-strong: #ff4048;
+    --color-accent-soft: #2a0d0e;
+
+    --color-structure: #00c2de;
+    --color-molecule: #f26522;
+    --color-table: #c1a968;
+
+    --color-ok: #3ccf91;
+    --color-warn: #f5a524;
+  }
+
+  * {
+    border-color: var(--border-subtle);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  /*
+   * Mobile browsers grow and shrink their toolbars as you scroll, and 100%
+   * resolves against the largest viewport. Without dvh the composer sits under
+   * the browser chrome on first paint. dvh follows the visible area instead.
+   */
+  @supports (height: 100dvh) {
+    html,
+    body,
+    #root {
+      height: 100dvh;
+    }
+  }
+
+  body {
+    margin: 0;
+    background: var(--surface-page);
+    color: var(--text-body);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    /* Stop the whole page rubber-banding on iOS; the transcript scrolls. */
+    overscroll-behavior-y: none;
+  }
+
+  /* Only show focus rings for keyboard users, but never remove them. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/*
+ * Semantic utilities. Components use these instead of raw colours, so a theme
+ * change is a token change and never a component change.
+ */
+@utility bg-page {
+  background-color: var(--surface-page);
+}
+@utility bg-raised {
+  background-color: var(--surface-raised);
+}
+@utility bg-sunken {
+  background-color: var(--surface-sunken);
+}
+@utility bg-inset {
+  background-color: var(--surface-inset);
+}
+@utility text-body {
+  color: var(--text-body);
+}
+@utility text-muted {
+  color: var(--text-muted);
+}
+@utility text-faint {
+  color: var(--text-faint);
+}
+@utility border-subtle {
+  border-color: var(--border-subtle);
+}
+@utility border-strong {
+  border-color: var(--border-strong);
+}
+@utility shadow-card {
+  box-shadow: var(--shadow-card);
+}
+
+/*
+ * Markdown produced by the agent. Tailwind resets heading and list styles, and
+ * the Typography plugin is more than this needs, so the few elements the agent
+ * actually emits are styled here.
+ */
+@layer components {
+  .markdown {
+    font-size: 0.8125rem;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+  }
+  .markdown > * + * {
+    margin-top: 0.625rem;
+  }
+  .markdown h1,
+  .markdown h2,
+  .markdown h3,
+  .markdown h4,
+  .markdown h5,
+  .markdown h6 {
+    font-weight: 600;
+    line-height: 1.35;
+  }
+  .markdown > :is(h1, h2, h3, h4, h5, h6):not(:first-child) {
+    margin-top: 1rem;
+  }
+  .markdown h1 {
+    font-size: 0.9375rem;
+  }
+  .markdown h2 {
+    font-size: 0.875rem;
+  }
+  .markdown h3,
+  .markdown h4 {
+    font-size: 0.8125rem;
+  }
+  .markdown h5,
+  .markdown h6 {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+  .markdown ul,
+  .markdown ol {
+    padding-left: 1.25rem;
+  }
+  .markdown li::marker {
+    color: var(--text-faint);
+  }
+  .markdown hr {
+    border-color: var(--border-subtle);
+  }
+  .markdown ul {
+    list-style: disc;
+  }
+  .markdown ol {
+    list-style: decimal;
+  }
+  .markdown li + li {
+    margin-top: 0.25rem;
+  }
+  .markdown a {
+    color: var(--color-accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .markdown code {
+    font-family: var(--font-mono);
+    font-size: 0.875em;
+    background: var(--surface-inset);
+    padding: 0.1em 0.35em;
+    border-radius: 0.3rem;
+  }
+  .markdown pre {
+    background: var(--surface-sunken);
+    border: 1px solid var(--border-subtle);
+    border-radius: 0.5rem;
+    padding: 0.75rem 1rem;
+    overflow-x: auto;
+  }
+  .markdown pre code {
+    background: none;
+    padding: 0;
+    font-size: 0.75rem;
+  }
+  .markdown blockquote {
+    border-left: 3px solid var(--border-strong);
+    padding-left: 0.9rem;
+    color: var(--text-muted);
+  }
+  /*
+   * A wide table scrolls inside its own box instead of widening the answer.
+   * display: block on the table keeps that without a wrapper element.
+   */
+  .markdown table {
+    display: block;
+    max-width: 100%;
+    width: max-content;
+    overflow-x: auto;
+    border-collapse: collapse;
+    font-size: 0.75rem;
+    line-height: 1.45;
+    overflow-wrap: normal;
+  }
+  .markdown th,
+  .markdown td {
+    border: 1px solid var(--border-subtle);
+    padding: 0.3rem 0.55rem;
+    text-align: left;
+    vertical-align: top;
+    /* Without a floor the columns squeeze to one word each instead of scrolling. */
+    min-width: 6rem;
+  }
+  /* Callouts sit in and next to answers, so they share the answer's size. */
+  .callout-body {
+    font-size: 0.8125rem;
+    line-height: 1.55;
+  }
+  .markdown th {
+    background: var(--surface-sunken);
+    font-weight: 600;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+}
+
+/* A residue named in an answer; it shows the residue in the 3D viewer. */
+.markdown .residue-link {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  color: var(--color-structure);
+  border-bottom: 1px dashed currentColor;
+  line-height: 1.2;
+}
+.markdown .residue-link:hover {
+  color: var(--color-accent);
+}
+
+/*
+ * Mol* sizes itself from its container. It must fill the host exactly and
+ * never shrink to zero, or the canvas stays blank until the next resize.
+ */
+.molstar-host .msp-plugin {
+  position: absolute;
+  inset: 0;
+  background: transparent;
+}
+.molstar-host .msp-layout-standard,
+.molstar-host .msp-layout-main,
+.molstar-host .msp-layout-region-main,
+.molstar-host .msp-viewport {
+  background: transparent;
+}
+.molstar-host canvas {
+  display: block;
+}
+/* Keep Mol*'s own viewport buttons clear of the overlay row on the left. */
+.molstar-host .msp-viewport-controls {
+  top: 8px;
+  right: 8px;
+}
+.molstar-host .msp-viewport-controls-buttons .msp-btn-icon {
+  background: var(--surface-raised) !important;
+  color: var(--text-muted) !important;
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.25rem;
+  opacity: 0.9;
+}
+.molstar-host .msp-viewport-controls-buttons .msp-btn-icon svg,
+.molstar-host .msp-viewport-controls-buttons .msp-btn-icon svg * {
+  fill: currentColor !important;
+}
+.molstar-host .msp-viewport-controls-buttons .msp-btn-icon:hover,
+.molstar-host .msp-viewport-controls-buttons .msp-btn-link-toggle-on {
+  opacity: 1;
+  color: var(--text-body) !important;
+}
+.molstar-host .msp-viewport-controls-buttons .msp-btn-icon:hover {
+  color: var(--color-accent-strong) !important;
+}
+/* The hover label sits top right, next to Mol*'s buttons. */
+.molstar-host .msp-highlight-toast-wrapper {
+  top: 8px;
+  right: 48px;
+  bottom: auto;
+  max-width: calc(100% - 22rem);
+}
+.molstar-host .msp-highlight-info {
+  background: var(--surface-raised);
+  color: var(--text-body);
+  border: 1px solid var(--border-subtle);
+  border-radius: 0.375rem;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: 0.95;
+}
+.molstar-host .msp-highlight-info-additional {
+  color: var(--text-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
