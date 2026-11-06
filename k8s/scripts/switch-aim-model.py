@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ MANIFESTS_DIR = K8S_DIR / "manifests"
 AIM_SERVICE_FILE = MANIFESTS_DIR / "aim-service.yaml"
 CONFIGMAP_FILE = MANIFESTS_DIR / "configmap.yaml"
 CONFIGMAP_NAME = "dd-agentic-config"
+KUBECTL_RETRIES = 40
 
 # Per tier: which AIMService to repoint, which ConfigMap key records the served
 # model id, and which Deployments read it. The interactive agent sits on the
@@ -46,7 +48,31 @@ PROFILE_ROLE_LABEL = "aim.eai.amd.com/profile-role"
 
 
 def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, check=check, capture_output=capture, text=True)
+    """Run a command, retrying kubectl through the cluster's Unauthorized flake.
+
+    A subset of the apiserver replicas rejects valid OIDC tokens, so a call that
+    fails that way says nothing about the request itself. kubectl output is
+    always captured so the failure can be recognised, and replayed afterwards
+    when the caller wanted it streamed.
+    """
+    if argv[0] != "kubectl":
+        return subprocess.run(argv, check=check, capture_output=capture, text=True)
+
+    for attempt in range(KUBECTL_RETRIES):
+        proc = subprocess.run(argv, check=False, capture_output=True, text=True)
+        if proc.returncode == 0 or "Unauthorized" not in (proc.stderr or ""):
+            break
+        if attempt < KUBECTL_RETRIES - 1:
+            time.sleep(2)
+
+    if not capture:
+        if proc.stdout:
+            sys.stdout.write(proc.stdout)
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, argv, proc.stdout, proc.stderr)
+    return proc
 
 
 def kubectl_json(argv: list[str]) -> Any:
@@ -192,18 +218,31 @@ def match_profiles(
     raise SystemExit("\n".join(lines))
 
 
-def patch_aim_service(path: Path, model_name: str, count: int, precision: str, metric: str) -> None:
+def patch_aim_service(
+    path: Path, service: str, model_name: str, count: int, precision: str, metric: str
+) -> None:
+    """Rewrite one tier's AIMService, leaving the other tier's alone.
+
+    The file holds both tiers, and spec.model is CEL-immutable, so touching the
+    tier that is not being switched makes the apply fail on it.
+    """
     lines = path.read_text().splitlines(keepends=True)
     out: list[str] = []
     in_aim = False
+    this_service = ""
     prev = ""
     for line in lines:
         stripped = line.rstrip("\n")
         if stripped.startswith("kind: AIMService"):
             in_aim = True
+            this_service = ""
         elif stripped == "---":
             in_aim = False
-        if in_aim:
+            this_service = ""
+        if in_aim and not this_service and stripped.startswith("  name:"):
+            # metadata.name is the only name: key at this indent.
+            this_service = stripped.split(":", 1)[1].strip()
+        if in_aim and this_service == service:
             if prev.strip() == "model:" and stripped.startswith("    name:"):
                 line = f"    name: {model_name}\n"
             elif stripped.startswith("      acceleratorCount:"):
@@ -474,13 +513,14 @@ def main() -> int:
 
     patch_aim_service(
         AIM_SERVICE_FILE,
+        aim_service,
         resolved["name"],
         args.accelerator_count,
         precision,
         metric,
     )
     print(
-        f"updated {AIM_SERVICE_FILE} model.name={resolved['name']} "
+        f"updated {AIM_SERVICE_FILE} {aim_service} model.name={resolved['name']} "
         f"acceleratorCount={args.accelerator_count} precision={precision} metric={metric}"
     )
 
