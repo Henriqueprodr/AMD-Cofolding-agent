@@ -119,36 +119,36 @@ def check_availability(
 def _check_in_stock(canonical_smiles: str, stock: Any) -> bool:
     """Perform the actual stock lookup against an AiZynthFinder Stock object.
 
-    AiZynthFinder's Stock API changed across versions.  This function tries
-    multiple access patterns in order:
-
-    1. ``stock[canonical_smiles]`` — dict-like access (some wrappers).
-    2. ``stock.mol_in_stock(molecule)`` — standard API.
-    3. Fallback via SMILES fingerprint lookup.
+    ``mol in stock`` is AiZynthFinder's own API: it is what the search uses to
+    decide whether a node is solved and what ``routes.py`` uses to annotate
+    leaves.  ``mol_in_stock`` and ``is_available`` are kept behind it for
+    wrapper objects that spell it differently.
     """
-    # Pattern 1: dict-like direct SMILES access (thin wrappers)
-    try:
-        return bool(stock[canonical_smiles])
-    except (KeyError, TypeError):
-        pass
+    from aizynthfinder.chem import Molecule  # noqa: PLC0415
 
-    # Pattern 2: standard mol_in_stock API
-    try:
-        from aizynthfinder.chem import Molecule  # noqa: PLC0415
-        mol = Molecule(smiles=canonical_smiles)
-        return bool(stock.mol_in_stock(mol))
-    except (ImportError, Exception):
-        pass
+    # An unselected stock answers False for everything, which would read as
+    # "not purchasable" when the truth is that we have nothing to check
+    # against.  The caller turns this into availability="unknown".
+    if not getattr(stock, "selection", None):
+        raise RuntimeError(
+            "no stock catalog is selected — stage the catalog on the volume "
+            "and restart the service"
+        )
 
-    # Pattern 3: is_available (newer AiZynthFinder versions)
-    try:
-        from aizynthfinder.chem import Molecule  # noqa: PLC0415
-        mol = Molecule(smiles=canonical_smiles)
-        return bool(stock.is_available(mol))
-    except (ImportError, Exception):
-        pass
+    mol = Molecule(smiles=canonical_smiles)
+    failures: list[str] = []
+
+    for name, query in (
+        ("mol in stock", lambda: mol in stock),
+        ("mol_in_stock", lambda: stock.mol_in_stock(mol)),
+        ("is_available", lambda: stock.is_available(mol)),
+    ):
+        try:
+            return bool(query())
+        except Exception as exc:  # noqa: BLE001, PERF203
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
 
     raise RuntimeError(
-        f"Could not query stock for SMILES {canonical_smiles!r}: "
-        "no compatible AiZynthFinder stock API found."
+        f"Could not query stock for SMILES {canonical_smiles!r}; "
+        "every stock API failed — " + "; ".join(failures)
     )
