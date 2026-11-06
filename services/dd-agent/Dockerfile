@@ -32,7 +32,8 @@ COPY reinvent4_mcp_config.yaml /app/reinvent4_mcp_config.yaml
 # guarded place, to validate Mol2Mol seed SMILES before a job is dispatched.
 # Worth ~120 MB here against the 11 GiB removed, since without it that check
 # degrades to a warning and a bad seed only fails later, inside the RL run.
-RUN pip install --no-cache-dir /app/reinvent4_mcp /app/reinvent4_agent "rdkit>=2024.3.1"
+# The [web] extra adds dd-web, the gateway the web UI talks to.
+RUN pip install --no-cache-dir /app/reinvent4_mcp "/app/reinvent4_agent[web]" "rdkit>=2024.3.1"
 
 # The inverse of the check this image used to make. REINVENT4 being *absent* is
 # the point of the split, so a torch or REINVENT4 dependency creeping back in
@@ -40,7 +41,7 @@ RUN pip install --no-cache-dir /app/reinvent4_mcp /app/reinvent4_agent "rdkit>=2
 RUN python -c "import importlib.util as u; \
 assert u.find_spec('reinvent') is None, 'REINVENT4 is back in the agent image; it belongs in reinvent-runner'; \
 assert u.find_spec('torch') is None, 'torch is back in the agent image'; \
-import reinvent4_mcp.server, reinvent4_agent.cli, rdkit; \
+import reinvent4_mcp.server, reinvent4_agent.cli, reinvent4_agent.web.cli, rdkit; \
 from reinvent4_mcp.config import ProcessConfig; ProcessConfig(); \
 print('agent image OK: MCP server and agent import, REINVENT4 absent')"
 
