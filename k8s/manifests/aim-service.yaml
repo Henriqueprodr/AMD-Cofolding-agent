@@ -95,7 +95,7 @@ spec:
   # the split alters *how* supervisors are served, not what they are talking
   # to -- one variable at a time.
   model:
-    name: amdenterpriseai-aim-qwen-qwen3-32b-0-13-0-31bb0f
+    name: amdenterpriseai-aim-google-gemma-4-31b-it-0-13-0-preview-b3fa6f
   # MI300X x1, fp8, metric=**throughput**. This is the half of the split that
   # matters: N supervisors issuing concurrent tool calls are a throughput
   # workload, and the latency profile they shared before was tuned for the

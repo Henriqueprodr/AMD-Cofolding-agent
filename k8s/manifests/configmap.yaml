@@ -7,7 +7,7 @@ data:
   # The interactive agent and the supervisors share the throughput tier: both
   # are "many turns, nobody waiting on any one of them". The conductor has its
   # own keys below, because a person *is* waiting on its turns.
-  REINVENT4_AGENT_MODEL: "Qwen/Qwen3-32B-FP8"
+  REINVENT4_AGENT_MODEL: "google/gemma-4-31B-it"
   REINVENT4_AGENT_BASE_URL: http://dd-agentic-aim-supervisor/v1
   # The conductor tier: a bigger model on a latency profile. Separate keys
   # rather than a separate ConfigMap so one `kubectl get configmap` still
