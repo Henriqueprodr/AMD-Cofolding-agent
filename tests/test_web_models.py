@@ -93,6 +93,14 @@ def test_a_model_outside_the_catalogue_is_left_alone():
     assert models.ModelControl(directory=None, fallback_model="Qwen/Qwen3.8-27B").active().key == "qwen"
 
 
+def test_the_picker_names_an_uncatalogued_model_instead_of_qwen():
+    """On Kubernetes the conductor tier serves gpt-oss-120b, and nothing swaps it."""
+    snapshot = models.ModelControl(directory=None, fallback_model="openai/gpt-oss-120b").snapshot()
+    assert snapshot["current"] == "configured"
+    assert snapshot["switchable"] is False
+    assert [(m["id"], m["label"]) for m in snapshot["models"]] == [("openai/gpt-oss-120b", "gpt-oss-120b")]
+
+
 def test_a_configured_but_absent_directory_is_not_switchable(tmp_path, monkeypatch):
     monkeypatch.setenv(models.CONTROL_DIR_ENV, str(tmp_path / "gone"))
     control = models.ModelControl(fallback_model="Qwen/Qwen3.8-27B")

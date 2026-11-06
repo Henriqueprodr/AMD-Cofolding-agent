@@ -208,12 +208,36 @@ class ModelControl:
         supervisor has had a chance to write anything.
         """
         live_key, live_state = self.status()
+        configured = self._configured_outside_catalogue()
+        if configured is not None:
+            # Kubernetes, or a hosted model: the tier serves what dd-agent was
+            # configured with, and naming a catalogue entry instead would tell
+            # the user they are talking to a model they are not.
+            return {
+                "current": configured.key,
+                "state": "ready",
+                "switchable": False,
+                "models": [configured.describe()],
+            }
         return {
             "current": current or live_key,
             "state": state or live_state,
             "switchable": self.switchable,
             "models": [spec.describe() for spec in CATALOGUE],
         }
+
+    def _configured_outside_catalogue(self) -> ModelSpec | None:
+        """The configured model, when nothing can swap it and it is not catalogued."""
+        if self.switchable or not self.fallback_model or key_for_served_id(self.fallback_model):
+            return None
+        if self._reported(self._read_state()) is not None:
+            return None
+        return ModelSpec(
+            key="configured",
+            served_id=self.fallback_model,
+            label=self.fallback_model.rsplit("/", 1)[-1],
+            efforts=("low", "medium", "high"),
+        )
 
     @staticmethod
     def _reported(state: dict[str, Any]) -> ModelSpec | None:
