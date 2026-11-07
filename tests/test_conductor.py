@@ -8,7 +8,7 @@ proposals, admission control, and the hard stop.
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from unittest.mock import patch
@@ -19,16 +19,13 @@ import requests
 from reinvent4_agent.conductor import (
     CampaignConductor,
     KubernetesPoolScaler,
-    ParetoProposer,
-    WeightVector,
     format_status,
-    front_weights,
     live_campaign_id,
     main,
     objectives_of,
     queue_pressure,
-    tried_vectors,
 )
+from reinvent4_agent.proposing import ProposerUnavailable, TaskProposal
 
 OBJECTIVES = ["BoltzAffinity", "QED"]
 
@@ -74,11 +71,17 @@ def _status(
 class FakeStore:
     """A ledger that answers from a canned status."""
 
-    def __init__(self, status: dict[str, Any], tasks: list[dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        status: dict[str, Any],
+        tasks: list[dict[str, Any]] | None = None,
+        results: list[dict[str, Any]] | None = None,
+    ):
         self.base_url = "http://store"
         self.owner = "conductor"
         self._status = status
         self._tasks = tasks or []
+        self._results = results or []
         self.enqueued: list[dict[str, Any]] = []
         self.closed = 0
         self.finalized = 0
@@ -96,6 +99,9 @@ class FakeStore:
 
     def pareto(self, campaign_id):
         return {"front": self._status["front"], "ineligible": []}
+
+    def results(self, campaign_id):
+        return {"results": self._results}
 
     def enqueue_task(self, campaign_id, **spec):
         self.enqueued.append(spec)
@@ -126,143 +132,34 @@ class FakeScaler:
         return True
 
 
+class FakeProposer:
+    """Always has something to propose, and records what it was asked.
+
+    The loop's tests are about how many tasks it dispatches and when, never
+    about which. Injecting this keeps them from reaching for a model, and
+    keeps a change of mind in the real proposer from breaking them.
+    """
+
+    def __init__(self, proposals: list[TaskProposal] | None = None, raises=None):
+        self._proposals = proposals
+        self._raises = raises
+        self.asked_for: list[int] = []
+        self.contexts: list[Any] = []
+
+    def propose(self, context, count):
+        self.asked_for.append(count)
+        self.contexts.append(context)
+        if self._raises:
+            raise self._raises
+        if self._proposals is not None:
+            return self._proposals[:count]
+        return [TaskProposal(intent=f"try something #{i}") for i in range(count)]
+
+
 def _conductor(store, **kwargs) -> CampaignConductor:
     kwargs.setdefault("stats_url", "http://gateway/unreachable")
+    kwargs.setdefault("proposer", FakeProposer())
     return CampaignConductor(store, "feed0001", **kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Weight vectors
-# ---------------------------------------------------------------------------
-
-
-class TestWeightVector:
-
-    def test_order_does_not_change_identity(self):
-        """Two spellings of the same point must not be dispatched twice."""
-        a = WeightVector.of({"QED": 1.0, "BoltzAffinity": 2.0})
-        b = WeightVector.of({"BoltzAffinity": 2.0, "QED": 1.0})
-
-        assert a == b
-        assert len({a, b}) == 1
-
-    def test_near_identical_weights_are_the_same_point(self):
-        """Float noise must not make a 'new' vector worth a GPU hour."""
-        a = WeightVector.of({"QED": 1.0})
-        b = WeightVector.of({"QED": 1.00004})
-
-        assert a == b
-
-    def test_it_round_trips_to_a_dict(self):
-        assert WeightVector.of({"QED": 1.5}).as_dict() == {"QED": 1.5}
-
-
-# ---------------------------------------------------------------------------
-# Proposals
-# ---------------------------------------------------------------------------
-
-
-class TestParetoProposer:
-
-    def test_it_seeds_the_extremes_before_refining(self):
-        """With no results there is nothing to learn from.
-
-        Bounding the front's extremes early is what makes later refinement
-        meaningful; refining around one lucky point first explores a corner.
-        """
-        proposals = ParetoProposer(OBJECTIVES).propose([], set(), 10)
-        weights = [p.as_dict() for p in proposals]
-
-        assert {"BoltzAffinity": 1.0, "QED": 1.0} in weights
-        assert {"BoltzAffinity": 2.0, "QED": 1.0} in weights
-        assert {"BoltzAffinity": 1.0, "QED": 2.0} in weights
-        assert len(weights) == 3
-
-    def test_it_respects_the_count(self):
-        assert len(ParetoProposer(OBJECTIVES).propose([], set(), 2)) == 2
-
-    def test_it_never_reproposes_a_tried_vector(self):
-        """A campaign must not pay twice for the same point."""
-        tried = {WeightVector.of({"BoltzAffinity": 1.0, "QED": 1.0})}
-
-        proposals = ParetoProposer(OBJECTIVES).propose([], tried, 10)
-
-        assert WeightVector.of({"BoltzAffinity": 1.0, "QED": 1.0}) not in proposals
-
-    def test_an_exhausted_sweep_proposes_nothing(self):
-        """Better to stop dispatching than to re-run paid-for points."""
-        proposer = ParetoProposer(OBJECTIVES)
-        everything = set(proposer.propose([], set(), 100))
-
-        assert proposer.propose([], everything, 5) == []
-
-    def test_it_refines_around_the_front(self):
-        front = [{
-            "task_id": "a",
-            "objective_profile": {"BoltzAffinity": 0.9, "QED": 0.4},
-            "weights": {"BoltzAffinity": 2.0, "QED": 1.0},
-        }]
-        seeds = set(ParetoProposer(OBJECTIVES).propose([], set(), 100))
-
-        proposals = ParetoProposer(OBJECTIVES).propose(front, seeds, 4)
-        weights = [p.as_dict() for p in proposals]
-
-        assert proposals, "a front should produce neighbours to try"
-        # Every proposal moves exactly one objective off the front member.
-        for candidate in weights:
-            differences = [
-                name for name in OBJECTIVES
-                if candidate[name] != front[0]["weights"][name]
-            ]
-            assert len(differences) == 1
-
-    def test_refinement_keeps_weights_positive(self):
-        """A zero weight would silently drop an objective from the score."""
-        front = [{
-            "task_id": "a",
-            "objective_profile": {},
-            "weights": {"BoltzAffinity": 0.05, "QED": 1.0},
-        }]
-
-        for proposal in ParetoProposer(OBJECTIVES).propose(front, set(), 50):
-            assert all(weight > 0 for weight in proposal.as_dict().values())
-
-    def test_a_campaign_needs_an_objective(self):
-        with pytest.raises(ValueError, match="at least one objective"):
-            ParetoProposer([])
-
-
-class TestLedgerDerivedState:
-
-    def test_tried_vectors_come_from_the_ledger(self):
-        """So a restarted conductor does not re-dispatch the whole sweep."""
-        tasks = [
-            {"task_id": "a", "spec": {"weight_overrides": {"QED": 1.0}}},
-            {"task_id": "b", "spec": {"weight_overrides": {"QED": 2.0}}},
-        ]
-
-        assert tried_vectors(tasks) == {
-            WeightVector.of({"QED": 1.0}), WeightVector.of({"QED": 2.0})
-        }
-
-    def test_tasks_without_overrides_are_not_points(self):
-        assert tried_vectors([{"task_id": "a", "spec": {}}]) == set()
-
-    def test_front_members_are_paired_with_their_weights(self):
-        """The store's front knows scores; refinement needs the weights."""
-        front = [{"task_id": "a", "objective_profile": {"QED": 0.9}}]
-        tasks = [{"task_id": "a", "spec": {"weight_overrides": {"QED": 2.0}}}]
-
-        paired = front_weights(front, tasks)
-
-        assert paired[0]["weights"] == {"QED": 2.0}
-        assert paired[0]["objective_profile"] == {"QED": 0.9}
-
-    def test_a_front_member_with_no_known_weights_is_dropped(self):
-        """A hand-queued task with no overrides has no neighbourhood."""
-        front = [{"task_id": "ghost", "objective_profile": {"QED": 0.9}}]
-
-        assert front_weights(front, []) == []
 
 
 # ---------------------------------------------------------------------------
@@ -416,28 +313,61 @@ class TestDispatchWindow:
 
         assert scaler.scaled_to == [2]
 
-    def test_it_does_not_redispatch_what_the_ledger_already_has(self):
-        """Idempotence: a conductor restart must not duplicate the sweep."""
-        tried = [
-            {"task_id": "a", "spec": {"weight_overrides": {
-                "BoltzAffinity": 1.0, "QED": 1.0}}},
-        ]
-        store = FakeStore(_status(counts={"done": 1}), tasks=tried)
+    def test_the_proposer_is_told_what_the_campaign_has_already_done(self):
+        """It cannot avoid repeating work it was never shown."""
+        done = [{"task_id": "a", "state": "done", "spec": {"intent": "try X"}}]
+        store = FakeStore(
+            _status(counts={"done": 1}), tasks=done,
+            results=[{"task_id": "a", "summary": "X did not help"}],
+        )
+        proposer = FakeProposer()
 
-        _conductor(store).tick()
+        _conductor(store, proposer=proposer).tick()
 
-        for spec in store.enqueued:
-            assert spec["weight_overrides"] != {"BoltzAffinity": 1.0, "QED": 1.0}
+        context = proposer.contexts[0]
+        assert context.goal == _campaign()["goal"]
+        assert context.task_ids == {"a"}
+        assert context.results[0]["summary"] == "X did not help"
 
-    def test_it_stops_dispatching_when_the_sweep_is_exhausted(self):
-        proposer = ParetoProposer(OBJECTIVES)
-        everything = [
-            {"task_id": str(i), "spec": {"weight_overrides": v.as_dict()}}
-            for i, v in enumerate(proposer.propose([], set(), 100))
-        ]
-        store = FakeStore(_status(counts={"done": len(everything)}), tasks=everything)
+    def test_a_proposer_with_nothing_to_say_dispatches_nothing(self):
+        """Better an idle campaign than tasks nobody wanted."""
+        store = FakeStore(_status())
 
-        assert _conductor(store).tick().dispatched == 0
+        report = _conductor(store, proposer=FakeProposer([])).tick()
+
+        assert report.dispatched == 0
+        assert store.enqueued == []
+
+    def test_a_proposer_that_cannot_decide_does_not_end_the_campaign(self):
+        """An unreachable model is a tick to retry, not a campaign to lose."""
+        store = FakeStore(_status())
+        proposer = FakeProposer(raises=ProposerUnavailable("model is down"))
+
+        report = _conductor(store, proposer=proposer).tick()
+
+        assert report.dispatched == 0
+        assert report.phase == "dispatching", "the loop carries on"
+
+    def test_what_the_proposer_decided_reaches_the_ledger(self):
+        """Intent and lineage are the task; dropping them loses the campaign."""
+        store = FakeStore(_status(counts={"claimed": 1}))
+        proposer = FakeProposer([
+            TaskProposal(
+                intent="hold the JQ1 core and vary the fused ring",
+                derived_from=("a", "b"),
+                weight_overrides={"QED": 2.0},
+                rationale="a and b both lost potency when the core moved",
+            )
+        ])
+
+        _conductor(store, proposer=proposer).tick()
+
+        assert store.enqueued == [{
+            "intent": "hold the JQ1 core and vary the fused ring",
+            "derived_from": ["a", "b"],
+            "weight_overrides": {"QED": 2.0},
+            "rationale": "a and b both lost potency when the core moved",
+        }]
 
 
 class TestAdmissionControl:
@@ -481,11 +411,16 @@ class TestDeadlines:
     def test_tasks_get_the_task_budget_as_a_deadline(self):
         store = FakeStore(_status())
 
+        before = datetime.now(timezone.utc)
         _conductor(store, task_budget_seconds=600).tick()
+        after = datetime.now(timezone.utc)
 
         deadline = datetime.fromisoformat(store.enqueued[0]["deadline"])
-        remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
-        assert 590 < remaining <= 600
+        # Bracketed by both clock reads rather than measured against one.
+        # The tick itself takes time -- it waits on the gateway -- so the
+        # budget runs from some instant inside it, and any assertion that
+        # picks one end as "now" fails by however long the tick took.
+        assert before + timedelta(seconds=600) <= deadline <= after + timedelta(seconds=600)
 
     def test_the_campaign_hard_stop_caps_the_task_budget(self):
         """No supervisor should start a run that outlives the campaign."""

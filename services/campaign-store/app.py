@@ -392,6 +392,21 @@ class TaskCreate(BaseModel):
                     "that rather than de novo' -- so the agent does the "
                     "chemistry instead of being handed a seed.",
     )
+    derived_from: list[str] = Field(
+        default_factory=list,
+        description="Task ids whose results led the conductor to this one. "
+                    "The campaign's lineage: without it a finished campaign "
+                    "is a bag of runs and nobody can see which result "
+                    "prompted which experiment. Empty for the first tasks, "
+                    "which had nothing to go on.",
+    )
+    rationale: Optional[str] = Field(
+        default=None,
+        description="One line on why this task and not another, for the "
+                    "human watching. Not shown to the agent, which is told "
+                    "what to do by `intent` and should not be second-guessing "
+                    "why it was asked.",
+    )
 
 
 class ConcurrencyUpdate(BaseModel):
@@ -785,6 +800,24 @@ def enqueue_task(campaign_id: str, body: TaskCreate) -> dict[str, Any]:
                        "the queue is closed to new tasks",
             )
 
+        # A lineage edge pointing at a task that does not exist, or at one in
+        # another campaign, is worse than no edge: it is drawn, believed, and
+        # wrong. Refuse it here, where the ids can still be checked.
+        if body.derived_from:
+            known = {
+                row["task_id"] for row in conn.execute(
+                    "SELECT task_id FROM tasks WHERE campaign_id = ?", (campaign_id,)
+                )
+            }
+            unknown = [ref for ref in body.derived_from if ref not in known]
+            if unknown:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"derived_from names {', '.join(unknown)}, which "
+                           f"{'is' if len(unknown) == 1 else 'are'} not a task "
+                           f"of campaign {campaign_id}",
+                )
+
         task_id = _new_id()
         conn.execute(
             "INSERT INTO tasks (task_id, campaign_id, spec, state, created_at) "
@@ -793,6 +826,7 @@ def enqueue_task(campaign_id: str, body: TaskCreate) -> dict[str, Any]:
         )
         _emit(conn, "task_enqueued", campaign_id, task_id,
               weight_overrides=body.weight_overrides,
+              derived_from=body.derived_from,
               fidelity_tier=body.fidelity_tier)
         row = conn.execute(
             "SELECT * FROM tasks WHERE task_id = ?", (task_id,)

@@ -610,7 +610,6 @@ def conduct_campaign(
         task_budget_hours=task_budget_hours,
         max_steps=max_steps,
         tick_seconds=tick_seconds,
-        objectives=campaign.get("objectives"),
     )
     return status.as_dict()
 

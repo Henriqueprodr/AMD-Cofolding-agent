@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from reinvent4_agent.campaign_client import CampaignStoreClient, StoreUnavailable
-from reinvent4_agent.conductor import CampaignConductor, ParetoProposer, TickReport
+from reinvent4_agent.conductor import CampaignConductor, TickReport
 from reinvent4_agent.pool import PoolScaler, make_pool_scaler
 
 logger = logging.getLogger(__name__)
@@ -172,7 +172,7 @@ class ConductingRegistry:
         task_budget_hours: Optional[float] = None,
         max_steps: Optional[int] = None,
         tick_seconds: Optional[float] = None,
-        objectives: Optional[list[str]] = None,
+        proposer: Optional[Any] = None,
     ) -> ConductingStatus:
         """Begin conducting, or return the status of the loop already doing it.
 
@@ -196,7 +196,10 @@ class ConductingRegistry:
                 store or CampaignStoreClient(),
                 campaign_id,
                 scaler=scaler or make_pool_scaler(),
-                proposer=ParetoProposer(objectives) if objectives else None,
+                # None means the conductor builds one on the agent's own
+                # model, which is the point: the campaign is directed by the
+                # same model the human is talking to.
+                proposer=proposer,
                 task_budget_seconds=(
                     task_budget_hours * 3600 if task_budget_hours else None
                 ),

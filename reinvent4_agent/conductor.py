@@ -1,9 +1,10 @@
 """Conductor: keep N supervisors busy against one goal until the clock runs out.
 
 The user gives a goal, a concurrency `N` and a wall-clock budget `T`. This runs
-the loop that turns that into work: it keeps `N` tasks in flight, reviews the
-Pareto front each time one finishes to decide what to try next, and respects
-three windows:
+the loop that turns that into work: it keeps `N` tasks in flight, asks the
+proposer what those tasks should be (see :mod:`reinvent4_agent.proposing` --
+this file decides *how many* and *when*, never *what*), and respects three
+windows:
 
 * **dispatch** `[0, T)` -- new tasks may be enqueued
 * **drain** `[T, T + grace)` -- the queue is closed, in-flight tasks finish
@@ -13,7 +14,10 @@ Nothing here holds campaign state. Every decision is made from a fresh read of
 ``campaign-store``, so a conductor that is restarted mid-campaign picks up where
 the ledger says it is rather than where its memory said it was. That is also
 why the loop is written as a single idempotent ``tick()``: running it twice in
-a row changes nothing.
+a row changes nothing. Note what that does and does not promise now the
+proposer is a model: a restarted conductor cannot double-dispatch or lose
+track of a task, but it may well decide to try something different from what
+the conductor it replaced would have tried.
 
 **The soft stop is the task deadline, not a signal.** Every task is enqueued
 with ``deadline = min(now + task_budget, hard_stop_at)``, and the supervisor
@@ -56,6 +60,12 @@ from reinvent4_agent.pool import (
     PoolScaler,
     make_pool_scaler,
 )
+from reinvent4_agent.proposing import (
+    CampaignContext,
+    Proposer,
+    ProposerUnavailable,
+    make_proposer,
+)
 from reinvent4_agent.service_registry import apply_registry
 
 logger = logging.getLogger(__name__)
@@ -64,141 +74,6 @@ TICK_SECONDS = float(os.getenv("CONDUCTOR_TICK_SECONDS", "30"))
 GATEWAY_STATS_URL = os.getenv(
     "BOLTZ_GATEWAY_STATS_URL", "http://dd-agentic-boltz-gateway:8091/stats"
 )
-
-
-# ---------------------------------------------------------------------------
-# Weight vectors
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class WeightVector:
-    """One point in the weight space, hashable so it can be de-duplicated."""
-
-    weights: tuple[tuple[str, float], ...]
-
-    @classmethod
-    def of(cls, weights: dict[str, float]) -> "WeightVector":
-        return cls(tuple(sorted((k, round(float(v), 3)) for k, v in weights.items())))
-
-    def as_dict(self) -> dict[str, float]:
-        return dict(self.weights)
-
-
-class ParetoProposer:
-    """Decides which weight vector to try next, from the front so far.
-
-    Two phases, because they answer different questions:
-
-    * **Seeding.** With no results, there is nothing to learn from, so it emits
-      one vector per objective with that objective emphasised, plus a balanced
-      one. That bounds the front's extremes early, which is what makes later
-      refinement meaningful -- refining around a single lucky point first would
-      just explore one corner.
-    * **Refinement.** With a front, it perturbs a front member's weights. The
-      front is by definition the set of trade-offs nothing else beats, so its
-      neighbourhood is where an improvement can still be found.
-
-    Deterministic: the same ledger produces the same next proposal, so a
-    campaign can be replayed and a restarted conductor does not change course.
-    """
-
-    def __init__(
-        self,
-        objectives: list[str],
-        emphasis: float = 2.0,
-        step: float = 1.5,
-    ) -> None:
-        if not objectives:
-            raise ValueError("a campaign needs at least one objective to sweep")
-        self.objectives = list(objectives)
-        self.emphasis = emphasis
-        self.step = step
-
-    def _seeds(self) -> list[WeightVector]:
-        balanced = {name: 1.0 for name in self.objectives}
-        seeds = [WeightVector.of(balanced)]
-        for name in self.objectives:
-            emphasised = dict(balanced)
-            emphasised[name] = self.emphasis
-            seeds.append(WeightVector.of(emphasised))
-        return seeds
-
-    def _refinements(self, front: list[dict[str, Any]]) -> list[WeightVector]:
-        """Neighbours of each front member, one objective moved at a time.
-
-        Ordered by the front member's own position so the strongest trade-offs
-        are refined first, and so the order does not depend on dict iteration.
-        """
-
-        proposals: list[WeightVector] = []
-        for member in sorted(front, key=lambda m: -sum(m["weights"].values())):
-            for name in self.objectives:
-                for factor in (self.step, 1 / self.step):
-                    moved = dict(member["weights"])
-                    moved[name] = max(0.05, moved.get(name, 1.0) * factor)
-                    proposals.append(WeightVector.of(moved))
-        return proposals
-
-    def propose(
-        self, front: list[dict[str, Any]], tried: set[WeightVector], count: int
-    ) -> list[WeightVector]:
-        """Up to `count` vectors that have not been tried yet.
-
-        May return fewer, including none: a campaign whose neighbourhood is
-        exhausted should stop dispatching rather than re-run points it has
-        already paid for.
-        """
-
-        candidates = self._seeds()
-        if front:
-            candidates += self._refinements(front)
-
-        chosen: list[WeightVector] = []
-        seen = set(tried)
-        for candidate in candidates:
-            if len(chosen) >= count:
-                break
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            chosen.append(candidate)
-        return chosen
-
-
-def tried_vectors(tasks: list[dict[str, Any]]) -> set[WeightVector]:
-    """Every weight vector the campaign has already enqueued.
-
-    Read from the ledger rather than remembered, so a restarted conductor does
-    not re-dispatch the whole sweep.
-    """
-
-    tried: set[WeightVector] = set()
-    for task in tasks:
-        overrides = (task.get("spec") or {}).get("weight_overrides") or {}
-        if overrides:
-            tried.add(WeightVector.of(overrides))
-    return tried
-
-
-def front_weights(
-    front: list[dict[str, Any]], tasks: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Pair each front member with the weight vector that produced it.
-
-    The store's front knows objective *scores*; refinement needs the *weights*
-    that got there, which only the task spec has.
-    """
-
-    weights_by_task = {
-        task["task_id"]: (task.get("spec") or {}).get("weight_overrides") or {}
-        for task in tasks
-    }
-    paired = []
-    for member in front:
-        weights = weights_by_task.get(member["task_id"])
-        if weights:
-            paired.append({**member, "weights": weights})
-    return paired
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +152,7 @@ class CampaignConductor:
         campaign_id: str,
         *,
         scaler: Optional[PoolScaler] = None,
-        proposer: Optional[ParetoProposer] = None,
+        proposer: Optional[Proposer] = None,
         task_budget_seconds: Optional[float] = None,
         max_steps: Optional[int] = None,
         max_queue_pressure: float = 2.0,
@@ -375,28 +250,59 @@ class CampaignConductor:
         report.dispatched = self._dispatch(campaign, status, shortfall)
         return report
 
+    def _context(self, campaign: dict[str, Any]) -> CampaignContext:
+        """The campaign as the proposer will see it, from one read.
+
+        The Pareto front is included as a hint about which results held up,
+        not as the thing being refined: it is a cheap, honest summary of
+        "these were not beaten", and the proposer is free to ignore it and
+        build on a task that is nowhere near it.
+        """
+
+        tasks = self.store.tasks(self.campaign_id)
+        try:
+            front = self.store.pareto(self.campaign_id)["front"]
+        except (StoreUnavailable, KeyError, TypeError):
+            # A front is a convenience here, not a premise. Losing it should
+            # cost the proposer a hint, not cost the campaign a tick.
+            logger.warning("no pareto front available; proposing without it")
+            front = []
+
+        return CampaignContext(
+            goal=campaign.get("goal") or "",
+            objectives=list(campaign.get("objectives") or []),
+            tasks=tasks,
+            results=self.store.results(self.campaign_id).get("results", []),
+            front=front,
+        )
+
     def _dispatch(
         self, campaign: dict[str, Any], status: dict[str, Any], count: int
     ) -> int:
-        """Enqueue up to `count` untried weight vectors."""
+        """Enqueue up to `count` tasks the proposer has decided on."""
 
-        objectives = campaign["objectives"]
-        proposer = self.proposer or ParetoProposer(objectives)
-        tasks = self.store.tasks(self.campaign_id)
+        proposer = self.proposer or make_proposer()
+        context = self._context(campaign)
 
-        front = front_weights(self.store.pareto(self.campaign_id)["front"], tasks)
-        proposals = proposer.propose(front, tried_vectors(tasks), count)
+        try:
+            proposals = proposer.propose(context, count)
+        except ProposerUnavailable as exc:
+            # Not an error the campaign should die of: the next tick asks
+            # again, and in the meantime nothing has been spent.
+            logger.warning("nothing dispatched this tick: %s", exc)
+            return 0
+
         if not proposals:
             logger.info(
-                "campaign %s has no untried weight vectors left to dispatch",
+                "the proposer had nothing worth dispatching for campaign %s",
                 self.campaign_id,
             )
             return 0
 
         deadline = self._task_deadline(campaign)
         dispatched = 0
-        for vector in proposals:
-            spec: dict[str, Any] = {"weight_overrides": vector.as_dict()}
+        for proposal in proposals:
+            spec = proposal.as_spec()
             if deadline:
                 spec["deadline"] = deadline
             if self.max_steps:
@@ -404,10 +310,10 @@ class CampaignConductor:
             try:
                 task = self.store.enqueue_task(self.campaign_id, **spec)
             except StoreUnavailable as exc:
-                logger.warning("could not enqueue %s: %s", vector.as_dict(), exc)
+                logger.warning("could not enqueue a task: %s", exc)
                 break
             logger.info(
-                "dispatched task %s with weights %s", task["task_id"], vector.as_dict()
+                "dispatched task %s: %s", task["task_id"], proposal.intent[:200]
             )
             dispatched += 1
 
