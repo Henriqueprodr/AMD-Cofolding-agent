@@ -34,9 +34,24 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from reinvent4_agent.web import campaign as campaign_log
+
+#: A campaign id as the ledger writes it: eight hex characters.
+_CAMPAIGN_ID = re.compile(r'"campaign_id"\s*:\s*"([0-9a-f]{4,32})"')
+
+
+def _campaign_id_in(result: str) -> Optional[str]:
+    """The campaign a tool's answer is about, if it names one.
+
+    Read out of the text rather than by re-parsing it as JSON: a tool result
+    is whatever the tool chose to return, and a conversation's record of what
+    it started should not depend on that staying a bare JSON object.
+    """
+
+    found = _CAMPAIGN_ID.search(result or "")
+    return found.group(1) if found else None
 from reinvent4_agent.web.artifacts import extract_panels
 from reinvent4_agent.web.events import WebSocketEventHandler
 from reinvent4_agent.web.plaintext import plain
@@ -371,10 +386,60 @@ class LiveSession:
         return self.meta["id"]
 
     def install_tools(self) -> None:
-        """Give the agent the tools that belong to this conversation."""
-        tools = getattr(self.agent, "local_tools", None)
-        if isinstance(tools, dict):
-            tools[campaign_log.TOOL_NAME] = (campaign_log.TOOL_DEFINITION, self._campaign_tool)
+        """Give the agent the tools that belong to this conversation.
+
+        Called again whenever an agent is attached, because the tools belong
+        to the conversation and the agent is the replaceable part. Nothing to
+        do before there is one -- which is a session not yet started, not an
+        agent that cannot hold tools. It used to be written as a getattr
+        against the agent, and since Agent had no such attribute the tool was
+        never installed anywhere and every call of it answered "unknown tool".
+        """
+
+        if self.agent is None:
+            return
+        self.agent.local_tools[campaign_log.TOOL_NAME] = (
+            campaign_log.TOOL_DEFINITION, self._campaign_tool,
+        )
+
+    #: Tools whose answer names a campaign this conversation now owns.
+    #: conduct_campaign as well as start_campaign, because a conversation
+    #: that picked up a campaign opened elsewhere and began conducting it is
+    #: the one driving it now.
+    CAMPAIGN_TOOLS = ("start_campaign", "conduct_campaign")
+
+    def note_tool_result(self, name: str, result: str, is_error: bool) -> None:
+        """Watch the conversation's own tool calls for things only it can know.
+
+        The campaign tools run inside the MCP server, which is one process
+        behind one pipe for every conversation at once and therefore cannot
+        tell which one called it. This end can, so the association is made
+        here and written to the ledger, where it outlives the browser.
+        """
+
+        if is_error or name not in self.CAMPAIGN_TOOLS:
+            return
+        campaign_id = _campaign_id_in(result)
+        if campaign_id:
+            self._claim_campaign(campaign_id)
+
+    def _claim_campaign(self, campaign_id: str) -> None:
+        from reinvent4_agent.campaign_client import (
+            CampaignStoreClient,
+            StoreUnavailable,
+        )
+
+        try:
+            CampaignStoreClient().attach_session(campaign_id, self.id)
+        except StoreUnavailable as exc:
+            # The campaign is running either way; all that is lost is this
+            # conversation's claim on it, which the next call re-attempts.
+            logger.warning(
+                "could not record campaign %s against session %s: %s",
+                campaign_id, self.id, exc,
+            )
+        except Exception:
+            logger.exception("could not record campaign %s", campaign_id)
 
     def _campaign_tool(self, arguments: dict[str, Any]) -> str:
         self.campaign = campaign_log.apply(self.campaign, arguments)
@@ -731,7 +796,11 @@ class SessionManager:
 
     def _attach_agent(self, live: LiveSession) -> None:
         # A fresh id prefix per load keeps call ids unique across restores.
-        handler = WebSocketEventHandler(sink=live.publish, id_prefix=f"call-{secrets.token_hex(3)}")
+        handler = WebSocketEventHandler(
+            sink=live.publish,
+            id_prefix=f"call-{secrets.token_hex(3)}",
+            on_result=live.note_tool_result,
+        )
         live.handler = handler
         live.agent = self._agent_factory(handler)
         live.install_tools()

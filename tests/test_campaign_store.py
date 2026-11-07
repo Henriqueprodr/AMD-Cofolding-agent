@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -463,6 +464,201 @@ class TestTaskIntent:
         task = _task(client, cid)
 
         assert task["spec"]["intent"] is None
+
+
+class TestLineage:
+    """Which earlier results led the conductor to this task.
+
+    It always knew -- a proposal was a step away from a specific result --
+    and threw it away, which left a finished campaign as a bag of runs with
+    no way to see which answer prompted which question.
+    """
+
+    def test_a_task_records_what_it_was_built_on(self, client):
+        cid = _campaign(client)["campaign_id"]
+        first = _task(client, cid)
+
+        second = _task(client, cid, derived_from=[first["task_id"]])
+
+        assert second["spec"]["derived_from"] == [first["task_id"]]
+
+    def test_the_first_tasks_are_built_on_nothing(self, client):
+        cid = _campaign(client)["campaign_id"]
+
+        assert _task(client, cid)["spec"]["derived_from"] == []
+
+    def test_a_task_can_come_from_several(self, client):
+        """A conductor combining two results is the interesting case."""
+        cid = _campaign(client)["campaign_id"]
+        a, b = _task(client, cid), _task(client, cid)
+
+        third = _task(client, cid, derived_from=[a["task_id"], b["task_id"]])
+
+        assert third["spec"]["derived_from"] == [a["task_id"], b["task_id"]]
+
+    def test_an_edge_to_a_task_that_does_not_exist_is_refused(self, client):
+        """Drawn, believed and wrong is worse than absent."""
+        cid = _campaign(client)["campaign_id"]
+
+        response = client.post(
+            f"/campaigns/{cid}/tasks", json={"derived_from": ["nosuchid"]}
+        )
+
+        assert response.status_code == 400
+        assert "nosuchid" in response.text
+
+    def test_an_edge_into_another_campaign_is_refused(self, client):
+        """Two campaigns are two experiments, not one graph."""
+        mine = _campaign(client)["campaign_id"]
+        theirs = _campaign(client)["campaign_id"]
+        elsewhere = _task(client, theirs)
+
+        response = client.post(
+            f"/campaigns/{mine}/tasks",
+            json={"derived_from": [elsewhere["task_id"]]},
+        )
+
+        assert response.status_code == 400
+
+    def test_the_rationale_is_kept_for_the_person_watching(self, client):
+        cid = _campaign(client)["campaign_id"]
+
+        task = _task(client, cid, rationale="the last two both lost potency")
+
+        assert task["spec"]["rationale"] == "the last two both lost potency"
+
+
+class TestWhichConversationOwnsACampaign:
+    """A campaign belongs to the conversation whose conductor runs it.
+
+    Recorded after the fact because the two facts live apart: the tool that
+    opens a campaign runs in a process shared by every conversation, and
+    only the chat gateway knows which one asked.
+    """
+
+    def test_a_campaign_starts_belonging_to_nobody(self, client):
+        assert _campaign(client)["session_id"] is None
+
+    def test_a_conversation_can_claim_one(self, client):
+        cid = _campaign(client)["campaign_id"]
+
+        response = client.post(f"/campaigns/{cid}/session", json={"session_id": "s-1"})
+
+        assert response.status_code == 200
+        assert response.json()["session_id"] == "s-1"
+
+    def test_claiming_twice_is_not_an_error(self, client):
+        """The gateway re-attaches on every campaign tool call."""
+        cid = _campaign(client)["campaign_id"]
+        client.post(f"/campaigns/{cid}/session", json={"session_id": "s-1"})
+
+        response = client.post(f"/campaigns/{cid}/session", json={"session_id": "s-1"})
+
+        assert response.status_code == 200
+
+    def test_another_conversation_cannot_take_it(self, client):
+        """Moving one is a mistake, not an edit."""
+        cid = _campaign(client)["campaign_id"]
+        client.post(f"/campaigns/{cid}/session", json={"session_id": "s-1"})
+
+        response = client.post(f"/campaigns/{cid}/session", json={"session_id": "s-2"})
+
+        assert response.status_code == 409
+
+    def test_a_conversation_sees_only_its_own(self, client):
+        mine = _campaign(client, goal="mine")["campaign_id"]
+        _campaign(client, goal="someone else's")
+        client.post(f"/campaigns/{mine}/session", json={"session_id": "s-1"})
+
+        listed = client.get("/campaigns?session_id=s-1").json()
+
+        assert [c["campaign_id"] for c in listed] == [mine]
+
+    def test_unclaimed_campaigns_are_not_everybodys(self, client):
+        """A filtered list answers 'which are mine', not 'which are free'."""
+        _campaign(client)
+
+        assert client.get("/campaigns?session_id=s-1").json() == []
+
+    def test_without_a_filter_every_campaign_is_listed(self, client):
+        _campaign(client)
+        _campaign(client)
+
+        assert len(client.get("/campaigns").json()) == 2
+
+
+class TestWhichRunATaskStarted:
+    """The job a task is running, while it is running it.
+
+    results.job_id has always had it afterwards, which is no use to somebody
+    asking what a supervisor is doing now -- the whole of a long run was the
+    part nobody could look inside.
+    """
+
+    def test_a_task_starts_with_no_run(self, client):
+        cid = _campaign(client)["campaign_id"]
+
+        assert _task(client, cid)["job_id"] is None
+
+    def test_the_beat_reports_the_run(self, client):
+        cid = _campaign(client)["campaign_id"]
+        _task(client, cid)
+        claimed = _claim(client, "s0").json()
+
+        beat = client.post(
+            f"/tasks/{claimed['task_id']}/heartbeat",
+            json={"owner": "s0", "job_id": "job-42"},
+        )
+
+        assert beat.status_code == 200
+        assert beat.json()["job_id"] == "job-42"
+
+    def test_it_shows_up_on_the_campaign_task_list(self, client):
+        """Which is where anyone watching the campaign would look."""
+        cid = _campaign(client)["campaign_id"]
+        _task(client, cid)
+        claimed = _claim(client, "s0").json()
+        client.post(
+            f"/tasks/{claimed['task_id']}/heartbeat",
+            json={"owner": "s0", "job_id": "job-42"},
+        )
+
+        tasks = client.get(f"/campaigns/{cid}/tasks").json()
+
+        assert tasks[0]["job_id"] == "job-42"
+
+    def test_a_beat_without_one_leaves_it_alone(self, client):
+        """A run that started is not un-started by the next quiet beat."""
+        cid = _campaign(client)["campaign_id"]
+        _task(client, cid)
+        claimed = _claim(client, "s0").json()
+        client.post(
+            f"/tasks/{claimed['task_id']}/heartbeat",
+            json={"owner": "s0", "job_id": "job-42"},
+        )
+
+        beat = client.post(
+            f"/tasks/{claimed['task_id']}/heartbeat", json={"owner": "s0"}
+        )
+
+        assert beat.json()["job_id"] == "job-42"
+
+    def test_a_second_run_does_not_repoint_the_first(self, client):
+        """A retry runs a new job; whoever opened the old one still means it."""
+        cid = _campaign(client)["campaign_id"]
+        _task(client, cid)
+        claimed = _claim(client, "s0").json()
+        client.post(
+            f"/tasks/{claimed['task_id']}/heartbeat",
+            json={"owner": "s0", "job_id": "job-42"},
+        )
+
+        beat = client.post(
+            f"/tasks/{claimed['task_id']}/heartbeat",
+            json={"owner": "s0", "job_id": "job-99"},
+        )
+
+        assert beat.json()["job_id"] == "job-42"
 
 
 class TestSupervisorPresence:
@@ -1047,3 +1243,60 @@ class TestDurability:
             raw = conn.execute("SELECT spec FROM tasks").fetchone()["spec"]
 
         assert json.loads(raw)["transform_overrides"]["QED"]["k"] == 0.5
+
+    def test_a_ledger_from_before_a_column_existed_still_opens(self, store, tmp_path):
+        """CREATE TABLE IF NOT EXISTS does nothing to a table that exists.
+
+        So a store upgraded over a ledger with campaigns in it would never
+        get the new columns, and every query naming one would fail -- on the
+        one service whose job is to outlive the things around it. Built from
+        the previous release's schema rather than by dropping columns from
+        this one, because that is the situation being tested.
+        """
+        old = tmp_path / "before.db"
+        conn = sqlite3.connect(old)
+        conn.executescript(
+            """
+            CREATE TABLE campaigns (
+                campaign_id TEXT PRIMARY KEY, goal TEXT NOT NULL,
+                base_ttp_id TEXT NOT NULL, objectives TEXT NOT NULL,
+                concurrency INTEGER NOT NULL, state TEXT NOT NULL,
+                created_at TEXT NOT NULL, dispatch_until REAL,
+                hard_stop_at REAL, finalized_at TEXT
+            );
+            CREATE TABLE tasks (
+                task_id TEXT PRIMARY KEY,
+                campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+                spec TEXT NOT NULL, state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                lease_owner TEXT, lease_expires_at REAL, claimed_at TEXT,
+                finished_at TEXT, error TEXT
+            );
+            INSERT INTO campaigns VALUES
+                ('old1', 'an older goal', 'brd4-bd1-lead-opt', '["QED"]', 1,
+                 'dispatching', '2026-01-01T00:00:00+00:00', NULL, NULL, NULL);
+            INSERT INTO tasks VALUES
+                ('t1', 'old1', '{}', 'queued', 0,
+                 '2026-01-01T00:00:00+00:00', NULL, NULL, NULL, NULL, NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        store.DB_PATH = old
+        store.init_db()
+
+        with TestClient(store.app) as client:
+            assert client.get("/campaigns/old1").json()["session_id"] is None
+            assert client.get("/campaigns/old1/tasks").json()[0]["job_id"] is None
+            # And the new columns are writable, not merely present.
+            claimed = _claim(client, "s0").json()
+            beat = client.post(
+                f"/tasks/{claimed['task_id']}/heartbeat",
+                json={"owner": "s0", "job_id": "job-7"},
+            )
+            assert beat.json()["job_id"] == "job-7"
+            attached = client.post(
+                "/campaigns/old1/session", json={"session_id": "s-1"}
+            )
+            assert attached.json()["session_id"] == "s-1"

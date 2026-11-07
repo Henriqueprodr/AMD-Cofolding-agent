@@ -323,6 +323,86 @@ def test_the_log_is_kept_published_and_survives_a_reload(tmp_path):
     assert reloaded.campaign == live.campaign
 
 
+# -- which campaigns this conversation owns ---------------------------------
+
+
+def _claims(tmp_path, monkeypatch, name, result, is_error=False):
+    """Run one tool result past a session and return what it claimed."""
+    claimed: list[tuple[str, str]] = []
+
+    class FakeLedger:
+        def attach_session(self, campaign_id, session_id):
+            claimed.append((campaign_id, session_id))
+            return {}
+
+    monkeypatch.setattr(
+        "reinvent4_agent.campaign_client.CampaignStoreClient", FakeLedger
+    )
+    live = make_session(tmp_path, FakeAgent())
+    live.note_tool_result(name, result, is_error)
+    return claimed
+
+
+def test_starting_a_campaign_records_it_against_the_conversation(tmp_path, monkeypatch):
+    """The tool runs where it cannot know who called it; this end knows."""
+    claimed = _claims(
+        tmp_path, monkeypatch, "start_campaign", '{"campaign_id": "feed0001"}'
+    )
+
+    assert claimed == [("feed0001", SESSION_ID)]
+
+
+def test_taking_over_conducting_claims_it_too(tmp_path, monkeypatch):
+    """Whoever is conducting it is the conversation driving it."""
+    claimed = _claims(
+        tmp_path, monkeypatch, "conduct_campaign", '{"campaign_id": "feed0001"}'
+    )
+
+    assert claimed == [("feed0001", SESSION_ID)]
+
+
+def test_a_tool_that_failed_claims_nothing(tmp_path, monkeypatch):
+    claimed = _claims(
+        tmp_path, monkeypatch, "start_campaign",
+        '{"campaign_id": "feed0001"}', is_error=True,
+    )
+
+    assert claimed == []
+
+
+def test_other_tools_are_left_alone(tmp_path, monkeypatch):
+    """Reading a campaign is not owning it."""
+    claimed = _claims(
+        tmp_path, monkeypatch, "get_campaign_state", '{"campaign_id": "feed0001"}'
+    )
+
+    assert claimed == []
+
+
+def test_an_answer_naming_no_campaign_claims_nothing(tmp_path, monkeypatch):
+    claimed = _claims(
+        tmp_path, monkeypatch, "start_campaign", '{"error": "no base TTP"}'
+    )
+
+    assert claimed == []
+
+
+def test_a_ledger_that_is_away_does_not_break_the_turn(tmp_path, monkeypatch):
+    """The campaign is running either way; only the claim is lost."""
+    from reinvent4_agent.campaign_client import StoreUnavailable
+
+    class Broken:
+        def attach_session(self, campaign_id, session_id):
+            raise StoreUnavailable("the ledger is unreachable")
+
+    monkeypatch.setattr(
+        "reinvent4_agent.campaign_client.CampaignStoreClient", Broken
+    )
+    live = make_session(tmp_path, FakeAgent())
+
+    live.note_tool_result("start_campaign", '{"campaign_id": "feed0001"}', False)
+
+
 def test_a_call_that_changes_nothing_is_refused(tmp_path):
     agent = FakeAgent()
     make_session(tmp_path, agent)

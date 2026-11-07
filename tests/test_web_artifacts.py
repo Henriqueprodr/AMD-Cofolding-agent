@@ -481,7 +481,7 @@ def test_opening_a_stored_session_saves_the_backfilled_title(tmp_path):
     for event in conversation():
         store.append_event(session_id, event)
 
-    manager = SessionManager(store, lambda handler: SimpleNamespace())
+    manager = SessionManager(store, lambda handler: SimpleNamespace(local_tools={}))
     live = manager.get(session_id)
 
     assert live is not None

@@ -44,6 +44,8 @@ class FakeAgent:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.backend = FakeBackend()
+        # Where a session installs the tools that belong to it.
+        self.local_tools = {}
 
     async def chat(self, content: str) -> str:
         self.asked.append(content)

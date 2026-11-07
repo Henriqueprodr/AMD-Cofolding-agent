@@ -15,6 +15,7 @@ structured JSONL transcript file for post-hoc analysis.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -84,6 +85,14 @@ class Agent:
         self.name = name
         self._system_prompt = system_prompt
         self._allowed_tools = allowed_tools
+        #: Tools answered here rather than over MCP, as ``name -> (definition,
+        #: handler)``. For things that belong to one agent and would be
+        #: meaningless shared: the MCP server is one process behind one stdio
+        #: pipe for every conversation at once, so a tool that needs to know
+        #: *which* conversation called it cannot live there. Installed by
+        #: whoever owns the agent, and therefore not subject to
+        #: ``allowed_tools``, which filters the catalog the agent was handed.
+        self.local_tools: dict[str, tuple[dict[str, Any], Any]] = {}
         self._transcript_path = _init_transcript(log_dir, name)
         self._turn = 0
         self._events: AgentEventHandler = event_handler or _NullEventHandler()
@@ -108,9 +117,13 @@ class Agent:
         agent physically cannot call mutating tools.
         """
         tools = await self.mcp.list_tools()
-        if self._allowed_tools is None:
-            return tools
-        return [t for t in tools if t["name"] in self._allowed_tools]
+        if self._allowed_tools is not None:
+            tools = [t for t in tools if t["name"] in self._allowed_tools]
+        # Local tools last and by name, so installing one over an MCP tool
+        # replaces it in the catalog rather than offering the model two tools
+        # with the same name and letting the backend pick.
+        local = {name: definition for name, (definition, _) in self.local_tools.items()}
+        return [t for t in tools if t["name"] not in local] + list(local.values())
 
     def _tool_allowed(self, name: str) -> bool:
         """Whether this agent may execute the canonical tool ``name``."""
@@ -202,6 +215,38 @@ class Agent:
         self._write_event("max_rounds", {"turn": self._turn})
         return msg
 
+    async def _call_local(
+        self, tc: Any, handler: Any, round_idx: int, t0: float
+    ) -> ToolResult:
+        """Run one locally-installed tool, reporting it as any other tool.
+
+        A local tool that raises is reported to the model as a failed tool
+        call rather than being allowed to abort the turn: it is usually the
+        conversation's own bookkeeping, and losing the answer because the
+        notepad broke would be a poor trade.
+        """
+
+        try:
+            answer = handler(tc.arguments)
+            if inspect.isawaitable(answer):
+                answer = await answer
+            content, is_error = str(answer), False
+        except Exception as exc:
+            logger.exception("local tool %s failed", tc.name)
+            content, is_error = f"{tc.name} failed: {exc}", True
+
+        elapsed = time.monotonic() - t0
+        self._write_event("tool_result", {
+            "name": tc.name,
+            "content_length": len(content),
+            "elapsed_s": round(elapsed, 3),
+            "is_error": is_error,
+            "round": round_idx,
+            "local": True,
+        })
+        self._events.on_tool_result(tc.name, content, is_error=is_error)
+        return ToolResult(tool_call_id=tc.id, content=content, is_error=is_error)
+
     async def _handle_tool_calls(
         self, result: ChatResult, round_idx: int
     ) -> list[ToolResult]:
@@ -224,6 +269,11 @@ class Agent:
             })
 
             t0 = time.monotonic()
+            local = self.local_tools.get(tc.name)
+            if local is not None:
+                results.append(await self._call_local(tc, local[1], round_idx, t0))
+                continue
+
             try:
                 self._tool_in_flight = True
                 resolved = self.mcp.resolve_tool_name(tc.name)

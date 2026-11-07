@@ -43,10 +43,16 @@ class WebSocketEventHandler:
         agent_label: str = "agent",
         sink: Callable[[dict[str, Any]], None] | None = None,
         id_prefix: str = "call",
+        on_result: Callable[[str, str, bool], None] | None = None,
     ) -> None:
         self.agent_label = agent_label
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._sink = sink
+        #: Told about every tool result, with the text untruncated. For the
+        #: session to notice things it owns but cannot see from inside the
+        #: MCP server, which serves every conversation at once and so cannot
+        #: know which one a call belonged to.
+        self._on_result = on_result
         self._id_prefix = id_prefix
         self._ids = itertools.count(1)
         #: Id of the open call per tool name.  The agent runs a round's calls
@@ -75,6 +81,13 @@ class WebSocketEventHandler:
         )
 
     def on_tool_result(self, name: str, result: str, is_error: bool) -> None:
+        if self._on_result is not None:
+            try:
+                self._on_result(name, result, is_error)
+            except Exception:
+                # Watching must never cost the conversation the result it is
+                # watching, so this is logged and dropped.
+                logger.exception("an observer of %s failed", name)
         call_id = self._pending.pop(name, None)
         started = self._started.pop(call_id, None) if call_id else None
         arguments = self._arguments.pop(call_id, None) if call_id else None

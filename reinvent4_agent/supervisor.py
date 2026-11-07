@@ -284,9 +284,14 @@ class Supervisor:
         heartbeat_seconds: float = HEARTBEAT_SECONDS,
         presence_seconds: float = PRESENCE_SECONDS,
         lease_seconds: Optional[float] = None,
+        job_id_source: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         self.store = store
         self.run_task = run_task
+        #: Asked, on the beat, for the run the current task has started.
+        #: Passed in rather than read off the runner so a runner that cannot
+        #: answer is a decision at the call site and not a silent nothing.
+        self.job_id_source = job_id_source
         self.campaign_id = campaign_id
         self.poll_seconds = poll_seconds
         self.heartbeat_seconds = heartbeat_seconds
@@ -360,13 +365,27 @@ class Supervisor:
 
         Presence is not renewed here -- ``_presence_forever`` owns that, so
         losing a lease does not also remove the supervisor from the pool.
+
+        The beat also carries the run this task started, the first time there
+        is one. The ledger used to learn that only from the result, which is
+        the one moment it is no longer interesting: for the hours the run was
+        actually going, nothing connected the task to the job and there was
+        no way to look inside a working supervisor.
         """
 
+        reported: Optional[str] = None
         while True:
             await asyncio.sleep(self.heartbeat_seconds)
+            if reported is None and self.job_id_source is not None:
+                try:
+                    reported = await asyncio.to_thread(self.job_id_source)
+                except Exception as exc:
+                    # Knowing the job id is a convenience for whoever is
+                    # watching; failing to find it must not drop the lease.
+                    logger.debug("could not tell which job %s started: %s", task_id, exc)
             try:
                 await asyncio.to_thread(
-                    self.store.heartbeat, task_id, self.lease_seconds
+                    self.store.heartbeat, task_id, self.lease_seconds, reported
                 )
             except LeaseLost:
                 logger.error("task %s was taken from us; abandoning it", task_id)
@@ -603,6 +622,16 @@ class CoscientistTaskRunner:
     clean transcript and budget.
     """
 
+    #: The variant TTP of the task running right now, or None between tasks.
+    #: The job is looked up through it rather than remembered, because the
+    #: agent starts the run itself and nothing tells us when it did.
+    _ttp_id: Optional[str] = None
+
+    def current_job_id(self) -> Optional[str]:
+        """The run this task has started, if it has started one yet."""
+
+        return job_for_ttp(self._ttp_id) if self._ttp_id else None
+
     def __init__(self, args: Any, store: CampaignStoreClient) -> None:
         self.args = args
         # Needed for the base TTP, which belongs to the campaign rather than
@@ -647,6 +676,10 @@ class CoscientistTaskRunner:
 
         args = self.args
         spec = task.get("spec") or {}
+        # Cleared before anything else: a TTP left over from the task before
+        # would answer current_job_id() with the previous task's run for as
+        # long as this one takes to prepare its own.
+        self._ttp_id = None
         # Both reach the store and the TTP tools over HTTP, and a call that
         # blocks here also stops _heartbeat_forever and _presence_forever.
         base_ttp_id = await asyncio.to_thread(self._base_ttp_id, task)
@@ -659,6 +692,9 @@ class CoscientistTaskRunner:
         )
         goal = build_goal(task, ttp_id)
         budget = _deadline_seconds(task)
+        # From here the run is findable by whoever is watching the campaign,
+        # not only once this task reports.
+        self._ttp_id = ttp_id
 
         def _backend(system_prompt: str):
             return create_backend(
@@ -746,9 +782,12 @@ class CoscientistTaskRunner:
             timed_out = await self._monitor(coordinator, goal, job_id, remaining)
             tokens = driver.total_tokens if coordinator is None else result.total_tokens
 
-        return await self._harvest_or_release(
-            task, job_id, verdict, turns, tokens, timed_out
-        )
+        try:
+            return await self._harvest_or_release(
+                task, job_id, verdict, turns, tokens, timed_out
+            )
+        finally:
+            self._ttp_id = None
 
     async def _harvest_or_release(
         self,
@@ -946,11 +985,13 @@ async def _run(args: Any) -> None:
         os.getenv("CAMPAIGN_STORE_URL", STORE_URL), supervisor_id()
     )
     lease = os.getenv("SUPERVISOR_LEASE_SECONDS")
+    runner = CoscientistTaskRunner(args, store)
     supervisor = Supervisor(
         store,
-        CoscientistTaskRunner(args, store),
+        runner,
         campaign_id=os.getenv("SUPERVISOR_CAMPAIGN_ID") or None,
         lease_seconds=float(lease) if lease else None,
+        job_id_source=runner.current_job_id,
     )
 
     loop = asyncio.get_running_loop()

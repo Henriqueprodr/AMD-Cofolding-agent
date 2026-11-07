@@ -272,7 +272,7 @@ class CampaignConductor:
             goal=campaign.get("goal") or "",
             objectives=list(campaign.get("objectives") or []),
             tasks=tasks,
-            results=self.store.results(self.campaign_id).get("results", []),
+            results=self.store.results(self.campaign_id),
             front=front,
         )
 

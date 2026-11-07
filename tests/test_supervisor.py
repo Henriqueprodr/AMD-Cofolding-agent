@@ -71,6 +71,7 @@ class FakeStore:
         self.results: list[tuple[str, TaskOutcome]] = []
         self.failures: list[tuple[str, str, bool]] = []
         self.heartbeats: list[str] = []
+        self.reported_jobs: list[tuple[str, str]] = []
         self.presence: list[tuple[str, Any]] = []
         self.left_the_pool = False
         self.claims = 0
@@ -87,8 +88,10 @@ class FakeStore:
     def drop_presence(self):
         self.left_the_pool = True
 
-    def heartbeat(self, task_id, lease_seconds=None):
+    def heartbeat(self, task_id, lease_seconds=None, job_id=None):
         self.heartbeats.append(task_id)
+        if job_id:
+            self.reported_jobs.append((task_id, job_id))
 
     def post_result(self, task_id, outcome):
         self.results.append((task_id, outcome))
@@ -467,6 +470,86 @@ class TestSupervisorLoop:
         assert store.heartbeats, "the lease was never renewed"
         assert set(store.heartbeats) == {"a1b2c3d4"}
 
+    def test_the_run_is_reported_while_it_runs(self):
+        """The ledger learned the job id from the result, which is too late.
+
+        For the hours a run was actually going, nothing joined the task to
+        the job, so a person watching a working supervisor could not open
+        what it was working on.
+        """
+        store = FakeStore([_task()])
+
+        async def scenario():
+            slow_enough = asyncio.Event()
+
+            async def _slow(task):
+                await slow_enough.wait()
+                return await _succeeds(task)
+
+            supervisor = Supervisor(
+                store, _slow, heartbeat_seconds=0.01,
+                job_id_source=lambda: "job-42",
+            )
+            running = asyncio.create_task(supervisor.run_once())
+            await asyncio.sleep(0.08)
+            slow_enough.set()
+            await running
+
+        asyncio.run(scenario())
+
+        assert ("a1b2c3d4", "job-42") in store.reported_jobs
+
+    def test_a_task_with_no_run_yet_still_beats(self):
+        """The lease matters more than knowing which job it started."""
+        store = FakeStore([_task()])
+
+        async def scenario():
+            slow_enough = asyncio.Event()
+
+            async def _slow(task):
+                await slow_enough.wait()
+                return await _succeeds(task)
+
+            supervisor = Supervisor(
+                store, _slow, heartbeat_seconds=0.01,
+                job_id_source=lambda: None,
+            )
+            running = asyncio.create_task(supervisor.run_once())
+            await asyncio.sleep(0.08)
+            slow_enough.set()
+            await running
+
+        asyncio.run(scenario())
+
+        assert store.heartbeats, "the lease was never renewed"
+        assert store.reported_jobs == []
+
+    def test_a_job_lookup_that_breaks_does_not_drop_the_lease(self):
+        """Losing the lease would requeue a task that is running fine."""
+        store = FakeStore([_task()])
+
+        def _explodes():
+            raise RuntimeError("the runner is not answering")
+
+        async def scenario():
+            slow_enough = asyncio.Event()
+
+            async def _slow(task):
+                await slow_enough.wait()
+                return await _succeeds(task)
+
+            supervisor = Supervisor(
+                store, _slow, heartbeat_seconds=0.01, job_id_source=_explodes,
+            )
+            running = asyncio.create_task(supervisor.run_once())
+            await asyncio.sleep(0.08)
+            slow_enough.set()
+            await running
+
+        asyncio.run(scenario())
+
+        assert store.heartbeats, "the lease was never renewed"
+
     def test_heartbeating_stops_when_the_task_does(self):
         store = FakeStore([_task()])
 
@@ -484,8 +567,8 @@ class TestSupervisorLoop:
     def test_a_store_outage_does_not_end_a_running_task(self):
         """The work in flight is worth more than the ledger entry."""
         class FlakyHeartbeat(FakeStore):
-            def heartbeat(self, task_id, lease_seconds=None):
-                super().heartbeat(task_id, lease_seconds)
+            def heartbeat(self, task_id, lease_seconds=None, job_id=None):
+                super().heartbeat(task_id, lease_seconds, job_id)
                 raise StoreUnavailable("store is down")
 
         store = FlakyHeartbeat([_task()])
@@ -616,7 +699,7 @@ class TestSupervisorLoop:
         did exactly that: alive, holding a GPU, invisible.
         """
         class LeaseTaken(FakeStore):
-            def heartbeat(self, task_id, lease_seconds=None):
+            def heartbeat(self, task_id, lease_seconds=None, job_id=None):
                 raise LeaseLost("held by someone else")
 
         store = LeaseTaken([_task()])

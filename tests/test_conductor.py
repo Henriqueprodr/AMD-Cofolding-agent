@@ -101,7 +101,9 @@ class FakeStore:
         return {"front": self._status["front"], "ineligible": []}
 
     def results(self, campaign_id):
-        return {"results": self._results}
+        # A list, as the store returns. It was a dict here once and the
+        # conductor was written to match the fake rather than the ledger.
+        return self._results
 
     def enqueue_task(self, campaign_id, **spec):
         self.enqueued.append(spec)

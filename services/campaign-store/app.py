@@ -101,7 +101,13 @@ CREATE TABLE IF NOT EXISTS campaigns (
     created_at        TEXT NOT NULL,
     dispatch_until    REAL,
     hard_stop_at      REAL,
-    finalized_at      TEXT
+    finalized_at      TEXT,
+    -- The conversation whose conductor opened this. Nullable: a campaign
+    -- started from the command line belongs to nobody, and campaigns that
+    -- predate the column belong to nobody either. The store never reads it;
+    -- it is here so a chat window can ask "which of these are mine" without
+    -- the answer living in a browser that will be closed.
+    session_id        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -115,7 +121,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     lease_expires_at  REAL,
     claimed_at        TEXT,
     finished_at       TEXT,
-    error             TEXT
+    error             TEXT,
+    -- The run this task started, reported as soon as it starts rather than
+    -- with the result. results.job_id has always had it afterwards, which is
+    -- no use to somebody asking what a task is doing *now* -- the whole of a
+    -- long run was the part nobody could look inside.
+    job_id            TEXT
 );
 
 CREATE INDEX IF NOT EXISTS tasks_queue
@@ -197,11 +208,31 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+#: Columns added after the first release, as (table, column, definition).
+#: ``CREATE TABLE IF NOT EXISTS`` does nothing to a table that already
+#: exists, so a ledger with campaigns in it would never see a new column and
+#: every query naming it would fail -- on a store whose whole job is to
+#: survive the things around it restarting.
+_ADDED_COLUMNS = [
+    ("campaigns", "session_id", "TEXT"),
+    ("tasks", "job_id", "TEXT"),
+]
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for table, column, definition in _ADDED_COLUMNS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            logger.info("added %s.%s to an existing ledger", table, column)
+
+
 def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _connect() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        _add_missing_columns(conn)
     logger.info("campaign store ready at %s", DB_PATH)
 
 
@@ -423,11 +454,25 @@ class ClaimRequest(BaseModel):
     lease_seconds: float = Field(default=DEFAULT_LEASE_SECONDS, gt=0)
 
 
+class SessionAttach(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    session_id: str = Field(min_length=1)
+
+
 class HeartbeatRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
     owner: str
     lease_seconds: float = Field(default=DEFAULT_LEASE_SECONDS, gt=0)
+    job_id: Optional[str] = Field(
+        default=None,
+        description="The run this task has started, once it has one. Carried "
+                    "on the beat the supervisor already sends rather than on "
+                    "a call of its own, so a task that is running is "
+                    "discoverable the whole time it runs and not only once "
+                    "it reports.",
+    )
 
 
 class ResultPost(BaseModel):
@@ -489,6 +534,7 @@ def _campaign_row(row: sqlite3.Row) -> dict[str, Any]:
         "dispatch_until": row["dispatch_until"],
         "hard_stop_at": row["hard_stop_at"],
         "finalized_at": row["finalized_at"],
+        "session_id": row["session_id"],
     }
 
 
@@ -522,6 +568,7 @@ def _task_row(row: sqlite3.Row) -> dict[str, Any]:
         "claimed_at": row["claimed_at"],
         "finished_at": row["finished_at"],
         "error": row["error"],
+        "job_id": row["job_id"],
     }
 
 
@@ -633,20 +680,58 @@ def create_campaign(body: CampaignCreate) -> dict[str, Any]:
     return _campaign_row(row)
 
 
+@app.post("/campaigns/{campaign_id}/session")
+def attach_session(campaign_id: str, body: SessionAttach) -> dict[str, Any]:
+    """Record which conversation this campaign belongs to.
+
+    Separate from creating it because the two are known in different places:
+    the campaign is opened by a tool running in a process that serves every
+    conversation at once and so cannot know which one asked, while the chat
+    gateway knows exactly. Idempotent, and it will not move a campaign from
+    one conversation to another -- that is a mistake, not an edit.
+    """
+
+    with _write() as conn:
+        row = _get_campaign(conn, campaign_id)
+        if row["session_id"] and row["session_id"] != body.session_id:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Campaign {campaign_id} already belongs to "
+                       f"conversation {row['session_id']}",
+            )
+        if not row["session_id"]:
+            conn.execute(
+                "UPDATE campaigns SET session_id = ? WHERE campaign_id = ?",
+                (body.session_id, campaign_id),
+            )
+        row = _get_campaign(conn, campaign_id)
+    return _campaign_row(row)
+
+
 @app.get("/campaigns")
-def list_campaigns() -> list[dict[str, Any]]:
+def list_campaigns(session_id: Optional[str] = None) -> list[dict[str, Any]]:
     """Every campaign newest first, each with enough to triage it.
 
     Task counts, how many results landed, and when the campaign was last
     touched -- so "what ran most recently and did it produce anything" is one
     call rather than one per campaign. Aggregated in two grouped queries
     rather than a query per campaign.
+
+    With ``session_id``, only that conversation's campaigns. Campaigns
+    belonging to nobody are left out of a filtered list rather than shown to
+    everyone: the question being asked is "which are mine".
     """
 
     with _read() as conn:
-        rows = conn.execute(
-            "SELECT * FROM campaigns ORDER BY created_at DESC"
-        ).fetchall()
+        if session_id:
+            rows = conn.execute(
+                "SELECT * FROM campaigns WHERE session_id = ? "
+                "ORDER BY created_at DESC", (session_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM campaigns ORDER BY created_at DESC"
+            ).fetchall()
 
         counts: dict[str, dict[str, int]] = {}
         latest: dict[str, str] = {}
@@ -895,12 +980,22 @@ def claim_task(body: ClaimRequest) -> Any:
 @app.post("/tasks/{task_id}/heartbeat")
 def heartbeat(task_id: str, body: HeartbeatRequest) -> dict[str, Any]:
     with _write() as conn:
-        _owned_task(conn, task_id, body.owner)
+        existing = _owned_task(conn, task_id, body.owner)
         expires = time.time() + body.lease_seconds
         conn.execute(
             "UPDATE tasks SET lease_expires_at = ? WHERE task_id = ?",
             (expires, task_id),
         )
+        # Written once and then left alone. A retried task runs a second job,
+        # and overwriting would silently repoint anyone watching the first
+        # at a run that is not the one they opened.
+        if body.job_id and not existing["job_id"]:
+            conn.execute(
+                "UPDATE tasks SET job_id = ? WHERE task_id = ?",
+                (body.job_id, task_id),
+            )
+            _emit(conn, "task_started_job", existing["campaign_id"], task_id,
+                  job_id=body.job_id, owner=body.owner)
         row = conn.execute(
             "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
         ).fetchone()

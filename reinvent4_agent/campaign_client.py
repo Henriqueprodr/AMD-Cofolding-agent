@@ -113,10 +113,17 @@ class CampaignStoreClient:
             body["lease_seconds"] = lease_seconds
         return self._call("POST", "/tasks/claim", **body)
 
-    def heartbeat(self, task_id: str, lease_seconds: Optional[float] = None) -> None:
+    def heartbeat(
+        self,
+        task_id: str,
+        lease_seconds: Optional[float] = None,
+        job_id: Optional[str] = None,
+    ) -> None:
         body: dict[str, Any] = {"owner": self.owner}
         if lease_seconds:
             body["lease_seconds"] = lease_seconds
+        if job_id:
+            body["job_id"] = job_id
         self._call("POST", f"/tasks/{task_id}/heartbeat", **body)
 
     def post_result(self, task_id: str, outcome: TaskOutcome) -> dict[str, Any]:
@@ -187,8 +194,16 @@ class CampaignStoreClient:
     def campaign(self, campaign_id: str) -> dict[str, Any]:
         return self._get(f"/campaigns/{campaign_id}")
 
-    def campaigns(self) -> list[dict[str, Any]]:
-        return self._get("/campaigns")
+    def campaigns(self, session_id: Optional[str] = None) -> list[dict[str, Any]]:
+        query = f"?session_id={session_id}" if session_id else ""
+        return self._get(f"/campaigns{query}")
+
+    def attach_session(self, campaign_id: str, session_id: str) -> dict[str, Any]:
+        """Record which conversation a campaign belongs to."""
+
+        return self._call(
+            "POST", f"/campaigns/{campaign_id}/session", session_id=session_id
+        )
 
     def supervisors(self, campaign_id: Optional[str] = None) -> dict[str, Any]:
         """The live pool, with dead presences swept first."""

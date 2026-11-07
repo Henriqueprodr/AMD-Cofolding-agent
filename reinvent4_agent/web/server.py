@@ -602,6 +602,73 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
             summary = {"removed": [], "kept": [], "freedBytes": 0, "error": str(exc)}
         return {"deleted": session_id, "conversationBytes": record, **summary}
 
+    # -- the fleet ------------------------------------------------------------
+    # Read-only views of the campaign ledger. Separate from the tool surface
+    # above because these are for a person looking, not for the agent acting:
+    # going through a tool would put the campaign's own state through the
+    # conversation it is being run from, and a browser polling every few
+    # seconds would fill the transcript with calls nobody made.
+
+    def _ledger() -> Any:
+        from reinvent4_agent.campaign_client import CampaignStoreClient
+
+        return CampaignStoreClient()
+
+    async def _from_ledger(what: str, read: Any) -> Any:
+        from reinvent4_agent.campaign_client import StoreUnavailable
+
+        try:
+            return await asyncio.to_thread(read)
+        except StoreUnavailable as exc:
+            # 503 and not 502: the ledger being away is a thing that passes,
+            # and the browser should say so rather than show an empty fleet,
+            # which reads as "nothing is running".
+            raise HTTPException(
+                status_code=503, detail=f"Could not read {what}: {exc}"
+            ) from exc
+
+    @app.get("/api/fleet/campaigns")
+    async def fleet_campaigns(session: str | None = None) -> list[dict[str, Any]]:
+        """Campaigns, newest first; with ``session``, only that conversation's."""
+
+        if session is not None and not valid_session_id(session):
+            raise HTTPException(status_code=422, detail="Not a session id")
+        ledger = _ledger()
+        return await _from_ledger(
+            "the campaigns", lambda: ledger.campaigns(session_id=session)
+        )
+
+    @app.get("/api/fleet/campaigns/{campaign_id}")
+    async def fleet_campaign(campaign_id: str) -> dict[str, Any]:
+        """One campaign with its tasks, results and the pool working on it.
+
+        In one call because they are read together and separately they tear:
+        tasks fetched a second after the supervisors can show a task claimed
+        by a supervisor that the other call says does not exist.
+        """
+
+        ledger = _ledger()
+
+        def read() -> dict[str, Any]:
+            return {
+                "campaign": ledger.campaign(campaign_id),
+                "tasks": ledger.tasks(campaign_id),
+                "results": ledger.results(campaign_id),
+                "supervisors": ledger.supervisors(campaign_id).get("supervisors", []),
+            }
+
+        return await _from_ledger(f"campaign {campaign_id}", read)
+
+    @app.get("/api/fleet/campaigns/{campaign_id}/events")
+    async def fleet_events(campaign_id: str) -> dict[str, Any]:
+        """What has happened in this campaign, oldest first."""
+
+        ledger = _ledger()
+        return await _from_ledger(
+            f"the history of campaign {campaign_id}",
+            lambda: ledger.events(campaign_id),
+        )
+
     # -- direct tool calls and job files --------------------------------------
 
     @app.post("/api/tools/{name}")
