@@ -21,6 +21,7 @@ from reinvent4_agent.pool import (
     RelayPoolScaler,
     SlurmPoolScaler,
     make_pool_scaler,
+    pool_capacity,
 )
 
 
@@ -198,6 +199,118 @@ class TestRelayPoolScaler:
 
     def test_no_state_yet_is_unknown(self, tmp_path):
         assert RelayPoolScaler(str(tmp_path)).current() is None
+
+
+class TestCapacity:
+    """The ceiling a person is offered before they choose a pool size."""
+
+    def test_slurm_counts_the_partition_s_idle_cpus(self, monkeypatch):
+        monkeypatch.setattr(
+            "reinvent4_agent.pool.shutil.which", lambda name: f"/usr/bin/{name}"
+        )
+        # allocated/idle/other/total, and two supervisors already running.
+        rec = _Recorder({"sinfo": "120/64/0/184\n", "squeue": "101\n102\n"})
+        monkeypatch.setattr(subprocess, "run", rec)
+
+        capacity = SlurmPoolScaler(partition="small").capacity()
+
+        # 64 idle CPUs at 4 each is 16 more, on top of the 2 already there.
+        assert capacity.max_supervisors == 18
+        assert capacity.detail["idle_cpus"] == 64
+
+    def test_slurm_without_a_partition_says_so_rather_than_guessing(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "reinvent4_agent.pool.shutil.which", lambda name: f"/usr/bin/{name}"
+        )
+        monkeypatch.delenv("SLURM_PARTITION", raising=False)
+
+        capacity = SlurmPoolScaler().capacity()
+
+        assert capacity.max_supervisors is None
+
+    def test_the_relay_reports_what_the_host_measured(self, tmp_path):
+        (tmp_path / "pool.state").write_text(json.dumps({
+            "replicas": 2, "at": time.time(),
+            "max_supervisors": 18, "capacity_basis": "idle CPUs in partition small",
+            "idle_cpus": 64, "cpus_each": 4,
+        }))
+
+        capacity = RelayPoolScaler(str(tmp_path)).capacity()
+
+        assert capacity.max_supervisors == 18
+        assert capacity.detail["idle_cpus"] == 64
+
+    def test_a_silent_relay_is_unknown_not_zero(self, tmp_path):
+        """Unknown must not read as "no room": that stops a campaign dead."""
+        assert RelayPoolScaler(str(tmp_path)).capacity().max_supervisors is None
+
+    def test_kubernetes_divides_the_namespace_quota(self, tmp_path, monkeypatch):
+        _service_account(tmp_path)
+        scaler = KubernetesPoolScaler(service_account=tmp_path)
+        quota = {"items": [{"status": {
+            "hard": {"requests.cpu": "40", "requests.memory": "200Gi"},
+            "used": {"requests.cpu": "8", "requests.memory": "32Gi"},
+        }}]}
+        monkeypatch.setattr(
+            scaler, "_request",
+            lambda method, body=None, path=None: (
+                quota if path else {"spec": {"replicas": 2}}
+            ),
+        )
+
+        capacity = scaler.capacity()
+
+        # 32 free cores at 4 each is 8; 168 GiB at 16 each is 10. CPU binds.
+        assert capacity.max_supervisors == 10
+        assert capacity.basis == "namespace quota"
+
+    def test_kubernetes_without_a_quota_is_unknown(self, tmp_path, monkeypatch):
+        """A cluster that will just leave pods Pending is not a number."""
+        _service_account(tmp_path)
+        scaler = KubernetesPoolScaler(service_account=tmp_path)
+        monkeypatch.setattr(
+            scaler, "_request", lambda method, body=None, path=None: {"items": []}
+        )
+
+        assert scaler.capacity().max_supervisors is None
+
+    def test_nothing_schedules_here_so_nothing_is_promised(self):
+        assert NullPoolScaler().capacity().max_supervisors is None
+
+    def test_the_operator_cap_lowers_a_measured_ceiling(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SUPERVISOR_MAX", "6")
+        (tmp_path / "pool.state").write_text(
+            json.dumps({"replicas": 0, "at": time.time(), "max_supervisors": 18})
+        )
+
+        capacity = pool_capacity(RelayPoolScaler(str(tmp_path)))
+
+        assert capacity.max_supervisors == 6
+        assert capacity.detail["measured"] == 18
+
+    def test_the_operator_cap_does_not_raise_a_smaller_one(
+        self, tmp_path, monkeypatch
+    ):
+        """A cap is a ceiling, not a target: the machine still has the say."""
+        monkeypatch.setenv("SUPERVISOR_MAX", "20")
+        (tmp_path / "pool.state").write_text(
+            json.dumps({"replicas": 0, "at": time.time(), "max_supervisors": 3})
+        )
+
+        assert pool_capacity(RelayPoolScaler(str(tmp_path))).max_supervisors == 3
+
+    def test_a_supervisor_s_size_is_configurable(self, monkeypatch):
+        monkeypatch.setenv("SUPERVISOR_CPUS", "8")
+        monkeypatch.setattr(
+            "reinvent4_agent.pool.shutil.which", lambda name: f"/usr/bin/{name}"
+        )
+        monkeypatch.setattr(
+            subprocess, "run", _Recorder({"sinfo": "0/64/0/64\n", "squeue": ""})
+        )
+
+        assert SlurmPoolScaler(partition="small").capacity().max_supervisors == 8
 
 
 class TestSchedulerDetection:

@@ -1601,9 +1601,134 @@ def get_pool_capacity(
     ``can_dispatch`` is yes/no/unknown and ``binding_limit`` names whichever
     one said no. A ``None`` queue_pressure means the gateway did not answer,
     which is not the same as idle.
+
+    ``ceiling`` carries what max_supervisors() reports, so one call answers
+    both "is there room now" and "how large could this pool ever be".
     """
 
     from reinvent4_mcp.tools.campaign import get_pool_capacity as _impl
+
+    return json.dumps(
+        _impl(campaign_id or None), indent=2, default=_json_default
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: max_supervisors
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def max_supervisors() -> str:
+    """The largest supervisor pool this compute could run.
+
+    Ask this before offering somebody a concurrency to choose, rather than
+    letting them pick a number the machine will not honour. Two limits cap
+    it and the smaller wins: what the scheduler would start (free CPUs in
+    the partition under Slurm, the namespace quota under Kubernetes) and what
+    the job backend will accept, since supervisors past the runner's
+    concurrency limit have their tasks refused and burn their retries.
+
+    ``max_supervisors`` of null means neither would say. That is unknown, not
+    unlimited: offer a conservative default and say the ceiling is unreadable
+    rather than inventing one.
+    """
+
+    from reinvent4_mcp.tools.campaign import max_supervisors as _impl
+
+    return json.dumps(_impl(), indent=2, default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# Tool: conduct_campaign
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def conduct_campaign(
+    campaign_id: Annotated[str, Field(description="Campaign to conduct")],
+    task_budget_hours: Annotated[
+        float,
+        Field(default=0.0, ge=0,
+              description="Wall clock per task, capped by the hard stop; "
+                          "0 leaves it to the campaign's own window"),
+    ] = 0.0,
+    max_steps: Annotated[
+        int,
+        Field(default=0, ge=0, description="RL steps per task; 0 for the default"),
+    ] = 0,
+    concurrency: Annotated[
+        int,
+        Field(default=0, ge=0,
+              description="Supervisors to hold in flight; 0 keeps what the "
+                          "campaign was opened with. Check max_supervisors "
+                          "first"),
+    ] = 0,
+) -> str:
+    """Start conducting a campaign: dispatch work and hold the pool at size.
+
+    Opening a campaign does not run it. This is the loop that makes it move --
+    proposing the next weight vector from the Pareto front, enqueueing it for
+    a supervisor to claim, and scaling the pool on every pass. It runs in the
+    background, so say that it has started and carry on; use
+    conducting_status to report progress later.
+
+    Idempotent: asking twice does not start a second loop.
+    """
+
+    from reinvent4_mcp.tools.campaign import conduct_campaign as _impl
+
+    return json.dumps(
+        _impl(
+            campaign_id,
+            task_budget_hours=task_budget_hours or None,
+            max_steps=max_steps or None,
+            concurrency=concurrency or None,
+        ),
+        indent=2, default=_json_default,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: stop_conducting
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def stop_conducting(
+    campaign_id: Annotated[str, Field(description="Campaign to stop dispatching to")],
+) -> str:
+    """Stop dispatching to a campaign, leaving the campaign itself open.
+
+    In-flight tasks keep running and their results still land in the ledger;
+    what stops is the proposing of new work and the resizing of the pool.
+    Use close_campaign to end the campaign, finalize_campaign to close the
+    books.
+    """
+
+    from reinvent4_mcp.tools.campaign import stop_conducting as _impl
+
+    return json.dumps(_impl(campaign_id), indent=2, default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# Tool: conducting_status
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def conducting_status(
+    campaign_id: Annotated[
+        str,
+        Field(default="", description="One campaign, or omit for all of them"),
+    ] = "",
+) -> str:
+    """What is being conducted here, and what the last pass did.
+
+    ``last_tick`` is the conductor's own report of that pass: the window
+    phase, how many tasks are in flight and queued, how many it dispatched,
+    and whether it held back. ``last_error`` is set when a pass failed --
+    the loop keeps going, because a ledger that is briefly unreachable is not
+    a campaign that is over.
+    """
+
+    from reinvent4_mcp.tools.campaign import conducting_status as _impl
 
     return json.dumps(
         _impl(campaign_id or None), indent=2, default=_json_default

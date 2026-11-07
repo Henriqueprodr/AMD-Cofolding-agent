@@ -157,6 +157,14 @@ export SUPERVISOR_JOB_NAME=${SUPERVISOR_JOB_NAME:-dd-supervisor}
 export SUPERVISOR_SBATCH=$REPO/services/lumi/supervisor.sbatch
 export SLURM_ACCOUNT=${SLURM_JOB_ACCOUNT:-}
 export CAMPAIGN_STORE_URL=http://127.0.0.1:8087
+# What a supervisor costs and where it runs; must match supervisor.sbatch,
+# since this is what the pool ceiling is computed from.
+export SUPERVISOR_PARTITION=${SUPERVISOR_PARTITION:-small}
+export SUPERVISOR_CPUS=${SUPERVISOR_CPUS:-4}
+export SUPERVISOR_POOL_CONTROL=$POOL_DIR
+# Empty, not unset: there is no boltz-gateway in this stack, and the two mean
+# different things to the conductor's admission control.
+export BOLTZ_GATEWAY_STATS_URL=
 
 # --- The supervisor pool relay ----------------------------------------------
 # Slurm's clients do not work inside the container: sbatch needs the host's
@@ -189,10 +197,19 @@ pool_relay() {
             scancel $(echo "$ids" | tail -n $((have - want))) \
                 && echo "relay: cancelled $((have - want)) supervisor(s)"
         fi
-        printf '{"replicas": %d, "want": %d, "jobs": [%s], "at": %d}\n' \
+        # The ceiling, measured here for the same reason the submitting is:
+        # sinfo does not work inside the container either. %C is
+        # "allocated/idle/other/total" CPUs across the partition.
+        cpus=$(sinfo --noheader --partition "$SUPERVISOR_PARTITION" --format %C 2>/dev/null \
+               | head -1 | cut -d/ -f2)
+        cpus=${cpus:-0}
+        printf '{"replicas": %d, "want": %d, "jobs": [%s], "at": %d, "max_supervisors": %d, "capacity_basis": "idle CPUs in partition %s", "idle_cpus": %d, "cpus_each": %d, "partition": "%s"}\n' \
             "$have" "$want" \
             "$(echo "$ids" | grep '[0-9]' | sed 's/.*/"&"/' | paste -sd, -)" \
-            "$(date +%s)" > "$POOL_DIR/pool.state.part"
+            "$(date +%s)" \
+            "$(( have + cpus / SUPERVISOR_CPUS ))" "$SUPERVISOR_PARTITION" \
+            "$cpus" "$SUPERVISOR_CPUS" "$SUPERVISOR_PARTITION" \
+            > "$POOL_DIR/pool.state.part"
         mv "$POOL_DIR/pool.state.part" "$POOL_DIR/pool.state"
         sleep "${POOL_RELAY_SECONDS:-20}"
     done

@@ -425,22 +425,34 @@ def get_pool_capacity(campaign_id: Optional[str] = None) -> dict[str, Any]:
         whole fleet.
     """
 
-    from reinvent4_agent.conductor import queue_pressure
+    from reinvent4_agent.conductor import GATEWAY_STATS_URL, queue_pressure
 
     pool = _guard("Could not read the supervisor pool",
                   lambda: _store().supervisors(campaign_id))
     idle = None if "error" in pool else pool["idle"]
 
     pressure = queue_pressure()
-    scorer = {
-        "queue_pressure": None if pressure is None else round(pressure, 2),
-        "verdict": "unknown" if pressure is None
-                   else ("room" if pressure <= 2.0 else "saturated"),
-        "detail": "the boltz gateway did not answer; treat capacity as unknown "
-                  "rather than free" if pressure is None
-                  else f"{pressure:.1f} batches in hand per healthy Boltz "
-                       "replica, queued and in flight together",
-    }
+    if not GATEWAY_STATS_URL:
+        # No gateway in this deployment, so its queue is not a limit here.
+        # Distinct from "it did not answer": one is a deployment without a
+        # proxy, the other is a proxy that is down, and only the second is a
+        # reason to hold dispatch back.
+        scorer = {
+            "queue_pressure": None,
+            "verdict": "not applicable",
+            "detail": "no boltz gateway is configured here, so its queue "
+                      "depth is not a constraint",
+        }
+    else:
+        scorer = {
+            "queue_pressure": None if pressure is None else round(pressure, 2),
+            "verdict": "unknown" if pressure is None
+                       else ("room" if pressure <= 2.0 else "saturated"),
+            "detail": "the boltz gateway did not answer; treat capacity as "
+                      "unknown rather than free" if pressure is None
+                      else f"{pressure:.1f} batches in hand per healthy Boltz "
+                           "replica, queued and in flight together",
+        }
 
     if idle is None:
         verdict, limit = "unknown", "supervisor pool unreadable"
@@ -462,6 +474,169 @@ def get_pool_capacity(campaign_id: Optional[str] = None) -> dict[str, Any]:
             "alive": None if "error" in pool else pool["n_alive"],
         },
         "scorer": scorer,
+        "ceiling": max_supervisors(),
+    }
+
+
+def max_supervisors() -> dict[str, Any]:
+    """The largest supervisor pool this deployment could run.
+
+    A different question from ``get_pool_capacity``'s: that one is about
+    right now, this is the ceiling somebody picks a number under. Two things
+    cap it and the smaller wins -- what the scheduler would start, and what
+    the job backend will accept, since supervisors past the runner's
+    concurrency limit have their tasks refused and spend their time retrying.
+
+    ``max_supervisors`` is ``None`` when neither can be read. That is not the
+    same as unlimited, and a caller offering somebody a choice should say so
+    rather than pick a number.
+    """
+
+    from reinvent4_agent.pool import pool_capacity
+
+    scheduler = pool_capacity()
+    jobs = _runner_concurrency()
+
+    limits = {
+        "scheduler": {
+            "max_supervisors": scheduler.max_supervisors,
+            "basis": scheduler.basis,
+            **({"detail": scheduler.detail} if scheduler.detail else {}),
+        },
+        "jobs": jobs,
+    }
+
+    candidates = [
+        (value, name) for name, value in (
+            ("scheduler", scheduler.max_supervisors),
+            ("jobs", jobs.get("max_concurrent_jobs")),
+        ) if isinstance(value, int)
+    ]
+    if not candidates:
+        return {
+            "max_supervisors": None,
+            "binding_limit": None,
+            "detail": "neither the scheduler nor the job backend would say; "
+                      "this is unknown, not unlimited",
+            "limits": limits,
+        }
+
+    ceiling, binding = min(candidates)
+    return {
+        "max_supervisors": ceiling,
+        "binding_limit": binding,
+        "detail": (
+            f"the {'scheduler' if binding == 'scheduler' else 'job backend'} "
+            f"is the binding limit at {ceiling}"
+        ),
+        "limits": limits,
+    }
+
+
+def _runner_concurrency() -> dict[str, Any]:
+    """How many RL jobs can run at once, from the runner or from config.
+
+    Asked of the runner rather than read from config when there is one: the
+    runner is the process that enforces it, and in a split deployment its
+    config is not necessarily the one this process loaded.
+    """
+
+    from reinvent4_mcp.config import get_config
+
+    config = get_config()
+    if not config.runner.enabled:
+        return {
+            "max_concurrent_jobs": config.jobs.max_concurrent_jobs,
+            "source": "local job manager",
+        }
+
+    import requests
+
+    try:
+        health = requests.get(
+            f"{config.runner.base_url.rstrip('/')}/health", timeout=10
+        ).json()
+    except Exception as exc:  # noqa: BLE001 - any failure is "could not say"
+        logger.warning("could not ask the runner its job limit: %s", exc)
+        return {"max_concurrent_jobs": None,
+                "source": f"reinvent-runner at {config.runner.base_url}",
+                "error": str(exc)}
+
+    value = health.get("max_concurrent_jobs")
+    return {
+        "max_concurrent_jobs": value if isinstance(value, int) else None,
+        "active_jobs": health.get("active_jobs"),
+        "source": f"reinvent-runner at {config.runner.base_url}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Conducting, in this process
+# ---------------------------------------------------------------------------
+
+def conduct_campaign(
+    campaign_id: str,
+    task_budget_hours: Optional[float] = None,
+    max_steps: Optional[int] = None,
+    concurrency: Optional[int] = None,
+    tick_seconds: Optional[float] = None,
+) -> dict[str, Any]:
+    """Start conducting: dispatch work and size the pool until the clock runs out.
+
+    Opening a campaign does not run it. This is what makes it move -- the
+    loop that proposes the next weight vector, enqueues it, and scales the
+    supervisor pool to the campaign's concurrency on every pass. It runs on a
+    background thread here, so the conversation carries on.
+
+    Idempotent: asking twice does not start a second loop.
+    """
+
+    from reinvent4_agent.conducting import REGISTRY
+
+    if concurrency is not None:
+        changed = set_concurrency(campaign_id, concurrency)
+        if "error" in changed:
+            return changed
+
+    campaign = _guard(
+        f"Could not read campaign {campaign_id}",
+        lambda: _store().campaign(campaign_id),
+    )
+    if "error" in campaign:
+        return campaign
+
+    status = REGISTRY.start(
+        campaign_id,
+        task_budget_hours=task_budget_hours,
+        max_steps=max_steps,
+        tick_seconds=tick_seconds,
+        objectives=campaign.get("objectives"),
+    )
+    return status.as_dict()
+
+
+def stop_conducting(campaign_id: str) -> dict[str, Any]:
+    """Stop dispatching to a campaign, leaving the campaign itself open.
+
+    In-flight tasks keep running and their results still land in the ledger;
+    what stops is the proposing of new ones and the resizing of the pool.
+    Use ``close_campaign`` to end the campaign itself.
+    """
+
+    from reinvent4_agent.conducting import REGISTRY
+
+    return REGISTRY.stop(campaign_id).as_dict()
+
+
+def conducting_status(campaign_id: Optional[str] = None) -> dict[str, Any]:
+    """What this process is conducting, and what its last pass did."""
+
+    from reinvent4_agent.conducting import REGISTRY
+
+    conducting = [status.as_dict() for status in REGISTRY.status(campaign_id)]
+    return {
+        "conducting": conducting,
+        "n_running": sum(1 for status in conducting if status["running"]),
     }
 
 

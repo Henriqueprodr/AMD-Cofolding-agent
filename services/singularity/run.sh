@@ -331,9 +331,23 @@ for _v in LLM_GATEWAY_KEY REINVENT4_AGENT_API_KEY \
           REINVENT4_AGENT_THINKING_BUDGET REINVENT4_AGENT_REASONING_EFFORT \
           REINVENT4_AGENT_MULTI_AGENT REINVENT4_AGENT_LOG_TIMESTAMPS \
           REINVENT4_AGENT_MAX_TOOL_RESULT_CHARS REINVENT4_AGENT_MAX_TOOL_ROUNDS \
-          REINVENT4_WEB_MODEL_CONTROL; do
-    [ -n "${!_v:-}" ] && AGENT_ENV+=(--env "${_v}=${!_v}")
+          REINVENT4_WEB_MODEL_CONTROL \
+          CAMPAIGN_STORE_URL DD_SERVICE_REGISTRY BOLTZ_GATEWAY_STATS_URL \
+          SUPERVISOR_POOL_CONTROL SUPERVISOR_JOB_NAME SUPERVISOR_SBATCH \
+          SUPERVISOR_PARTITION SUPERVISOR_CPUS SUPERVISOR_MEM_GB SUPERVISOR_MAX \
+          SLURM_ACCOUNT SLURM_PARTITION; do
+    # BOLTZ_GATEWAY_STATS_URL is forwarded when *set to empty* too: empty
+    # means "no gateway here", which is a different answer from unset.
+    if [ -n "${!_v+set}" ] && { [ -n "${!_v}" ] || [ "${_v}" = BOLTZ_GATEWAY_STATS_URL ]; }; then
+        AGENT_ENV+=(--env "${_v}=${!_v}")
+    fi
 done
+# The agent conducts campaigns itself now, and on a scheduler that means
+# asking the host-side relay for supervisors -- which it does through this
+# directory, so it has to exist on both sides of the boundary.
+if [ -n "${SUPERVISOR_POOL_CONTROL:-}" ] && [ -d "${SUPERVISOR_POOL_CONTROL}" ]; then
+    AGENT_BINDS+=(--bind "${SUPERVISOR_POOL_CONTROL}")
+fi
 
 if [ "${WEB}" -eq 1 ]; then
     case "${DD_WEB_HOST:-127.0.0.1}" in

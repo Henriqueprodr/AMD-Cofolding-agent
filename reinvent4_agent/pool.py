@@ -21,12 +21,22 @@ the container boundary. There the conductor writes the number it wants to a
 file and a plain bash loop on the host, inside the same allocation, submits
 and cancels on its behalf.
 
+Each scaler also answers *how many* could run at all, which is a different
+question from how many are running: a person choosing a pool size needs the
+ceiling the compute imposes before they choose, not a refusal afterwards. The
+ceiling is read from whatever the scheduler will tell us -- free CPUs in the
+partition on Slurm, the namespace quota on Kubernetes -- and is ``None`` when
+it cannot be known, which is not the same as unlimited.
+
 Env:
     SUPERVISOR_DEPLOYMENT     Deployment to scale on Kubernetes
     POD_NAMESPACE             namespace for the scale call
     SUPERVISOR_JOB_NAME       Slurm job name identifying pool members
     SUPERVISOR_SBATCH         sbatch script submitted to add one supervisor
     SUPERVISOR_POOL_CONTROL   directory shared with a host-side relay
+    SUPERVISOR_CPUS           CPUs one supervisor asks for (default 4)
+    SUPERVISOR_MEM_GB         memory one supervisor asks for (default 16)
+    SUPERVISOR_MAX            hard ceiling, overriding anything measured
 """
 
 from __future__ import annotations
@@ -37,6 +47,7 @@ import os
 import shutil
 import subprocess
 import time
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
@@ -57,6 +68,55 @@ _SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 _LIVE_STATES = "PENDING,CONFIGURING,RUNNING,COMPLETING,SUSPENDED"
 
 
+def _env_number(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+def supervisor_cost() -> tuple[float, float]:
+    """CPUs and GiB of memory one supervisor asks its scheduler for."""
+
+    return _env_number("SUPERVISOR_CPUS", 4), _env_number("SUPERVISOR_MEM_GB", 16)
+
+
+@dataclass
+class PoolCapacity:
+    """How many supervisors the scheduler would run, and what says so.
+
+    ``max_supervisors`` counts the pool as a whole -- the ones already running
+    plus the ones there is room to add -- because that is the number a person
+    sets, not the increment.
+    """
+
+    max_supervisors: Optional[int]
+    basis: str
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _with_override(capacity: PoolCapacity) -> PoolCapacity:
+    """Apply SUPERVISOR_MAX, which an operator sets to keep a pool smaller
+    than the hardware would allow -- a shared node, a budget."""
+
+    raw = os.getenv("SUPERVISOR_MAX", "").strip()
+    if not raw:
+        return capacity
+    try:
+        ceiling = int(raw)
+    except ValueError:
+        logger.warning("ignoring SUPERVISOR_MAX=%r: not an integer", raw)
+        return capacity
+    if capacity.max_supervisors is not None and capacity.max_supervisors <= ceiling:
+        return capacity
+    return PoolCapacity(
+        ceiling, "SUPERVISOR_MAX", {**capacity.detail, "measured": capacity.max_supervisors}
+    )
+
+
 @runtime_checkable
 class PoolScaler(Protocol):
     """What the conductor needs from whatever is running the supervisors."""
@@ -70,6 +130,9 @@ class PoolScaler(Protocol):
 
     def scale(self, replicas: int) -> bool:
         """Size the pool. False when it could not be done."""
+
+    def capacity(self) -> PoolCapacity:
+        """The largest pool this compute would run, with what decided it."""
 
 
 class KubernetesPoolScaler:
@@ -108,12 +171,17 @@ class KubernetesPoolScaler:
     def available(self) -> bool:
         return self.in_cluster
 
-    def _request(self, method: str, body: Optional[dict[str, Any]] = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        body: Optional[dict[str, Any]] = None,
+        path: Optional[str] = None,
+    ) -> Any:
         token = (self._sa / "token").read_text().strip()
-        url = (
-            f"https://kubernetes.default.svc/apis/apps/v1/namespaces/"
+        url = "https://kubernetes.default.svc" + (path or (
+            f"/apis/apps/v1/namespaces/"
             f"{self.namespace}/deployments/{self.deployment}/scale"
-        )
+        ))
         headers = {"Authorization": f"Bearer {token}"}
         if method == "PATCH":
             # Merge patch: the smallest thing that expresses "only replicas".
@@ -158,6 +226,72 @@ class KubernetesPoolScaler:
 
         logger.info("scaled %s to %d", self.deployment, replicas)
         return True
+
+    def capacity(self) -> PoolCapacity:
+        """How many supervisors the namespace quota leaves room for.
+
+        A quota is the only ceiling a namespace can state about itself. With
+        none declared the honest answer is unknown: the cluster's free
+        capacity is not ours to read, and a scheduler that will simply leave
+        pods Pending is not a number we can offer somebody.
+        """
+
+        if not self.in_cluster:
+            return PoolCapacity(None, "not in a cluster")
+
+        try:
+            quotas = self._request(
+                "GET", path=f"/api/v1/namespaces/{self.namespace}/resourcequotas"
+            )["items"]
+        except (requests.RequestException, KeyError, OSError) as exc:
+            logger.warning("could not read the namespace quota: %s", exc)
+            return PoolCapacity(None, "the namespace quota could not be read")
+
+        cpus, mem_gb = supervisor_cost()
+        room: list[int] = []
+        detail: dict[str, Any] = {"cpus_each": cpus, "mem_gb_each": mem_gb}
+        for quota in quotas:
+            status = quota.get("status") or {}
+            hard, used = status.get("hard") or {}, status.get("used") or {}
+            for key, per_one in (("requests.cpu", cpus), ("requests.memory", mem_gb)):
+                if key not in hard:
+                    continue
+                free = _k8s_quantity(hard[key]) - _k8s_quantity(used.get(key, "0"))
+                room.append(int(free // per_one))
+                detail[f"free_{key}"] = round(free, 2)
+
+        if not room:
+            return PoolCapacity(None, "the namespace declares no cpu or memory quota")
+
+        running = self.current() or 0
+        # The quota counts what is already running, so the free room is the
+        # room to *add*; the pool size is that plus what is there.
+        return PoolCapacity(max(running, running + min(room)), "namespace quota", detail)
+
+
+def _k8s_quantity(value: str) -> float:
+    """A Kubernetes quantity as a plain number: cores for cpu, GiB for memory.
+
+    Only the suffixes a quota actually uses. An unparseable value is zero
+    room rather than an exception, because a quota we cannot read should
+    make the pool smaller, never larger.
+    """
+
+    text = str(value).strip()
+    units = {
+        "m": 1 / 1000, "Ki": 1 / 1024 ** 2, "Mi": 1 / 1024, "Gi": 1.0,
+        "Ti": 1024.0, "K": 1e3 / 1024 ** 3, "M": 1e6 / 1024 ** 3, "G": 1e9 / 1024 ** 3,
+    }
+    for suffix, factor in sorted(units.items(), key=lambda kv: -len(kv[0])):
+        if text.endswith(suffix):
+            try:
+                return float(text[: -len(suffix)]) * factor
+            except ValueError:
+                return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
 
 
 class SlurmPoolScaler:
@@ -268,6 +402,46 @@ class SlurmPoolScaler:
         logger.info("cancelled supervisors %s", ", ".join(ids))
         return True
 
+    def capacity(self) -> PoolCapacity:
+        """How many supervisors the partition has free CPUs for right now.
+
+        Idle CPUs rather than total: a pool sized to a busy partition is a
+        pool that mostly sits PENDING, which looks to a person like the fleet
+        is broken rather than like the machine is full. Supervisors already
+        running are counted back in, since their CPUs are no longer idle but
+        are still ours.
+        """
+
+        if not self.in_slurm:
+            return PoolCapacity(None, "no Slurm client here")
+
+        out = self._run(
+            "sinfo", "--noheader", "--partition", self.partition or "", "--format", "%C"
+        ) if self.partition else None
+        if not out:
+            return PoolCapacity(
+                None,
+                "the partition's free CPUs could not be read"
+                if self.partition else "no partition set (SLURM_PARTITION)",
+            )
+
+        # sinfo %C is "allocated/idle/other/total", aggregated over the partition.
+        fields = out.strip().splitlines()[0].strip().split("/")
+        try:
+            idle, total = int(fields[1]), int(fields[3])
+        except (IndexError, ValueError):
+            logger.warning("could not parse sinfo CPU counts %r", out.strip())
+            return PoolCapacity(None, "the partition's CPU counts were unreadable")
+
+        cpus, _ = supervisor_cost()
+        running = self.current() or 0
+        return PoolCapacity(
+            max(running, running + int(idle // cpus)),
+            f"idle CPUs in partition {self.partition}",
+            {"idle_cpus": idle, "total_cpus": total, "cpus_each": cpus,
+             "running": running},
+        )
+
 
 class RelayPoolScaler:
     """Asks a host-side relay to do the scaling, through two small files.
@@ -296,7 +470,9 @@ class RelayPoolScaler:
     def available(self) -> bool:
         return bool(self.dir.name) and self.dir.is_dir()
 
-    def current(self) -> Optional[int]:
+    def _state(self) -> Optional[dict[str, Any]]:
+        """The relay's last report, or None if there is not a fresh one."""
+
         if not self.available:
             return None
         try:
@@ -309,8 +485,30 @@ class RelayPoolScaler:
         if isinstance(at, (int, float)) and time.time() - at > self.STALE_AFTER:
             logger.warning("the pool relay has not reported for %.0fs", time.time() - at)
             return None
+        return state
+
+    def current(self) -> Optional[int]:
+        state = self._state()
+        if state is None:
+            return None
         replicas = state.get("replicas")
         return replicas if isinstance(replicas, int) else None
+
+    def capacity(self) -> PoolCapacity:
+        """Whatever the relay measured, since sinfo does not work in here either."""
+
+        state = self._state()
+        if state is None:
+            return PoolCapacity(None, "the pool relay has not reported")
+        measured = state.get("max_supervisors")
+        if not isinstance(measured, int):
+            return PoolCapacity(None, "the pool relay reported no capacity")
+        return PoolCapacity(
+            measured,
+            state.get("capacity_basis") or "measured by the pool relay",
+            {k: state[k] for k in ("idle_cpus", "cpus_each", "partition")
+             if k in state},
+        )
 
     def scale(self, replicas: int) -> bool:
         if not self.available:
@@ -348,6 +546,9 @@ class NullPoolScaler:
         logger.info("no scheduler here; would size the pool to %d", replicas)
         return False
 
+    def capacity(self) -> PoolCapacity:
+        return PoolCapacity(None, "no scheduler here")
+
 
 def make_pool_scaler(**kwargs: Any) -> PoolScaler:
     """Pick the scaler that matches where this process is running.
@@ -375,3 +576,14 @@ def make_pool_scaler(**kwargs: Any) -> PoolScaler:
         return slurm
 
     return NullPoolScaler()
+
+
+def pool_capacity(scaler: Optional[PoolScaler] = None) -> PoolCapacity:
+    """The ceiling for this compute, with the operator's cap applied.
+
+    Use this rather than ``scaler.capacity()`` directly: SUPERVISOR_MAX is a
+    decision about the deployment rather than about the scheduler, so no
+    scaler knows about it and every caller would otherwise have to.
+    """
+
+    return _with_override((scaler or make_pool_scaler()).capacity())
