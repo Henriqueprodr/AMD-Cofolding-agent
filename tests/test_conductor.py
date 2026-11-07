@@ -1,4 +1,4 @@
-"""Tests for reinvent4_agent/conductor.py -- the campaign loop.
+﻿"""Tests for reinvent4_agent/conductor.py -- the campaign loop.
 
 ``tick()`` is a pure function of a ledger read, so the whole loop is testable
 against a fake store: the windows, the top-up arithmetic, the Pareto-guided
@@ -18,8 +18,8 @@ import requests
 
 from reinvent4_agent.conductor import (
     CampaignConductor,
+    KubernetesPoolScaler,
     ParetoProposer,
-    PoolScaler,
     WeightVector,
     format_status,
     front_weights,
@@ -827,11 +827,11 @@ class TestStatusView:
 # ---------------------------------------------------------------------------
 
 
-class TestPoolScaler:
+class TestKubernetesPoolScaler:
 
     def test_outside_a_cluster_it_is_a_noop(self, tmp_path):
         """A laptop run should exercise the loop, not fail on the one cluster bit."""
-        scaler = PoolScaler("dd-agentic-supervisor", "demo", tmp_path)
+        scaler = KubernetesPoolScaler("dd-agentic-supervisor", "demo", tmp_path)
 
         assert scaler.in_cluster is False
         assert scaler.scale(4) is False
@@ -840,7 +840,7 @@ class TestPoolScaler:
     def test_the_namespace_comes_from_the_service_account(self, tmp_path):
         (tmp_path / "namespace").write_text("demo-lux\n")
 
-        assert PoolScaler("d", None, tmp_path).namespace == "demo-lux"
+        assert KubernetesPoolScaler("d", None, tmp_path).namespace == "demo-lux"
 
     def test_it_patches_only_the_replica_count(self, tmp_path, monkeypatch):
         _service_account(tmp_path)
@@ -852,7 +852,7 @@ class TestPoolScaler:
             return _ok({"spec": {"replicas": 0}})
 
         monkeypatch.setattr(requests, "request", _record)
-        scaler = PoolScaler("dd-agentic-supervisor", "demo-lux", tmp_path)
+        scaler = KubernetesPoolScaler("dd-agentic-supervisor", "demo-lux", tmp_path)
 
         assert scaler.scale(4) is True
 
@@ -876,7 +876,7 @@ class TestPoolScaler:
 
         monkeypatch.setattr(requests, "request", _record)
 
-        assert PoolScaler("d", "demo", tmp_path).scale(3) is True
+        assert KubernetesPoolScaler("d", "demo", tmp_path).scale(3) is True
         assert "PATCH" not in methods
 
     def test_a_refused_scale_is_reported_not_raised(self, tmp_path, monkeypatch):
@@ -890,7 +890,7 @@ class TestPoolScaler:
 
         monkeypatch.setattr(requests, "request", _forbid)
 
-        assert PoolScaler("d", "demo", tmp_path).scale(4) is False
+        assert KubernetesPoolScaler("d", "demo", tmp_path).scale(4) is False
 
 
 def _service_account(path) -> None:

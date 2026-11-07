@@ -23,12 +23,17 @@ hard stop arrives, every in-flight task has therefore already wound itself up;
 the conductor does not have to reach across into the runner to stop jobs it
 does not own.
 
+The pool is sized through :mod:`reinvent4_agent.pool`, which knows whether it
+is talking to Kubernetes or Slurm. Nothing in this file does.
+
 Env:
     CAMPAIGN_STORE_URL        the ledger
     BOLTZ_GATEWAY_STATS_URL   queue depth, for admission control
-    SUPERVISOR_DEPLOYMENT     the Deployment to scale (default dd-agentic-supervisor)
-    POD_NAMESPACE             namespace for the scale call
     CONDUCTOR_TICK_SECONDS    how often the loop reconsiders
+    DD_SERVICE_REGISTRY       service discovery file, when there is no DNS
+
+See :mod:`reinvent4_agent.pool` for the variables that select and configure
+the scaler.
 """
 
 from __future__ import annotations
@@ -40,22 +45,25 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 import requests
 
 from reinvent4_agent.campaign_client import CampaignStoreClient, StoreUnavailable
+from reinvent4_agent.pool import (
+    SUPERVISOR_DEPLOYMENT,
+    KubernetesPoolScaler,
+    PoolScaler,
+    make_pool_scaler,
+)
+from reinvent4_agent.service_registry import apply_registry
 
 logger = logging.getLogger(__name__)
 
 TICK_SECONDS = float(os.getenv("CONDUCTOR_TICK_SECONDS", "30"))
-SUPERVISOR_DEPLOYMENT = os.getenv("SUPERVISOR_DEPLOYMENT", "dd-agentic-supervisor")
 GATEWAY_STATS_URL = os.getenv(
     "BOLTZ_GATEWAY_STATS_URL", "http://dd-agentic-boltz-gateway:8091/stats"
 )
-
-_SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 
 
 # ---------------------------------------------------------------------------
@@ -191,94 +199,6 @@ def front_weights(
         if weights:
             paired.append({**member, "weights": weights})
     return paired
-
-
-# ---------------------------------------------------------------------------
-# Pool scaling
-# ---------------------------------------------------------------------------
-
-class PoolScaler:
-    """Scales the supervisor Deployment through the Kubernetes API.
-
-    Talks to the API directly with the pod's ServiceAccount token rather than
-    shelling out to ``kubectl`` (not in the image) or pulling in the Kubernetes
-    client (a dependency for two HTTP calls).
-
-    Outside a cluster there is no token, and every call is a logged no-op: a
-    conductor run on a laptop should exercise the loop, not fail on the one
-    thing that needs a cluster.
-    """
-
-    def __init__(
-        self,
-        deployment: str = SUPERVISOR_DEPLOYMENT,
-        namespace: Optional[str] = None,
-        service_account: Path = _SERVICE_ACCOUNT,
-    ) -> None:
-        self.deployment = deployment
-        self._sa = service_account
-        self.namespace = namespace or os.getenv("POD_NAMESPACE") or self._namespace()
-
-    def _namespace(self) -> str:
-        try:
-            return (self._sa / "namespace").read_text().strip()
-        except OSError:
-            return "default"
-
-    @property
-    def in_cluster(self) -> bool:
-        return (self._sa / "token").is_file()
-
-    def _request(self, method: str, body: Optional[dict[str, Any]] = None) -> Any:
-        token = (self._sa / "token").read_text().strip()
-        url = (
-            f"https://kubernetes.default.svc/apis/apps/v1/namespaces/"
-            f"{self.namespace}/deployments/{self.deployment}/scale"
-        )
-        headers = {"Authorization": f"Bearer {token}"}
-        if method == "PATCH":
-            # Merge patch: the smallest thing that expresses "only replicas".
-            headers["Content-Type"] = "application/merge-patch+json"
-
-        response = requests.request(
-            method, url, json=body, headers=headers,
-            verify=str(self._sa / "ca.crt"), timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def current(self) -> Optional[int]:
-        """Replicas the Deployment is set to, or None when not in a cluster."""
-
-        if not self.in_cluster:
-            return None
-        try:
-            return self._request("GET")["spec"].get("replicas", 0)
-        except (requests.RequestException, KeyError, OSError) as exc:
-            logger.warning("could not read the supervisor replica count: %s", exc)
-            return None
-
-    def scale(self, replicas: int) -> bool:
-        """Set the replica count. False when it could not be done."""
-
-        if not self.in_cluster:
-            logger.info(
-                "not in a cluster; would scale %s to %d", self.deployment, replicas
-            )
-            return False
-
-        if self.current() == replicas:
-            return True
-
-        try:
-            self._request("PATCH", {"spec": {"replicas": replicas}})
-        except (requests.RequestException, OSError) as exc:
-            # Most likely the ServiceAccount has no deployments/scale grant.
-            logger.error("could not scale %s to %d: %s", self.deployment, replicas, exc)
-            return False
-
-        logger.info("scaled %s to %d", self.deployment, replicas)
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -824,6 +744,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     args = parser.parse_args(argv)
 
+    # Before anything reads a service URL. A no-op on Kubernetes, where the
+    # ConfigMap has already set every variable this could fill in.
+    apply_registry()
+
     opening_flags = (
         args.goal, args.base_ttp, args.objectives, args.hours,
     )
@@ -854,7 +778,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     conductor = CampaignConductor(
         store,
         campaign_id,
-        scaler=None if args.no_scale else PoolScaler(),
+        scaler=None if args.no_scale else make_pool_scaler(),
         task_budget_seconds=(
             args.task_budget_hours * 3600 if args.task_budget_hours else None
         ),
