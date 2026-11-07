@@ -16,7 +16,10 @@ From: mambaorg/micromamba:1.5-jammy
 
 %files
     # Build context is the dd_agentic/ root (apptainer build is invoked there).
-    services/structure-prep/ /app/
+    # Apptainer creates the destination and copies into it, so this lands as
+    # /app/structure-prep rather than flattening into /app the way the
+    # Dockerfile's COPY does -- hence the working directory below.
+    services/structure-prep /app/
 
 %post
     set -eux
@@ -56,6 +59,10 @@ import rdkit; import pdb2pqr; \
 import fastapi; import pydantic; \
 print('All imports OK')"
 
+    # Fails the build rather than the first request if %files ever lands the
+    # service somewhere other than where the run script looks for it.
+    test -f /app/structure-prep/app.py
+
 %environment
     export PATH=/opt/conda/bin:$PATH
     export SP_SHARED_DIR=${SP_SHARED_DIR:-/shared}
@@ -64,11 +71,11 @@ print('All imports OK')"
     export PORT=${PORT:-8089}
 
 %startscript
-    cd /app
+    cd /app/structure-prep
     exec /opt/conda/bin/python -m uvicorn app:app --host 0.0.0.0 --port "${PORT:-8089}"
 
 %runscript
-    cd /app
+    cd /app/structure-prep
     exec /opt/conda/bin/python -m uvicorn app:app --host 0.0.0.0 --port "${PORT:-8089}"
 
 %labels

@@ -18,11 +18,18 @@ From: mambaorg/micromamba:1.5-jammy
 
 %files
     # Build context is the dd_agentic/ root (apptainer build is invoked there).
-    services/synthesis-planner/environment.yml /tmp/environment.yml
+    #
+    # Not /tmp, which is where the Dockerfile stages these: Apptainer binds the
+    # host's /tmp over the container's during %post, so anything %files puts
+    # there is hidden by the time the build would read it.
+    services/synthesis-planner/environment.yml /opt/build/environment.yml
     services/synthesis-planner/app.py /app/app.py
-    services/synthesis-planner/synthesis_planner/ /app/synthesis_planner/
-    services/synthesis-planner/download_models.py /tmp/download_models.py
-    services/synthesis-planner/write_manifest.py /tmp/write_manifest.py
+    # Destination is the parent, not the package: Apptainer creates the
+    # destination directory and copies into it, so naming the package here
+    # would nest it as /app/synthesis_planner/synthesis_planner.
+    services/synthesis-planner/synthesis_planner /app/
+    services/synthesis-planner/download_models.py /opt/build/download_models.py
+    services/synthesis-planner/write_manifest.py /opt/build/write_manifest.py
 
 %post
     set -eux
@@ -30,12 +37,12 @@ From: mambaorg/micromamba:1.5-jammy
     export MODELS_DIR=/app/models
     export PYTHONHASHSEED=0
 
-    micromamba install -y -n base -f /tmp/environment.yml
+    micromamba install -y -n base -f /opt/build/environment.yml
     micromamba clean --all --yes
 
     cd /app
-    /opt/conda/bin/python3 /tmp/download_models.py
-    /opt/conda/bin/python3 /tmp/write_manifest.py
+    /opt/conda/bin/python3 /opt/build/download_models.py
+    /opt/conda/bin/python3 /opt/build/write_manifest.py
 
     # Fails the build rather than the first request if a model did not land.
     /opt/conda/bin/python -c "\
