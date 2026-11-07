@@ -752,6 +752,16 @@ class TestSupervisorPool:
         # queue; a campaign begins by scaling up.
         assert deployments[SUPERVISOR_DEPLOYMENT]["spec"]["replicas"] == 0
 
+    def test_shrinking_the_pool_does_not_kill_a_run(self, deployments):
+        # SIGTERM makes a supervisor finish its task and exit, and an RL task
+        # is hours. A short grace period turns "use fewer agents" into "throw
+        # away what they were doing", which is not what the number means.
+        grace = _pod_spec(
+            deployments[SUPERVISOR_DEPLOYMENT]
+        )["terminationGracePeriodSeconds"]
+
+        assert grace >= 3600
+
     def test_it_is_the_agent_image_with_another_entrypoint(self, deployments):
         # A supervisor *is* the agent, so there is no second image to build and
         # no second copy of the agent to keep in step.

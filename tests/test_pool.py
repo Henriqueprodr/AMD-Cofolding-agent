@@ -73,7 +73,7 @@ class TestSlurmPoolScaler:
         assert scaler.scale(3) is False
 
     def test_the_count_comes_from_squeue(self, slurm, monkeypatch):
-        rec = _Recorder({"squeue": "101\n102\n103\n"})
+        rec = _Recorder({"squeue": "101 RUNNING\n102 RUNNING\n103 PENDING\n"})
         monkeypatch.setattr(subprocess, "run", rec)
 
         assert slurm.current() == 3
@@ -84,7 +84,7 @@ class TestSlurmPoolScaler:
         assert "COMPLETING" in argv[argv.index("--states") + 1]
 
     def test_scaling_up_submits_the_difference(self, slurm, monkeypatch):
-        rec = _Recorder({"squeue": "101\n", "sbatch": "777\n"})
+        rec = _Recorder({"squeue": "101 RUNNING\n", "sbatch": "777\n"})
         monkeypatch.setattr(subprocess, "run", rec)
 
         assert slurm.scale(3) is True
@@ -94,18 +94,66 @@ class TestSlurmPoolScaler:
         assert submits[0][-1] == "sup.sbatch"
         assert "--parsable" in submits[0]
 
-    def test_scaling_down_cancels_the_youngest(self, slurm, monkeypatch):
-        """Oldest jobs are closest to a checkpoint, so they are kept."""
-        rec = _Recorder({"squeue": "101\n102\n103\n104\n"})
+    def test_a_working_supervisor_is_asked_to_stop_not_killed(self, slurm, monkeypatch):
+        """Cancelling one destroys the RL run it is an hour into.
+
+        It handles SIGTERM by finishing the task and exiting, which takes far
+        longer than the grace period a cancel allows -- so the drain it was
+        written for would never once have completed.
+        """
+        rec = _Recorder({"squeue": "101 RUNNING\n102 RUNNING\n103 RUNNING\n"})
         monkeypatch.setattr(subprocess, "run", rec)
 
         assert slurm.scale(2) is True
 
-        cancel = rec.argv_for("scancel")[0]
-        assert cancel == ["scancel", "103", "104"]
+        assert rec.argv_for("scancel") == [
+            ["scancel", "--signal=TERM", "--full", "103"]
+        ]
+
+    def test_the_youngest_running_supervisor_is_the_one_asked(self, slurm, monkeypatch):
+        """The oldest is furthest into its task and has the most to lose."""
+        rec = _Recorder({"squeue": "101 RUNNING\n102 RUNNING\n103 RUNNING\n104 RUNNING\n"})
+        monkeypatch.setattr(subprocess, "run", rec)
+
+        slurm.scale(2)
+
+        assert rec.argv_for("scancel")[0][-2:] == ["103", "104"]
+
+    def test_a_supervisor_that_never_started_is_cancelled_outright(self, slurm, monkeypatch):
+        """It holds no work, and the CPU it frees is free now."""
+        rec = _Recorder({"squeue": "101 RUNNING\n102 PENDING\n"})
+        monkeypatch.setattr(subprocess, "run", rec)
+
+        assert slurm.scale(1) is True
+
+        assert rec.argv_for("scancel") == [["scancel", "102"]]
+
+    def test_queued_supervisors_are_given_back_before_working_ones(self, slurm, monkeypatch):
+        """Giving back a running one costs a run; a pending one costs nothing."""
+        rec = _Recorder({
+            "squeue": "101 RUNNING\n102 RUNNING\n103 PENDING\n104 PENDING\n"
+        })
+        monkeypatch.setattr(subprocess, "run", rec)
+
+        slurm.scale(2)
+
+        assert rec.argv_for("scancel") == [["scancel", "103", "104"]]
+
+    def test_a_big_shrink_spends_the_queue_then_asks_the_rest(self, slurm, monkeypatch):
+        rec = _Recorder({
+            "squeue": "101 RUNNING\n102 RUNNING\n103 RUNNING\n104 PENDING\n"
+        })
+        monkeypatch.setattr(subprocess, "run", rec)
+
+        slurm.scale(1)
+
+        assert rec.argv_for("scancel") == [
+            ["scancel", "104"],
+            ["scancel", "--signal=TERM", "--full", "102", "103"],
+        ]
 
     def test_scaling_to_the_current_size_touches_nothing(self, slurm, monkeypatch):
-        rec = _Recorder({"squeue": "101\n102\n"})
+        rec = _Recorder({"squeue": "101 RUNNING\n102 RUNNING\n"})
         monkeypatch.setattr(subprocess, "run", rec)
 
         assert slurm.scale(2) is True
@@ -115,7 +163,7 @@ class TestSlurmPoolScaler:
 
     def test_two_ticks_in_a_row_submit_once(self, slurm, monkeypatch):
         """The conductor relies on tick() being idempotent."""
-        state = {"out": "101\n"}
+        state = {"out": "101 RUNNING\n"}
         rec = _Recorder({"sbatch": "777\n"})
 
         def _run(argv, **kwargs):

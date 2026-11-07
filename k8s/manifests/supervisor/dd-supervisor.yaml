@@ -26,11 +26,15 @@ spec:
         app.kubernetes.io/name: dd-agentic-supervisor
         app.kubernetes.io/component: supervisor
     spec:
-      # SIGTERM stops it claiming new work; the task in hand keeps running for
-      # this long and then the pod goes. Whatever it was holding returns to the
-      # queue when the lease lapses, so this is a trade between draining
-      # politely and freeing the node, not a correctness question.
-      terminationGracePeriodSeconds: 120
+      # SIGTERM stops it claiming new work and it exits once the task in hand
+      # is done. This is the cap on that, not a wait: a drained supervisor
+      # goes as soon as it finishes, and the task deadline -- which every task
+      # carries and which the supervisor turns into a checkpointing stop -- is
+      # what actually bounds it. It was two minutes, which meant shrinking the
+      # pool killed a supervisor mid-run and sent hours of RL work back to the
+      # queue to be done again. Scaling down is meant to cost throughput, not
+      # work.
+      terminationGracePeriodSeconds: 21600
       containers:
         # The same image as the interactive agent. A supervisor *is* the agent
         # with a different entrypoint, so there is no supervisor image to

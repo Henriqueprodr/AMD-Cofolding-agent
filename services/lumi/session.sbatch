@@ -174,15 +174,16 @@ export BOLTZ_GATEWAY_STATS_URL=
 # makes it true -- the submitting and cancelling that SlurmPoolScaler would
 # have done, in the one place that can actually do it.
 pool_relay() {
-    local want have ids id n
+    local want have rows ids waiting running surplus take id n
     while true; do
         want=$(cat "$POOL_DIR/pool.want" 2>/dev/null | tr -dc '0-9')
         want=${want:-0}
-        # --sort V is submission order, so the tail of this list is the
-        # youngest work and therefore the cheapest to throw away.
-        ids=$(squeue --noheader --user "$USER" --name "$SUPERVISOR_JOB_NAME" \
-                     --states PENDING,CONFIGURING,RUNNING,COMPLETING,SUSPENDED \
-                     --format %i --sort V 2>/dev/null)
+        # --sort V is submission order, so the tail of each list below is the
+        # youngest work and therefore the cheapest to give back.
+        rows=$(squeue --noheader --user "$USER" --name "$SUPERVISOR_JOB_NAME" \
+                      --states PENDING,CONFIGURING,RUNNING,COMPLETING,SUSPENDED \
+                      --format '%i %T' --sort V 2>/dev/null)
+        ids=$(echo "$rows" | awk 'NF {print $1}')
         have=$(echo "$ids" | grep -c '[0-9]' || true)
         if (( want > have )); then
             for ((n = have; n < want; n++)); do
@@ -193,9 +194,28 @@ pool_relay() {
                     || echo "relay: sbatch failed: $id"
             done
         elif (( want < have )); then
-            # shellcheck disable=SC2086
-            scancel $(echo "$ids" | tail -n $((have - want))) \
-                && echo "relay: cancelled $((have - want)) supervisor(s)"
+            # A supervisor that is working is asked to stop, not cancelled.
+            # It finishes its task and exits on SIGTERM, which takes far
+            # longer than the ~30s scancel allows before killing it, so
+            # cancelling one destroys the RL run it is holding. --signal
+            # delivers the signal and leaves the allocation alone, so the job
+            # ends when the work does. Only jobs that never started, which
+            # hold nothing, are cancelled outright.
+            surplus=$((have - want))
+            waiting=$(echo "$rows" | awk '$2 == "PENDING" || $2 == "CONFIGURING" {print $1}')
+            running=$(echo "$rows" | awk 'NF && $2 != "PENDING" && $2 != "CONFIGURING" {print $1}')
+            take=$(echo "$waiting" | grep -c '[0-9]' || true)
+            (( take > surplus )) && take=$surplus
+            if (( take > 0 )); then
+                # shellcheck disable=SC2086
+                scancel $(echo "$waiting" | tail -n "$take") \
+                    && echo "relay: cancelled $take supervisor(s) that had not started"
+            fi
+            if (( surplus > take )); then
+                # shellcheck disable=SC2086
+                scancel --signal=TERM --full $(echo "$running" | tail -n $((surplus - take))) \
+                    && echo "relay: asked $((surplus - take)) supervisor(s) to finish and exit"
+            fi
         fi
         # The ceiling, measured here for the same reason the submitting is:
         # sinfo does not work inside the container either. %C is

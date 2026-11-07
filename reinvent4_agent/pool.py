@@ -67,6 +67,11 @@ _SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 # oversubscription for as long as it takes to exit.
 _LIVE_STATES = "PENDING,CONFIGURING,RUNNING,COMPLETING,SUSPENDED"
 
+# Of those, the ones holding no work yet, so giving one back costs nothing.
+# CONFIGURING is a node being set up for a job whose supervisor has not
+# started, which is the same bargain as PENDING.
+_NOT_STARTED = {"PENDING", "CONFIGURING"}
+
 
 def _env_number(name: str, default: float) -> float:
     try:
@@ -303,9 +308,20 @@ class SlurmPoolScaler:
     too -- two ticks in a row converge on the same pool rather than submitting
     twice.
 
-    Scaling down cancels the youngest jobs. A supervisor that has been running
-    for an hour is holding an RL job that is an hour from its checkpoint, so
-    cancelling the newest throws away the least work.
+    Scaling down does not cancel a supervisor that is working. The supervisor
+    handles SIGTERM by finishing its current task and then exiting, and
+    cancelling a job gives it about ``KillWait`` seconds -- thirty, by
+    default -- before the kill lands, which is nowhere near long enough for
+    an RL run. So shrinking the pool would have destroyed exactly the work it
+    was told to preserve, and the supervisor's careful drain would never once
+    have completed.
+
+    Instead the surplus is signalled, not cancelled: ``scancel --signal`` on a
+    running job delivers SIGTERM and leaves the allocation alone, so no kill
+    timer starts and the job ends when the supervisor is done. Only jobs that
+    have not started yet are cancelled outright, since they hold nothing.
+    The pool therefore shrinks as the work finishes rather than at the moment
+    the number changes, which is slower and is what the number meant.
     """
 
     def __init__(
@@ -346,18 +362,35 @@ class SlurmPoolScaler:
             return None
         return done.stdout
 
-    def job_ids(self) -> Optional[list[str]]:
-        """Live pool job ids, oldest first, or None if squeue could not say."""
+    def jobs(self) -> Optional[list[tuple[str, str]]]:
+        """Live pool jobs as (id, state), oldest first, or None if squeue could not say.
+
+        The state is what decides whether a surplus job is cancelled or asked
+        to drain, so it has to come from the same listing as the count --
+        asking twice would let a job start between the two answers and be
+        killed as though it were still queued.
+        """
 
         out = self._run(
             "squeue", "--noheader", "--name", self.job_name,
-            "--states", _LIVE_STATES, "--format", "%i",
+            "--states", _LIVE_STATES, "--format", "%i %T",
             "--user", os.getenv("USER", ""), "--sort", "V",
         )
         if out is None:
             return None
         # Array tasks come back as "123_4"; the whole id is what scancel wants.
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        found = []
+        for line in out.splitlines():
+            parts = line.split()
+            if parts:
+                found.append((parts[0], parts[1] if len(parts) > 1 else "UNKNOWN"))
+        return found
+
+    def job_ids(self) -> Optional[list[str]]:
+        """Live pool job ids, oldest first, or None if squeue could not say."""
+
+        jobs = self.jobs()
+        return None if jobs is None else [job_id for job_id, _ in jobs]
 
     def current(self) -> Optional[int]:
         ids = self.job_ids() if self.in_slurm else None
@@ -370,16 +403,38 @@ class SlurmPoolScaler:
             )
             return False
 
-        ids = self.job_ids()
-        if ids is None:
+        jobs = self.jobs()
+        if jobs is None:
             return False
 
-        if len(ids) < replicas:
-            return self._submit(replicas - len(ids))
-        if len(ids) > replicas:
-            # job_ids() is oldest first, so the tail is the youngest work.
-            return self._cancel(ids[replicas:])
+        if len(jobs) < replicas:
+            return self._submit(replicas - len(jobs))
+        if len(jobs) > replicas:
+            return self._shrink(jobs, len(jobs) - replicas)
         return True
+
+    def _shrink(self, jobs: list[tuple[str, str]], surplus: int) -> bool:
+        """Give back `surplus` supervisors without throwing work away.
+
+        Jobs that have not started are given back first and outright: they
+        hold nothing, and releasing one frees a CPU now rather than whenever
+        somebody else's run finishes. Beyond that the youngest running
+        supervisors are asked to drain, because the oldest is the furthest
+        into its task and has the most to lose.
+        """
+
+        waiting = [job_id for job_id, state in jobs if state in _NOT_STARTED]
+        running = [job_id for job_id, state in jobs if state not in _NOT_STARTED]
+
+        cancel = waiting[-surplus:] if surplus <= len(waiting) else waiting
+        drain = running[len(running) - (surplus - len(cancel)):] if surplus > len(cancel) else []
+
+        ok = True
+        if cancel:
+            ok = self._cancel(cancel) and ok
+        if drain:
+            ok = self._drain(drain) and ok
+        return ok
 
     def _submit(self, count: int) -> bool:
         argv = ["sbatch", "--parsable", "--job-name", self.job_name]
@@ -399,7 +454,22 @@ class SlurmPoolScaler:
     def _cancel(self, ids: list[str]) -> bool:
         if self._run("scancel", *ids) is None:
             return False
-        logger.info("cancelled supervisors %s", ", ".join(ids))
+        logger.info("cancelled supervisors %s (not started)", ", ".join(ids))
+        return True
+
+    def _drain(self, ids: list[str]) -> bool:
+        """Ask running supervisors to finish up, without taking the allocation.
+
+        ``--full`` so the signal reaches the batch shell and the steps under
+        it: signalled without it, the supervisor Python process -- which is
+        the thing that knows how to stop politely -- never hears about it.
+        """
+
+        if self._run("scancel", "--signal=TERM", "--full", *ids) is None:
+            return False
+        logger.info(
+            "asked supervisors %s to finish their task and exit", ", ".join(ids)
+        )
         return True
 
     def capacity(self) -> PoolCapacity:
