@@ -388,11 +388,22 @@ class CampaignCreate(BaseModel):
     model_config = {"extra": "forbid"}
 
     goal: str
-    base_ttp_id: str
+    base_ttp_id: Optional[str] = Field(
+        default=None,
+        description="The TTP every task varies. Omit it and each task builds "
+                    "its own instead, which is the usual way round: the "
+                    "conductor says what an experiment is for and the agent "
+                    "running it decides how to measure that. Give one when "
+                    "the campaign is a sweep of a profile you have already "
+                    "written and every task must score the same way.",
+    )
     objectives: list[str] = Field(
-        min_length=1,
-        description="Objective names the Pareto front is computed over. Fixed at "
-                    "creation so the front's dimensions cannot drift mid-campaign",
+        default_factory=list,
+        description="Objective names the Pareto front is computed over. Fixed "
+                    "at creation so the front's dimensions cannot drift "
+                    "mid-campaign. Empty when tasks bring their own TTPs and "
+                    "therefore their own objectives -- there is no shared "
+                    "front then, and a result is read in its own terms",
     )
     concurrency: int = Field(default=1, ge=1, description="Supervisors to hold in flight")
     dispatch_seconds: Optional[float] = Field(
@@ -526,7 +537,9 @@ def _campaign_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "campaign_id": row["campaign_id"],
         "goal": row["goal"],
-        "base_ttp_id": row["base_ttp_id"],
+        # None, not "": a campaign whose tasks build their own TTPs has no
+        # base TTP, and callers branch on that.
+        "base_ttp_id": row["base_ttp_id"] or None,
         "objectives": json.loads(row["objectives"]),
         "concurrency": row["concurrency"],
         "state": row["state"],
@@ -667,7 +680,12 @@ def create_campaign(body: CampaignCreate) -> dict[str, Any]:
             "concurrency, state, created_at, dispatch_until, hard_stop_at) "
             "VALUES (?, ?, ?, ?, ?, 'dispatching', ?, ?, ?)",
             (
-                campaign_id, body.goal, body.base_ttp_id,
+                # Empty string rather than NULL for the absent TTP: the
+                # column was declared NOT NULL and SQLite cannot relax that
+                # without rebuilding the table, which is not worth doing to a
+                # live ledger for a distinction _campaign_row restores on the
+                # way out.
+                campaign_id, body.goal, body.base_ttp_id or "",
                 json.dumps(body.objectives), body.concurrency,
                 _now_iso(), dispatch_until, hard_stop_at,
             ),
@@ -1221,11 +1239,17 @@ def list_results(campaign_id: str, full: bool = False) -> list[dict[str, Any]]:
     ``full=true`` returns the stored record untouched, including every scorer
     diagnostic. The ledger keeps all of it; this endpoint defaults to the
     narrow view because its caller is an LLM with a bounded context.
+
+    A campaign whose tasks bring their own TTPs declares no objectives, so
+    there is no campaign-wide list to narrow to. Each result is then narrowed
+    to the objectives it reported for itself, which is the same idea applied
+    one task at a time -- and not to nothing, which would hand the conductor
+    molecules with no scores and let it narrate numbers it cannot see.
     """
 
     with _read() as conn:
         campaign = _get_campaign(conn, campaign_id)
-        objectives = json.loads(campaign["objectives"])
+        declared = json.loads(campaign["objectives"])
         rows = conn.execute(
             "SELECT * FROM results WHERE campaign_id = ? ORDER BY posted_at",
             (campaign_id,),
@@ -1237,6 +1261,7 @@ def list_results(campaign_id: str, full: bool = False) -> list[dict[str, Any]]:
 
     narrowed = []
     for result in results:
+        objectives = declared or list(result.get("objective_profile") or {})
         candidates = result.get("candidates") or []
         narrowed.append({
             **result,

@@ -83,6 +83,7 @@ __all__ = [
     "Supervisor",
     "TaskOutcome",
     "apply_overrides",
+    "authored_ttp_id",
     "build_goal",
     "default_run_substitutes_for",
     "job_for_ttp",
@@ -156,6 +157,19 @@ def variant_ttp_id(base_ttp_id: str, task_id: str) -> str:
     """
 
     return f"{base_ttp_id}-{task_id}"
+
+
+def authored_ttp_id(task_id: str) -> str:
+    """The TTP id a task writes its own profile under.
+
+    Prescribed rather than left to the agent for the same reason the variant
+    id is derived: it is how the task's job is found afterwards, by anyone,
+    without trusting a sentence the model wrote. An agent that uses a
+    different id has not done the task, and the task fails and is retried --
+    which is the right outcome, because nobody can tell what it ran.
+    """
+
+    return f"ttp-{task_id}"
 
 
 def prepare_ttp_variant(
@@ -538,7 +552,9 @@ DRIVER_DENIED_TOOLS = frozenset({
 STEP_SECONDS_HINT = "3 to 10 minutes"
 
 
-def default_run_substitutes_for(spec: dict[str, Any]) -> bool:
+def default_run_substitutes_for(
+    spec: dict[str, Any], authored: bool = False
+) -> bool:
     """Whether starting a plain run would still be this task's experiment.
 
     The supervisor starts the run itself when its agent finishes without
@@ -547,13 +563,30 @@ def default_run_substitutes_for(spec: dict[str, Any]) -> bool:
     does, and not once a task's ``intent`` may have called for another prior.
     A substituted run would post into the same Pareto front while measuring
     something else, which is worse than the task failing and being retried.
+
+    Never a stand-in for a task that was asked to write its own TTP: the
+    substitute run would name a TTP that does not exist, because writing it
+    was the part the agent skipped.
     """
 
-    return not (spec or {}).get("intent")
+    return not authored and not (spec or {}).get("intent")
 
 
-def build_goal(task: dict[str, Any], ttp_id: str) -> str:
+def build_goal(
+    task: dict[str, Any],
+    ttp_id: str,
+    campaign_goal: Optional[str] = None,
+    authored: bool = False,
+) -> str:
     """The instruction handed to the Driver.
+
+    Two shapes, because a campaign can work either way round. When the
+    campaign has a base TTP, the task's variant is already written and the
+    agent is told to run it and not touch its weights. When it has none --
+    the usual case -- the agent writes the profile itself from what the task
+    is for, which is the part of the work it is actually better at: it can
+    look the target up and decide what is worth scoring, where a weight
+    vector can only re-weight what somebody already thought of.
 
     Names the prepared TTP rather than restating the weights, so there is one
     source of truth for the weight vector and the agent cannot paraphrase it
@@ -569,13 +602,31 @@ def build_goal(task: dict[str, Any], ttp_id: str) -> str:
     """
 
     spec = task.get("spec") or {}
-    lines = [
-        f"Run a lead-optimisation campaign against TTP '{ttp_id}'.",
-        "",
-        "The TTP already carries the exact objective weights and transforms "
-        "this task is meant to explore -- use it as it is and do not modify "
-        "its weights.",
-    ]
+    if authored:
+        lines = [
+            f"Run a lead-optimisation task, under TTP id '{ttp_id}'.",
+            "",
+            "There is no therapeutic target profile for this task yet. Write "
+            f"one, with the id '{ttp_id}' exactly -- that id is how your run "
+            "is found afterwards, so a different one loses the work even "
+            "though it ran. Choose the objectives and their weights from "
+            "what this task is for: look the target up rather than recalling "
+            "it, and say what you chose to score and why before you start.",
+        ]
+        if campaign_goal:
+            lines += [
+                "",
+                "The campaign this task belongs to:",
+                str(campaign_goal).strip(),
+            ]
+    else:
+        lines = [
+            f"Run a lead-optimisation campaign against TTP '{ttp_id}'.",
+            "",
+            "The TTP already carries the exact objective weights and "
+            "transforms this task is meant to explore -- use it as it is and "
+            "do not modify its weights.",
+        ]
     if spec.get("intent"):
         lines += [
             "",
@@ -654,15 +705,19 @@ class CoscientistTaskRunner:
             )
             return None
 
-    def _base_ttp_id(self, task: dict[str, Any]) -> str:
-        campaign = self.store.campaign(task["campaign_id"])
-        base_ttp_id = campaign.get("base_ttp_id")
-        if not base_ttp_id:
-            raise RuntimeError(
-                f"campaign {task['campaign_id']} names no base TTP, so there is "
-                "nothing to apply this task's weights to"
-            )
-        return base_ttp_id
+    def _campaign_of(self, task: dict[str, Any]) -> dict[str, Any]:
+        return self.store.campaign(task["campaign_id"])
+
+    def _base_ttp_id(self, task: dict[str, Any]) -> Optional[str]:
+        """The TTP this task varies, or None when it writes its own.
+
+        No longer an error to have none. A campaign that names a base TTP is
+        sweeping a profile somebody already wrote; one that does not is
+        asking each task to decide how its own experiment should be scored,
+        which is the usual way round.
+        """
+
+        return self._campaign_of(task).get("base_ttp_id") or None
 
     async def __call__(self, task: dict[str, Any]) -> TaskOutcome:
         from reinvent4_agent.agent import Agent
@@ -682,15 +737,26 @@ class CoscientistTaskRunner:
         self._ttp_id = None
         # Both reach the store and the TTP tools over HTTP, and a call that
         # blocks here also stops _heartbeat_forever and _presence_forever.
-        base_ttp_id = await asyncio.to_thread(self._base_ttp_id, task)
-        ttp_id = await asyncio.to_thread(
-            prepare_ttp_variant,
-            base_ttp_id,
-            task["task_id"],
-            spec.get("weight_overrides"),
-            spec.get("transform_overrides"),
+        campaign = await asyncio.to_thread(self._campaign_of, task)
+        base_ttp_id = campaign.get("base_ttp_id") or None
+        if base_ttp_id:
+            ttp_id = await asyncio.to_thread(
+                prepare_ttp_variant,
+                base_ttp_id,
+                task["task_id"],
+                spec.get("weight_overrides"),
+                spec.get("transform_overrides"),
+            )
+        else:
+            # Nothing to prepare: the agent writes this one, and the id is
+            # reserved for it so the run stays findable either way.
+            ttp_id = authored_ttp_id(task["task_id"])
+        goal = build_goal(
+            task,
+            ttp_id,
+            campaign_goal=campaign.get("goal"),
+            authored=not base_ttp_id,
         )
-        goal = build_goal(task, ttp_id)
         budget = _deadline_seconds(task)
         # From here the run is findable by whoever is watching the campaign,
         # not only once this task reports.
@@ -753,6 +819,14 @@ class CoscientistTaskRunner:
                 verdict, turns = "single-agent", 1
 
             job_id = await asyncio.to_thread(job_for_ttp, ttp_id)
+            if not job_id and not base_ttp_id:
+                raise RuntimeError(
+                    f"the agent was asked to write TTP '{ttp_id}' and start a "
+                    f"run against it, and no such run exists (verdict: "
+                    f"{verdict}). Either it wrote the TTP under another id, "
+                    "in which case the run cannot be found and does not "
+                    "count, or it never started one"
+                )
             if not job_id and not default_run_substitutes_for(spec):
                 raise RuntimeError(
                     f"the agent did not start a run for TTP '{ttp_id}' "

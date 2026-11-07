@@ -99,13 +99,25 @@ class TestCampaigns:
     def test_unknown_campaign_is_404(self, client):
         assert client.get("/campaigns/nope").status_code == 404
 
-    def test_objectives_are_required(self, client):
-        """The front's dimensions are fixed at creation, so they cannot be empty."""
-        response = client.post(
-            "/campaigns",
-            json={"goal": "g", "base_ttp_id": "t", "objectives": []},
-        )
-        assert response.status_code == 422
+    def test_a_campaign_needs_neither_a_base_ttp_nor_objectives(self, client):
+        """The common case: tasks bring their own TTP, so there is no shared
+        front and nothing to declare up front."""
+
+        response = client.post("/campaigns", json={"goal": "g"})
+
+        assert response.status_code == 201
+        campaign = response.json()
+        assert campaign["base_ttp_id"] is None
+        assert campaign["objectives"] == []
+
+    def test_an_absent_base_ttp_reads_back_as_none_not_empty(self, client):
+        """Stored as "" because the column is NOT NULL, which is an artifact
+        of the schema and must not leak to anyone reading the campaign."""
+
+        created = client.post("/campaigns", json={"goal": "g"}).json()
+
+        fetched = client.get(f"/campaigns/{created['campaign_id']}").json()
+        assert fetched["base_ttp_id"] is None
 
     def test_deadlines_derive_from_the_dispatch_and_grace_windows(self, client):
         campaign = _campaign(client, dispatch_seconds=600, grace_seconds=300)

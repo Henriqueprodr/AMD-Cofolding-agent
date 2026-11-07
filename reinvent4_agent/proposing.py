@@ -327,7 +327,18 @@ def parse_proposals(
 
         weights: dict[str, float] = {}
         for name, value in (entry.get("weight_overrides") or {}).items():
-            if known_objectives and name not in known_objectives:
+            if not known_objectives:
+                # Nothing to re-weight: the task writes its own TTP, so a
+                # weight here would be dropped by the supervisor rather than
+                # applied. Said plainly now, where it can be read, instead of
+                # being discovered as a task that scored the wrong thing.
+                logger.warning(
+                    "dropping weight for '%s': this campaign has no base TTP, "
+                    "so weights have nothing to apply to -- say it in the intent",
+                    name,
+                )
+                continue
+            if name not in known_objectives:
                 logger.warning(
                     "dropping weight for '%s': not an objective of this campaign", name
                 )

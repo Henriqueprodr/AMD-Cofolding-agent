@@ -38,8 +38,8 @@ def _guard(what: str, call) -> Any:
 
 def start_campaign(
     goal: str,
-    base_ttp_id: str,
-    objectives: list[str],
+    base_ttp_id: Optional[str] = None,
+    objectives: Optional[list[str]] = None,
     concurrency: int = 1,
     hours: Optional[float] = None,
     grace_hours: float = 0.0,
@@ -56,11 +56,19 @@ def start_campaign(
         What the campaign is for, in a sentence. Carried in the ledger so a
         conductor restarting mid-campaign knows what it was doing.
     base_ttp_id:
-        The TTP every task starts from. Each task runs a variant of it with
-        its own objective weights.
+        The TTP every task starts from, each running a variant of it with its
+        own objective weights. Usually omitted: without one, you say what
+        each task is for and the agent running it writes the profile that
+        measures it. Name a base TTP only when the campaign really is a
+        sweep of one profile and every task must be scored the same way --
+        it is the stricter mode, and it limits tasks to re-weighting
+        objectives somebody has already thought of.
     objectives:
         The objective names the Pareto front is computed over. Fixed at
         creation, so the front's dimensions cannot drift mid-campaign.
+        Defaults to the base TTP's own objectives, and to none at all when
+        there is no base TTP -- tasks then bring their own, and results are
+        read in their own terms rather than against a shared front.
     concurrency:
         How many supervisors to hold in flight.
     hours:

@@ -77,7 +77,7 @@ import sys
 
 from reinvent4_agent.campaign_client import CampaignStoreClient
 from reinvent4_agent.conductor import format_status
-from reinvent4_agent.supervisor import job_for_ttp, variant_ttp_id
+from reinvent4_agent.supervisor import authored_ttp_id, job_for_ttp, variant_ttp_id
 from reinvent4_mcp.tools.results import get_optimization_status
 
 
@@ -92,7 +92,11 @@ def rl_jobs(status):
 
     base = status["campaign"]["base_ttp_id"]
     for task in status["in_flight"]:
-        job_id = job_for_ttp(variant_ttp_id(base, task["task_id"]))
+        job_id = task.get("job_id") or job_for_ttp(
+            variant_ttp_id(base, task["task_id"])
+            if base
+            else authored_ttp_id(task["task_id"])
+        )
         if not job_id:
             print(f"    {task['task_id']}  no RL job yet (the agent is still setting up)")
             continue

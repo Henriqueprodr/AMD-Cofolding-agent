@@ -356,19 +356,25 @@ class CampaignConductor:
         """Stop the RL jobs of tasks that will never report. Returns their ids.
 
         A task's TTP id is derived from the task id, so this works even for a
-        task whose supervisor is gone and cannot clean up after itself.
+        task whose supervisor is gone and cannot clean up after itself. The
+        job the task reported on its heartbeat is tried first: it is what
+        actually ran, and it is still there to be stopped even if the agent
+        wrote its TTP under an id nobody can guess.
         """
 
-        from reinvent4_agent.supervisor import job_for_ttp, variant_ttp_id
+        from reinvent4_agent.supervisor import (
+            authored_ttp_id, job_for_ttp, variant_ttp_id,
+        )
         from reinvent4_mcp.tools.optimization import stop_optimization
-
-        if not base_ttp_id:
-            return []
 
         stopped: list[str] = []
         for task in tasks:
             try:
-                job_id = job_for_ttp(variant_ttp_id(base_ttp_id, task["task_id"]))
+                job_id = task.get("job_id") or job_for_ttp(
+                    variant_ttp_id(base_ttp_id, task["task_id"])
+                    if base_ttp_id
+                    else authored_ttp_id(task["task_id"])
+                )
             except Exception:
                 logger.warning(
                     "could not look up the job for task %s", task["task_id"],
@@ -421,18 +427,27 @@ class CampaignConductor:
 def start_campaign(
     store: CampaignStoreClient,
     goal: str,
-    base_ttp_id: str,
-    objectives: list[str],
+    base_ttp_id: Optional[str] = None,
+    objectives: Optional[list[str]] = None,
     concurrency: int = 1,
     hours: Optional[float] = None,
     grace_hours: float = 0.0,
 ) -> dict[str, Any]:
-    """Open a campaign and return it. Dispatch is the conductor loop's job."""
+    """Open a campaign and return it. Dispatch is the conductor loop's job.
+
+    Both ``base_ttp_id`` and ``objectives`` are optional, and omitting them
+    is the common case: each task then writes the TTP its own experiment
+    needs. Give a base TTP to sweep a profile that already exists, in which
+    case the objectives default to the ones it declares.
+    """
+
+    if base_ttp_id and not objectives:
+        objectives = objectives_of(base_ttp_id)
 
     campaign = store.create_campaign(
         goal=goal,
         base_ttp_id=base_ttp_id,
-        objectives=objectives,
+        objectives=objectives or [],
         concurrency=concurrency,
         dispatch_seconds=hours * 3600 if hours else None,
         grace_seconds=grace_hours * 3600,

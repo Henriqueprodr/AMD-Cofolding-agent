@@ -260,6 +260,38 @@ class TestBuildGoal:
         assert "do not modify" in goal
         assert "2.0" not in goal, "restating the weights invites paraphrasing"
 
+    def test_a_task_with_no_base_ttp_is_told_to_write_one(self):
+        """The usual case. The agent is given the id, not asked to invent it:
+        that id is how its run is found afterwards."""
+
+        goal = build_goal(_task(), "ttp-t1", authored=True)
+
+        assert "ttp-t1" in goal
+        assert "Write" in goal or "write" in goal
+        assert "do not modify" not in goal, "there is nothing yet to modify"
+
+    def test_an_authored_task_is_given_the_campaign_goal(self):
+        """It has to choose objectives, and cannot do that from the task
+        alone -- the task says what this experiment is for, the campaign
+        says what the experiment is part of."""
+
+        goal = build_goal(
+            _task(), "ttp-t1",
+            campaign_goal="Improve BRD4 BD1 selectivity over BD2",
+            authored=True,
+        )
+
+        assert "BRD4 BD1 selectivity" in goal
+
+    def test_a_task_with_a_base_ttp_is_not_told_to_write_one(self):
+        goal = build_goal(
+            _task(), "brd4-a1b2c3d4",
+            campaign_goal="Improve BRD4 BD1 selectivity", authored=False,
+        )
+
+        assert "do not modify" in goal
+        assert "no therapeutic target profile" not in goal
+
     def test_the_step_budget_is_passed_on_as_a_ceiling(self):
         goal = build_goal(_task(max_steps=120), "ttp-1")
 
@@ -325,6 +357,15 @@ class TestTheDeNovoFallback:
 
         assert default_run_substitutes_for({})
         assert default_run_substitutes_for(None)
+
+    def test_nothing_substitutes_for_a_task_that_writes_its_own_ttp(self):
+        """The substitute run would name a TTP that does not exist, because
+        writing it was exactly the step the agent skipped."""
+
+        from reinvent4_agent.supervisor import default_run_substitutes_for
+
+        assert not default_run_substitutes_for({}, authored=True)
+        assert not default_run_substitutes_for(None, authored=True)
 
     def test_the_driver_is_told_how_long_a_step_takes(self):
         """Without a number it cannot tell a slow step from a broken one.
@@ -871,6 +912,32 @@ class TestPrepareTtpVariant:
         assert "error" in ttp_store.get_ttp("brd4-bd1-lead-opt-a1b2c3d4")
 
 
+class TestAuthoredTtpId:
+    """The id reserved for a TTP the agent has not written yet.
+
+    Prescribed rather than chosen, for the same reason the variant id is
+    derived: it is how the task's job is found afterwards, by a conductor
+    whose supervisor is long gone, without trusting a sentence the model
+    wrote about what it did.
+    """
+
+    def test_it_is_derived_from_the_task(self):
+        from reinvent4_agent.supervisor import authored_ttp_id
+
+        assert authored_ttp_id("t1") == "ttp-t1"
+
+    def test_two_tasks_do_not_collide(self):
+        from reinvent4_agent.supervisor import authored_ttp_id
+
+        assert authored_ttp_id("t1") != authored_ttp_id("t2")
+
+    def test_a_retried_task_reuses_its_id(self):
+        """A retry is the same experiment, so it finds the same run."""
+        from reinvent4_agent.supervisor import authored_ttp_id
+
+        assert authored_ttp_id("t1") == authored_ttp_id("t1")
+
+
 class TestBaseTtpResolution:
     """Where the base TTP comes from.
 
@@ -898,13 +965,29 @@ class TestBaseTtpResolution:
         assert runner._base_ttp_id(_task()) == "brd4-bd1-lead-opt"
         assert store.asked_for == ["feed0001"]
 
-    def test_a_campaign_without_one_is_a_clear_error(self):
+    def test_a_campaign_without_one_means_the_task_writes_its_own(self):
+        """Not an error: it is the usual way a campaign runs.
+
+        A campaign names a base TTP only when it is deliberately a sweep of
+        one profile. Without one, each task is told what it is for and the
+        agent running it decides how that should be scored.
+        """
+
         from reinvent4_agent.supervisor import CoscientistTaskRunner
 
         runner = CoscientistTaskRunner(object(), self._Store({}))
 
-        with pytest.raises(RuntimeError, match="no base TTP"):
-            runner._base_ttp_id(_task())
+        assert runner._base_ttp_id(_task()) is None
+
+    def test_an_empty_base_ttp_reads_as_none(self):
+        """The ledger stores the absent TTP as "", and nothing downstream
+        should have to know that."""
+
+        from reinvent4_agent.supervisor import CoscientistTaskRunner
+
+        runner = CoscientistTaskRunner(object(), self._Store({"base_ttp_id": ""}))
+
+        assert runner._base_ttp_id(_task()) is None
 
 
 class TestJobDiscovery:

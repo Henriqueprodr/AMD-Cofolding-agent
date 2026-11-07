@@ -1262,24 +1262,31 @@ def start_campaign(
         Field(description="What the campaign is for, in a sentence"),
     ],
     base_ttp_id: Annotated[
-        str,
+        str | None,
         Field(
+            default=None,
             description=(
-                "TTP every task starts from. Each task runs a variant of it "
-                "with its own objective weights."
+                "TTP every task starts from, each running a variant of it "
+                "with its own objective weights. Usually omit it: the agent "
+                "running each task then writes the profile that measures "
+                "what that task is for. Name one only when the campaign is "
+                "deliberately a sweep of a single profile and every task "
+                "must be scored identically."
             ),
         ),
-    ],
+    ] = None,
     objectives: Annotated[
-        list[str],
+        list[str] | None,
         Field(
+            default=None,
             description=(
                 "Objective names the Pareto front is computed over. Fixed at "
                 "creation, so the front's dimensions cannot drift later. Use "
-                "the names as they appear in the base TTP."
+                "the names as they appear in the base TTP. Defaults to that "
+                "TTP's own objectives, and to none when there is no base TTP."
             ),
         ),
-    ],
+    ] = None,
     concurrency: Annotated[
         int,
         Field(default=1, ge=1, description="Supervisors to hold in flight"),

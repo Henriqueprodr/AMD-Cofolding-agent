@@ -408,6 +408,69 @@ class TestAdmissionControl:
         assert _conductor(store).tick().dispatched == 2
 
 
+class TestStoppingOrphanedJobs:
+    """Jobs whose task will never report still hold GPU.
+
+    Finalizing a campaign abandons its open tasks, and each one may have an
+    RL job behind it that nobody is left to stop. This used to give up
+    entirely on a campaign with no base TTP -- which, now that a base TTP is
+    the exception, would have meant leaking the job of every abandoned task.
+    """
+
+    @staticmethod
+    def _stopped(monkeypatch, campaign_base, tasks, found):
+        from reinvent4_agent import supervisor
+        from reinvent4_mcp.tools import optimization
+
+        asked: list[str] = []
+
+        def _job_for_ttp(ttp_id):
+            asked.append(ttp_id)
+            return found.get(ttp_id)
+
+        monkeypatch.setattr(supervisor, "job_for_ttp", _job_for_ttp)
+        monkeypatch.setattr(
+            optimization, "stop_optimization", lambda job_id: {"message": "stopped"}
+        )
+
+        conductor = _conductor(FakeStore(_status()))
+        stopped = conductor._stop_jobs_for(campaign_base, tasks)
+        return stopped, asked
+
+    def test_a_campaign_with_a_base_ttp_stops_the_variants_job(self, monkeypatch):
+        stopped, asked = self._stopped(
+            monkeypatch, "brd4", [{"task_id": "t1"}], {"brd4-t1": "job-9"},
+        )
+
+        assert stopped == ["job-9"]
+        assert asked == ["brd4-t1"]
+
+    def test_a_campaign_without_one_stops_the_authored_ttps_job(self, monkeypatch):
+        stopped, asked = self._stopped(
+            monkeypatch, "", [{"task_id": "t1"}], {"ttp-t1": "job-9"},
+        )
+
+        assert stopped == ["job-9"], "the job would otherwise run until the wall clock"
+        assert asked == ["ttp-t1"]
+
+    def test_the_job_the_task_reported_is_preferred(self, monkeypatch):
+        """It is what actually ran. An agent that wrote its TTP under some
+        other id still started a real job, and that job is still ours to
+        stop even though no id can be derived for it."""
+
+        stopped, asked = self._stopped(
+            monkeypatch, "", [{"task_id": "t1", "job_id": "job-live"}], {},
+        )
+
+        assert stopped == ["job-live"]
+        assert asked == [], "no need to go looking for a job we were told about"
+
+    def test_a_task_that_never_started_anything_is_skipped(self, monkeypatch):
+        stopped, _ = self._stopped(monkeypatch, "", [{"task_id": "t1"}], {})
+
+        assert stopped == []
+
+
 class TestDeadlines:
 
     def test_tasks_get_the_task_budget_as_a_deadline(self):
@@ -422,7 +485,12 @@ class TestDeadlines:
         # The tick itself takes time -- it waits on the gateway -- so the
         # budget runs from some instant inside it, and any assertion that
         # picks one end as "now" fails by however long the tick took.
-        assert before + timedelta(seconds=600) <= deadline <= after + timedelta(seconds=600)
+        # The second of slack is for the clock, not the code: datetime.now()
+        # on Windows is not reliably ordered at microsecond resolution, and
+        # a test about a ten-minute budget should not fail over a microsecond.
+        slack = timedelta(seconds=1)
+        assert before + timedelta(seconds=600) - slack <= deadline
+        assert deadline <= after + timedelta(seconds=600) + slack
 
     def test_the_campaign_hard_stop_caps_the_task_budget(self):
         """No supervisor should start a run that outlives the campaign."""

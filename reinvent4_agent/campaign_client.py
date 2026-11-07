@@ -175,15 +175,15 @@ class CampaignStoreClient:
     def create_campaign(
         self,
         goal: str,
-        base_ttp_id: str,
-        objectives: list[str],
+        base_ttp_id: Optional[str] = None,
+        objectives: Optional[list[str]] = None,
         concurrency: int = 1,
         dispatch_seconds: Optional[float] = None,
         grace_seconds: float = 0.0,
     ) -> dict[str, Any]:
         return self._call(
             "POST", "/campaigns",
-            goal=goal, base_ttp_id=base_ttp_id, objectives=objectives,
+            goal=goal, base_ttp_id=base_ttp_id, objectives=objectives or [],
             concurrency=concurrency, dispatch_seconds=dispatch_seconds,
             grace_seconds=grace_seconds,
         )
