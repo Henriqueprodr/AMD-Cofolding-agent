@@ -1,0 +1,75 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# structure-prep — Apptainer/Singularity definition.
+#
+# CPU service, HTTP server. Vendor-neutral. Mirrors services/structure-prep/Dockerfile.
+#
+# Unlike the Dockerfile there is no entrypoint to activate the conda base
+# environment, so %environment puts it on PATH instead and the service is
+# started as plain `python -m uvicorn`.
+#
+# Build from the dd_agentic/ root (see services/singularity/build.sh).
+
+Bootstrap: docker
+From: mambaorg/micromamba:1.5-jammy
+
+%files
+    # Build context is the dd_agentic/ root (apptainer build is invoked there).
+    services/structure-prep/ /app/
+
+%post
+    set -eux
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    apt-get update
+    apt-get install -y --no-install-recommends build-essential ca-certificates
+    rm -rf /var/lib/apt/lists/*
+
+    micromamba install -y -n base -c conda-forge \
+        python=3.11.9 \
+        gemmi=0.6.5 \
+        rdkit=2024.03.5 \
+        openmm=8.1.2 \
+        pdbfixer=1.9.0 \
+        openff-toolkit=0.16.6 \
+        openff-nagl=0.4.0 \
+        openff-nagl-models=0.4.1 \
+        openff-forcefields=2024.07.0 \
+        setuptools=80.9.0 \
+        numpy=1.26.4 \
+        scipy=1.13.1
+    micromamba clean -afy
+
+    /opt/conda/bin/pip install --no-cache-dir \
+        "pdb2pqr==3.6.1" \
+        "propka==3.5.0" \
+        "fastapi==0.114.0" \
+        "uvicorn[standard]==0.30.6" \
+        "pydantic>=2.9,<3"
+
+    # The same build-time check the Dockerfile makes: these imports are the
+    # ones that break when a conda solve quietly picks a different build.
+    /opt/conda/bin/python -c "\
+import gemmi; import pdbfixer; import openmm; \
+import openff.toolkit; import openff.nagl; import openff.nagl_models; \
+import rdkit; import pdb2pqr; \
+import fastapi; import pydantic; \
+print('All imports OK')"
+
+%environment
+    export PATH=/opt/conda/bin:$PATH
+    export SP_SHARED_DIR=${SP_SHARED_DIR:-/shared}
+    export SP_HOST=0.0.0.0
+    export SP_MAX_CONCURRENCY=${SP_MAX_CONCURRENCY:-1}
+    export PORT=${PORT:-8089}
+
+%startscript
+    cd /app
+    exec /opt/conda/bin/python -m uvicorn app:app --host 0.0.0.0 --port "${PORT:-8089}"
+
+%runscript
+    cd /app
+    exec /opt/conda/bin/python -m uvicorn app:app --host 0.0.0.0 --port "${PORT:-8089}"
+
+%labels
+    org.dd_agentic.service structure-prep

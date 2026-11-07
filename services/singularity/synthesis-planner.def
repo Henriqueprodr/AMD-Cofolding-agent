@@ -1,0 +1,63 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# synthesis-planner — Apptainer/Singularity definition.
+#
+# CPU service, HTTP server. Vendor-neutral. Mirrors services/synthesis-planner/Dockerfile.
+#
+# The expansion policy and templates are downloaded from Zenodo at build time
+# (record 11430881, MD5-verified). The ZINC stock catalog is 1.3 GB and is NOT
+# baked in: bind it over /app/models/stock at run time. Without it the service
+# still starts, but every building-block answer is "unknown" rather than a
+# purchasability verdict -- see services/lumi/README.md for staging it.
+#
+# Build from the dd_agentic/ root (see services/singularity/build.sh).
+
+Bootstrap: docker
+From: mambaorg/micromamba:1.5-jammy
+
+%files
+    # Build context is the dd_agentic/ root (apptainer build is invoked there).
+    services/synthesis-planner/environment.yml /tmp/environment.yml
+    services/synthesis-planner/app.py /app/app.py
+    services/synthesis-planner/synthesis_planner/ /app/synthesis_planner/
+    services/synthesis-planner/download_models.py /tmp/download_models.py
+    services/synthesis-planner/write_manifest.py /tmp/write_manifest.py
+
+%post
+    set -eux
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export MODELS_DIR=/app/models
+    export PYTHONHASHSEED=0
+
+    micromamba install -y -n base -f /tmp/environment.yml
+    micromamba clean --all --yes
+
+    cd /app
+    /opt/conda/bin/python3 /tmp/download_models.py
+    /opt/conda/bin/python3 /tmp/write_manifest.py
+
+    # Fails the build rather than the first request if a model did not land.
+    /opt/conda/bin/python -c "\
+import sys; sys.path.insert(0,'/app'); \
+from synthesis_planner.manifest import load_and_verify; \
+m = load_and_verify('/app/models'); \
+print(f'manifest OK: policy={m.policy_version()}, templates={m.templates_version()}')"
+    /opt/conda/bin/python -c "from importlib.metadata import version; from aizynthfinder.aizynthfinder import AiZynthFinder; print('AiZynthFinder', version('aizynthfinder'), 'import OK')"
+
+%environment
+    export PATH=/opt/conda/bin:$PATH
+    export PYTHONUNBUFFERED=1
+    export MODELS_DIR=/app/models
+    export PORT=${PORT:-8088}
+
+%startscript
+    cd /app
+    exec /opt/conda/bin/python -m uvicorn app:app --host 0.0.0.0 --port "${PORT:-8088}"
+
+%runscript
+    cd /app
+    exec /opt/conda/bin/python -m uvicorn app:app --host 0.0.0.0 --port "${PORT:-8088}"
+
+%labels
+    org.dd_agentic.service synthesis-planner

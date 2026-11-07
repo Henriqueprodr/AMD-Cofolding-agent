@@ -1,0 +1,36 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# annotation — Apptainer/Singularity definition.
+#
+# CPU service, HTTP server. Vendor-neutral. Mirrors services/annotation/Dockerfile.
+# Fetches target annotations from UniProt and friends, so it needs egress; on a
+# compute node without it the fetchers fail and the tools report no annotation.
+#
+# Build from the dd_agentic/ root (see services/singularity/build.sh).
+
+Bootstrap: docker
+From: python:3.11-slim
+
+%files
+    # Build context is the dd_agentic/ root (apptainer build is invoked there).
+    services/annotation/requirements.txt /app/requirements.txt
+    services/annotation/app.py /app/app.py
+
+%post
+    set -eux
+    pip install --no-cache-dir -r /app/requirements.txt
+
+%environment
+    export PORT=${PORT:-8090}
+
+%startscript
+    cd /app
+    exec uvicorn app:app --host 0.0.0.0 --port "${PORT:-8090}"
+
+%runscript
+    cd /app
+    exec uvicorn app:app --host 0.0.0.0 --port "${PORT:-8090}"
+
+%labels
+    org.dd_agentic.service annotation

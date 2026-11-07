@@ -1,0 +1,39 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# campaign-store — Apptainer/Singularity definition.
+#
+# CPU service, HTTP server. Vendor-neutral. Mirrors services/campaign-store/Dockerfile.
+# The ledger the conductor and its supervisors claim tasks from; one writer only,
+# so never start a second instance against the same CAMPAIGN_STORE_DB.
+#
+# Build from the dd_agentic/ root (see services/singularity/build.sh).
+
+Bootstrap: docker
+From: python:3.12-slim
+
+%files
+    # Build context is the dd_agentic/ root (apptainer build is invoked there).
+    services/campaign-store/requirements.txt /app/requirements.txt
+    services/campaign-store/app.py /app/app.py
+
+%post
+    set -eux
+    pip install --no-cache-dir -r /app/requirements.txt
+
+%environment
+    export PORT=${PORT:-8087}
+    # The default keeps the database inside the container, which is wiped with
+    # it; session.sbatch points this at the bound /shared instead.
+    export CAMPAIGN_STORE_DB=${CAMPAIGN_STORE_DB:-/shared/campaign-store/campaigns.db}
+
+%startscript
+    cd /app
+    exec uvicorn app:app --host 0.0.0.0 --port "${PORT:-8087}" --workers 1
+
+%runscript
+    cd /app
+    exec uvicorn app:app --host 0.0.0.0 --port "${PORT:-8087}" --workers 1
+
+%labels
+    org.dd_agentic.service campaign-store

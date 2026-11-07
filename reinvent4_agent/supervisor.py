@@ -65,6 +65,7 @@ from reinvent4_agent.campaign_client import (
     TaskOutcome,
     supervisor_id,
 )
+from reinvent4_agent.service_registry import apply_registry
 
 logger = logging.getLogger(__name__)
 
@@ -966,6 +967,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Before anything reads a service URL. A no-op on Kubernetes, where the
+    # ConfigMap has already set every variable this could fill in.
+    apply_registry()
+
     args = _parse_args(argv)
     from reinvent4_agent.cli import _resolve_api_key
 

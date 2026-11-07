@@ -22,8 +22,19 @@
 #   --data-dir <path>       Host data dir to bind (default: ./data).
 #   --reinvent-gpu <id>     GPU index for the agent (default: $REINVENT_GPU or 0).
 #   --boltz-gpu <id>        GPU index for boltz    (default: $BOLTZ_GPU or 1).
+#   --boltz-gpus <ids>      Comma-separated GPUs for boltz, e.g. 5,6,7; overrides
+#                           --boltz-gpu (default: $BOLTZ_GPUS, else the one GPU).
+#                           Boltz runs $BOLTZ_WORKERS_PER_GPU (default 2) resident
+#                           workers on each.
 #   --skip-agent            Start + health-gate services only, then wait (Ctrl-C).
+#   --web                   Run the dd-web gateway for the browser UI instead of
+#                           the terminal agent ($DD_WEB_HOST:$DD_WEB_PORT,
+#                           default 127.0.0.1:8000). Set REINVENT4_WEB_TOKEN
+#                           whenever DD_WEB_HOST is reachable by other users.
 #   --dry-run               Print the apptainer commands without running them.
+#
+# APPTAINER_GPU_FLAG overrides --rocm/--nv. On LUMI set it to "": the GPUs are
+# visible without it, and --rocm would mount the host's older ROCm libraries.
 #
 # GPU assignment mirrors services/env.sh: agent -> GPU0, boltz -> GPU1.
 # ──────────────────────────────────────────────────────────────────────
@@ -37,7 +48,9 @@ VENDOR=""
 DATA_DIR="${DATA_DIR:-${ROOT_DIR}/data}"
 REINVENT_GPU="${REINVENT_GPU:-0}"
 BOLTZ_GPU="${BOLTZ_GPU:-1}"
+BOLTZ_GPUS="${BOLTZ_GPUS:-}"
 SKIP_AGENT=0
+WEB=0
 DRY_RUN=0
 AGENT_ARGS=()
 
@@ -48,10 +61,12 @@ while [ $# -gt 0 ]; do
         --data-dir)         DATA_DIR="$2"; shift 2 ;;
         --reinvent-gpu)     REINVENT_GPU="$2"; shift 2 ;;
         --boltz-gpu)        BOLTZ_GPU="$2"; shift 2 ;;
+        --boltz-gpus)       BOLTZ_GPUS="$2"; shift 2 ;;
         --skip-agent)       SKIP_AGENT=1; shift ;;
+        --web)              WEB=1; shift ;;
         --dry-run)          DRY_RUN=1; shift ;;
         --)                 shift; AGENT_ARGS=("$@"); break ;;
-        -h|--help)          sed -n '5,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)          sed -n '5,39p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)                  echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -61,8 +76,11 @@ case "${VENDOR}" in
     nvidia) GPU_FLAG="--nv" ;;
     *)      echo "error: --vendor must be amd or nvidia" >&2; exit 1 ;;
 esac
+GPU_FLAG="${APPTAINER_GPU_FLAG-${GPU_FLAG}}"
+BOLTZ_GPUS="${BOLTZ_GPUS:-${BOLTZ_GPU}}"
 
-run() { echo "+ $*"; [ "${DRY_RUN}" -eq 0 ] && "$@"; return 0; }
+# The echo lands in the stack log, so keys and tokens passed as --env are masked.
+run() { echo "+ $*" | sed -E 's/((KEY|TOKEN)=)[^ ]+/\1***/g'; [ "${DRY_RUN}" -eq 0 ] && "$@"; return 0; }
 
 # --- Resolve the container runtime (apptainer or singularity) ---------
 # HPC clusters often expose it as a module (`module load apptainer`) or as the
@@ -88,7 +106,9 @@ fi
 gpu_env_flag() {
     local gpu="$1"
     if [ "${VENDOR}" = "amd" ]; then
-        echo "--env HIP_VISIBLE_DEVICES=${gpu},ROCR_VISIBLE_DEVICES=${gpu}"
+        # ROCR renumbers the GPUs it keeps from 0, so a HIP_VISIBLE_DEVICES with the
+        # same id would then point past the single visible device.
+        echo "--env ROCR_VISIBLE_DEVICES=${gpu}"
     else
         echo "--env CUDA_VISIBLE_DEVICES=${gpu}"
     fi
@@ -113,6 +133,12 @@ INSTANCES=(
     "admet-predictor|8084|admet-predictor-${VENDOR}.sif|cpu|shared"
     "retrodmta-predictor|8085|retrodmta-predictor.sif|cpu|shared"
     "interaction-profiler|8083|interaction-profiler.sif|cpu|shared"
+    # The ports match the cluster's Service ports, so the URLs the tools read
+    # are the same string with a different host.
+    "campaign-store|8087|campaign-store.sif|cpu|shared"
+    "synthesis-planner|8088|synthesis-planner.sif|cpu|shared"
+    "structure-prep|8089|structure-prep.sif|cpu|shared"
+    "annotation|8090|annotation.sif|cpu|shared"
 )
 
 STARTED=()
@@ -137,7 +163,10 @@ health_ok() {
 }
 
 wait_health() {
-    local name="$1" port="$2" tries=60
+    # A cold start loads models off Lustre -- admet-predictor holds them in
+    # process (PRED_LOADER_WORKERS=0) and has taken over five minutes, which
+    # used to go unnoticed because a long-lived stack reuses its instances.
+    local name="$1" port="$2" tries="${HEALTH_TRIES:-180}"
     echo -n "  waiting for ${name} on :${port} "
     if [ "${DRY_RUN}" -eq 1 ]; then echo "(dry-run: skipped)"; return 0; fi
     for _ in $(seq "${tries}"); do
@@ -151,7 +180,7 @@ wait_health() {
 
 echo "Vendor    : ${VENDOR} (${GPU_FLAG})"
 echo "Data dir  : ${DATA_DIR}"
-echo "GPUs      : agent=${REINVENT_GPU}  boltz=${BOLTZ_GPU}"
+echo "GPUs      : agent=${REINVENT_GPU}  boltz=${BOLTZ_GPUS}"
 echo ""
 
 # --- Start service instances -----------------------------------------
@@ -167,13 +196,57 @@ for row in "${INSTANCES[@]}"; do
     opts=(--env "PORT=${port}")
     [ "${share}" = "shared" ] && opts+=(--bind "${SHARED_BIND}")
     # boltz needs a writable /cache (read-only container root otherwise).
-    [ "${name}" = "boltz" ] && opts+=(--bind "${BOLTZ_CACHE_BIND}")
+    # The image bakes only app.py; the worker-pool modules come from this
+    # checkout, so the whole wrapper dir is bound over the baked copy.
+    if [ "${name}" = "boltz" ]; then
+        opts+=(--bind "${BOLTZ_CACHE_BIND}")
+        opts+=(--bind "${ROOT_DIR}/services/boltz2:/app/wrapper")
+        if [ -n "${BOLTZ_WORKERS_PER_GPU:-}" ]; then
+            opts+=(--env "BOLTZ_WORKERS_PER_GPU=${BOLTZ_WORKERS_PER_GPU}")
+        fi
+    fi
+    # The predictor's /score and /predict are sync FastAPI handlers, so they
+    # run on a threadpool thread, and forking the DataLoader's workers off a
+    # non-main thread deadlocks: the server waits on a futex while its
+    # pt_data_workers poll, and every request hangs until the caller gives up.
+    # Loading in-process costs little on CPU and cannot deadlock.
+    if [ "${name}" = "admet-predictor" ]; then
+        opts+=(--env "PRED_LOADER_WORKERS=${PRED_LOADER_WORKERS:-0}")
+    fi
+    # The ledger is a SQLite file, so it has to outlive the instance.
+    if [ "${name}" = "campaign-store" ]; then
+        mkdir -p "${DATA_DIR}/shared/campaign-store"
+        opts+=(--env "CAMPAIGN_STORE_DB=/shared/campaign-store/campaigns.db")
+    fi
+    # The 1.3 GB ZINC catalog is too big to bake in. Without it the planner
+    # still answers, but every building block comes back "unknown" instead of
+    # purchasable -- so say so once here rather than leave it to be diagnosed
+    # from scores that look merely disappointing.
+    if [ "${name}" = "synthesis-planner" ]; then
+        if [ -d "${STOCK_DIR:-${DATA_DIR}/aizynth-stock}" ]; then
+            opts+=(--bind "${STOCK_DIR:-${DATA_DIR}/aizynth-stock}:/app/models/stock")
+        else
+            echo "  note: no stock catalog at ${STOCK_DIR:-${DATA_DIR}/aizynth-stock};" \
+                 "building-block availability will be 'unknown'"
+        fi
+    fi
+    # The image installs the profiler package at build time; bind the checkout
+    # over it so profiler fixes deploy without a rebuild.
+    if [ "${name}" = "interaction-profiler" ]; then
+        opts+=(--bind "${ROOT_DIR}/interaction-profiler/src/interaction_profiler:/opt/conda/lib/python3.11/site-packages/interaction_profiler")
+    fi
     if [ "${kind}" = "gpu" ]; then
         opts+=(${GPU_FLAG})
         # shellcheck disable=SC2046
-        opts+=($(gpu_env_flag "${BOLTZ_GPU}"))
+        opts+=($(gpu_env_flag "${BOLTZ_GPUS}"))
     fi
 
+    # Reusing a healthy instance lets the gateway be restarted with new settings
+    # without taking the scoring services (and Boltz's model load) down with it.
+    if [ "${DRY_RUN}" -eq 0 ] && "${APPTAINER}" instance list 2>/dev/null | grep -qE "^dd_${name}\b"; then
+        echo "  reusing running instance dd_${name}"
+        continue
+    fi
     run "${APPTAINER}" instance start "${opts[@]}" "${sif_path}" "dd_${name}"
     STARTED+=("${name}")
 done
@@ -215,6 +288,22 @@ AGENT_BINDS=(
     --bind "${DATA_DIR}/tb_logs:/data/reinvent4_mcp/tb_logs"
     --bind "${DATA_DIR}/agent_logs:/logs"
 )
+# The model supervisor hands the gateway the running model through this directory.
+# A path inside the container (e.g. /logs/model-control) is already covered by
+# the log bind; only a host directory needs its own bind.
+if [ -n "${REINVENT4_WEB_MODEL_CONTROL:-}" ] && [ -d "${REINVENT4_WEB_MODEL_CONTROL}" ]; then
+    AGENT_BINDS+=(--bind "${REINVENT4_WEB_MODEL_CONTROL}:${REINVENT4_WEB_MODEL_CONTROL}")
+fi
+# DEV_SOURCE=1 runs the agent and MCP server from this checkout instead of the
+# copies baked into the image, so Python edits need a restart, not a rebuild.
+# Dependency changes (pyproject.toml) still need build.sh.
+if [ "${DEV_SOURCE:-0}" = 1 ]; then
+    SITE=/opt/venv/lib/python3.12/site-packages
+    AGENT_BINDS+=(
+        --bind "${ROOT_DIR}/reinvent4_agent:${SITE}/reinvent4_agent"
+        --bind "${ROOT_DIR}/reinvent4_mcp:${SITE}/reinvent4_mcp"
+    )
+fi
 
 # Forward agent env into the container. REINVENT4_MCP_CONFIG + LOG_DIR are fixed
 # to the in-container paths; the rest (gateway URL, key, model, ...) pass through
@@ -232,11 +321,41 @@ for _v in LLM_GATEWAY_KEY REINVENT4_AGENT_API_KEY \
           REINVENT4_AGENT_BACKEND REINVENT4_AGENT_MODEL REINVENT4_AGENT_BASE_URL \
           REINVENT4_AGENT_API_VERSION REINVENT4_AGENT_NO_VERIFY_SSL \
           REINVENT4_AGENT_THINKING_BUDGET REINVENT4_AGENT_REASONING_EFFORT \
-          REINVENT4_AGENT_MULTI_AGENT REINVENT4_AGENT_LOG_TIMESTAMPS; do
+          REINVENT4_AGENT_MULTI_AGENT REINVENT4_AGENT_LOG_TIMESTAMPS \
+          REINVENT4_AGENT_MAX_TOOL_RESULT_CHARS REINVENT4_AGENT_MAX_TOOL_ROUNDS \
+          REINVENT4_WEB_MODEL_CONTROL; do
     [ -n "${!_v:-}" ] && AGENT_ENV+=(--env "${_v}=${!_v}")
 done
 
-# shellcheck disable=SC2046
+if [ "${WEB}" -eq 1 ]; then
+    case "${DD_WEB_HOST:-127.0.0.1}" in
+        127.0.0.1|localhost|::1) ;;
+        *)
+            if [ -z "${REINVENT4_WEB_TOKEN:-}" ]; then
+                echo "error: DD_WEB_HOST=${DD_WEB_HOST} is reachable by other users;" \
+                     "set REINVENT4_WEB_TOKEN first" >&2
+                exit 1
+            fi ;;
+    esac
+    # The gateway is restarted whenever it exits, so a code change (DEV_SOURCE=1)
+    # needs only `pkill -f '[d]d-web --host'`, not a restart of the services.
+    # Ctrl-C or a TERM to this script ends the loop.
+    trap 'exit 0' INT TERM
+    while true; do
+        # shellcheck disable=SC2046,SC2086
+        run "${APPTAINER}" exec \
+            ${GPU_FLAG} \
+            $(gpu_env_flag "${REINVENT_GPU}") \
+            "${AGENT_ENV[@]}" \
+            "${AGENT_BINDS[@]}" \
+            "${AGENT_SIF}" dd-web --host "${DD_WEB_HOST:-127.0.0.1}" --port "${DD_WEB_PORT:-8000}" || true
+        [ "${DRY_RUN}" -eq 1 ] && exit 0
+        echo "dd-web exited at $(date +%T); restarting in 3 s" >&2
+        sleep 3
+    done
+fi
+
+# shellcheck disable=SC2046,SC2086
 run "${APPTAINER}" run \
     ${GPU_FLAG} \
     $(gpu_env_flag "${REINVENT_GPU}") \
