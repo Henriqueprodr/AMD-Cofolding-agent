@@ -9,13 +9,16 @@ lived; this file is the Slurm half and the choice between them.
 
 from __future__ import annotations
 
+import json
 import subprocess
+import time
 
 import pytest
 
 from reinvent4_agent.pool import (
     KubernetesPoolScaler,
     NullPoolScaler,
+    RelayPoolScaler,
     SlurmPoolScaler,
     make_pool_scaler,
 )
@@ -157,6 +160,46 @@ class TestSlurmPoolScaler:
         assert argv[argv.index("--partition") + 1] == "standard-g"
 
 
+class TestRelayPoolScaler:
+
+    def test_without_a_control_directory_it_is_a_noop(self):
+        scaler = RelayPoolScaler("")
+
+        assert scaler.available is False
+        assert scaler.current() is None
+        assert scaler.scale(3) is False
+
+    def test_the_wanted_count_is_written_for_the_relay(self, tmp_path):
+        scaler = RelayPoolScaler(str(tmp_path))
+
+        assert scaler.scale(4) is True
+
+        assert (tmp_path / "pool.want").read_text().strip() == "4"
+        # Written by rename, so no partial file is ever left behind.
+        assert list(tmp_path.glob("pool.want.*")) == []
+
+    def test_the_count_is_what_the_relay_achieved(self, tmp_path):
+        """Not what was asked for: a full queue must show as a smaller pool."""
+        scaler = RelayPoolScaler(str(tmp_path))
+        scaler.scale(4)
+        (tmp_path / "pool.state").write_text(
+            json.dumps({"replicas": 2, "jobs": ["101", "102"], "at": time.time()})
+        )
+
+        assert scaler.current() == 2
+
+    def test_a_relay_that_stopped_reporting_is_unknown_not_stale(self, tmp_path):
+        scaler = RelayPoolScaler(str(tmp_path))
+        (tmp_path / "pool.state").write_text(
+            json.dumps({"replicas": 3, "at": time.time() - 10_000})
+        )
+
+        assert scaler.current() is None
+
+    def test_no_state_yet_is_unknown(self, tmp_path):
+        assert RelayPoolScaler(str(tmp_path)).current() is None
+
+
 class TestSchedulerDetection:
 
     def test_kubernetes_wins_when_a_token_is_mounted(self, tmp_path, monkeypatch):
@@ -178,6 +221,35 @@ class TestSchedulerDetection:
         scaler = make_pool_scaler(service_account=tmp_path)
 
         assert isinstance(scaler, SlurmPoolScaler)
+
+    def test_the_relay_beats_slurm_when_both_look_present(
+        self, tmp_path, monkeypatch
+    ):
+        """In a container sbatch may be on PATH and still be unusable."""
+        control = tmp_path / "pool"
+        control.mkdir()
+        monkeypatch.setattr(
+            "reinvent4_agent.pool.shutil.which", lambda name: f"/usr/bin/{name}"
+        )
+        monkeypatch.setattr(
+            "reinvent4_agent.pool.SUPERVISOR_POOL_CONTROL", str(control)
+        )
+
+        scaler = make_pool_scaler(service_account=tmp_path)
+
+        assert isinstance(scaler, RelayPoolScaler)
+
+    def test_kubernetes_still_wins_over_the_relay(self, tmp_path, monkeypatch):
+        control = tmp_path / "pool"
+        control.mkdir()
+        _service_account(tmp_path)
+        monkeypatch.setattr(
+            "reinvent4_agent.pool.SUPERVISOR_POOL_CONTROL", str(control)
+        )
+
+        assert isinstance(
+            make_pool_scaler(service_account=tmp_path), KubernetesPoolScaler
+        )
 
     def test_neither_gives_a_scaler_that_declines(self, tmp_path, monkeypatch):
         monkeypatch.setattr("reinvent4_agent.pool.shutil.which", lambda name: None)

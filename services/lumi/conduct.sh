@@ -17,45 +17,62 @@
 # shares the session's network and can reach the services on 127.0.0.1.
 set -uo pipefail
 
-CAMPAIGN=${1:-}
-[[ -n $CAMPAIGN ]] || { echo "usage: conduct.sh <campaign_id>" >&2; exit 2; }
+[[ $# -gt 0 ]] || { echo "usage: conduct.sh <campaign_id> | --start --goal ... " >&2; exit 2; }
 
 SESSION_ENV=${SESSION_ENV:-${DATA_DIR:-$PWD/data}/session.env}
 [[ -f $SESSION_ENV ]] || { echo "no session to join: $SESSION_ENV" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$SESSION_ENV"
 
-export REINVENT4_AGENT_BACKEND=openai
-export REINVENT4_AGENT_BASE_URL=$CHAT_BASE_URL
-export REINVENT4_AGENT_MODEL=$CHAT_MODEL_ID
-export REINVENT4_AGENT_API_KEY=local-vllm
-export REINVENT4_AGENT_LOG_DIR=/logs
-# A conductor steers a fleet; it does not need a second opinion on its own turn.
-export REINVENT4_AGENT_MULTI_AGENT=false
-# Creating a base TTP is how a campaign on a new target begins; editing or
-# deleting one would rewrite the thing its own campaigns are measured against.
-export REINVENT4_AGENT_DENY_TOOLS=update_ttp,delete_ttp
-export CAMPAIGN_STORE_URL=${CAMPAIGN_STORE_URL:-http://$SESSION_NODE:8087}
-export DD_SERVICE_REGISTRY
+# Passed with --env rather than exported: the image's %environment declares
+# defaults for the agent variables, and a declared variable beats an inherited
+# one, so exporting them would leave the conductor talking to api.anthropic.com.
+AGENT_ENV=(
+    --env REINVENT4_AGENT_BACKEND=openai
+    --env "REINVENT4_AGENT_BASE_URL=$CHAT_BASE_URL"
+    --env "REINVENT4_AGENT_MODEL=$CHAT_MODEL_ID"
+    --env REINVENT4_AGENT_API_KEY=local-vllm
+    --env REINVENT4_AGENT_LOG_DIR=/logs
+    # A conductor steers a fleet; it does not need a second opinion on its own turn.
+    --env REINVENT4_AGENT_MULTI_AGENT=false
+    # Creating a base TTP is how a campaign on a new target begins; editing or
+    # deleting one would rewrite what its own campaigns are measured against.
+    --env REINVENT4_AGENT_DENY_TOOLS=update_ttp,delete_ttp
+    --env REINVENT4_AGENT_NO_VERIFY_SSL=false
+    --env "CAMPAIGN_STORE_URL=${CAMPAIGN_STORE_URL:-http://$SESSION_NODE:8087}"
+    --env DD_SERVICE_REGISTRY=/tmp/service-registry.json
+    # No boltz-gateway in this stack: one Boltz, no proxy to ask how deep its
+    # queue is. Empty rather than unset, so the conductor skips admission
+    # control instead of falling back to the cluster's hostname.
+    --env BOLTZ_GATEWAY_STATS_URL=
+)
 export SUPERVISOR_JOB_NAME=${SUPERVISOR_JOB_NAME:-dd-supervisor}
 export SUPERVISOR_SBATCH=$REPO/services/lumi/supervisor.sbatch
 
 SIF=$REPO/services/singularity/dd-agent-amd.sif
 [[ -f $SIF ]] || { echo "no agent image at $SIF (build it with build.sbatch)" >&2; exit 1; }
 
-# sbatch and squeue live on the host, not in the image, so the scaler needs
-# them bound in along with the Slurm config they read.
-SLURM_BINDS=()
-for p in /usr/bin/sbatch /usr/bin/squeue /usr/bin/scancel /etc/slurm /var/run/munge /usr/lib64/slurm; do
-    [[ -e $p ]] && SLURM_BINDS+=(--bind "$p")
-done
+# Not bound in: sbatch and friends. They are on the host but unusable from a
+# container -- munge and the user database do not cross the boundary -- so the
+# conductor states the pool size it wants in here and session.sbatch's relay
+# submits for it. RelayPoolScaler picks this up from the directory alone.
+export SUPERVISOR_POOL_CONTROL
+[[ -d ${SUPERVISOR_POOL_CONTROL:-} ]] || {
+    echo "no pool relay at '${SUPERVISOR_POOL_CONTROL:-}': the conductor will not be able to scale" >&2
+}
 
+SITE=/opt/venv/lib/python3.12/site-packages
 exec singularity exec \
     --bind "$DATA_DIR/shared:/shared" \
     --bind "$DATA_DIR/agent_logs:/logs" \
     --bind "$DATA_DIR/ttps:/data/reinvent4_mcp/ttps" \
     --bind "$DATA_DIR/jobs:/data/reinvent4_mcp/jobs" \
-    --bind "$REPO/reinvent4_agent:/app/reinvent4_agent_src" \
-    --env PYTHONPATH=/app/reinvent4_agent_src/.. \
-    "${SLURM_BINDS[@]}" \
-    "$SIF" python -m reinvent4_agent.conductor "$CAMPAIGN"
+    --bind "$SUPERVISOR_POOL_CONTROL" \
+    --bind "$REPO/reinvent4_agent:$SITE/reinvent4_agent" \
+    --bind "$REPO/reinvent4_mcp:$SITE/reinvent4_mcp" \
+    --bind "$MCP_CONFIG_FILE:/app/reinvent4_mcp_config.singularity.yaml" \
+    --bind "$DD_SERVICE_REGISTRY:/tmp/service-registry.json" \
+    --env REINVENT4_MCP_CONFIG=/app/reinvent4_mcp_config.singularity.yaml \
+    --env PYTHONPATH=$SITE/reinvent4_mcp/_plugins \
+    "${AGENT_ENV[@]}" \
+    "$SIF" python -m reinvent4_agent.conductor "$@"

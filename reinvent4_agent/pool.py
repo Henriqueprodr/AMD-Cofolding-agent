@@ -14,19 +14,29 @@ work that has run longest is the work least likely to be thrown away.
 than at configuration, because the thing that decides this is where the
 process happens to be running.
 
+A third case sits between the two. On an HPC system the conductor runs inside
+a container, and Slurm's client tools do not work in there: they need the
+system's munge socket and the host's user database, neither of which crosses
+the container boundary. There the conductor writes the number it wants to a
+file and a plain bash loop on the host, inside the same allocation, submits
+and cancels on its behalf.
+
 Env:
     SUPERVISOR_DEPLOYMENT     Deployment to scale on Kubernetes
     POD_NAMESPACE             namespace for the scale call
     SUPERVISOR_JOB_NAME       Slurm job name identifying pool members
     SUPERVISOR_SBATCH         sbatch script submitted to add one supervisor
+    SUPERVISOR_POOL_CONTROL   directory shared with a host-side relay
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
@@ -37,6 +47,7 @@ logger = logging.getLogger(__name__)
 SUPERVISOR_DEPLOYMENT = os.getenv("SUPERVISOR_DEPLOYMENT", "dd-agentic-supervisor")
 SUPERVISOR_JOB_NAME = os.getenv("SUPERVISOR_JOB_NAME", "dd-supervisor")
 SUPERVISOR_SBATCH = os.getenv("SUPERVISOR_SBATCH", "services/slurm/supervisor.sbatch")
+SUPERVISOR_POOL_CONTROL = os.getenv("SUPERVISOR_POOL_CONTROL", "")
 
 _SERVICE_ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 
@@ -258,6 +269,67 @@ class SlurmPoolScaler:
         return True
 
 
+class RelayPoolScaler:
+    """Asks a host-side relay to do the scaling, through two small files.
+
+    Slurm's clients cannot run inside the container -- ``sbatch`` needs the
+    host's munge socket and user database -- so the conductor states its
+    intent instead of acting on it. ``pool.want`` holds the number it wants;
+    ``pool.state`` is what the relay last managed to achieve. Writes are
+    atomic renames, so a relay reading mid-write sees the old number rather
+    than half of the new one.
+
+    Reporting the relay's state rather than the wanted number keeps the
+    conductor honest: if the queue is full and nothing starts, it sees the
+    pool it actually has.
+    """
+
+    # A relay that has not written for this long is treated as gone, so a
+    # dead loop surfaces as "unknown" instead of a stale count the conductor
+    # would keep reasoning about.
+    STALE_AFTER = 300.0
+
+    def __init__(self, control_dir: Optional[str] = None) -> None:
+        self.dir = Path(control_dir or SUPERVISOR_POOL_CONTROL or "")
+
+    @property
+    def available(self) -> bool:
+        return bool(self.dir.name) and self.dir.is_dir()
+
+    def current(self) -> Optional[int]:
+        if not self.available:
+            return None
+        try:
+            state = json.loads((self.dir / "pool.state").read_text())
+        except (OSError, ValueError) as exc:
+            logger.warning("no state from the pool relay: %s", exc)
+            return None
+
+        at = state.get("at")
+        if isinstance(at, (int, float)) and time.time() - at > self.STALE_AFTER:
+            logger.warning("the pool relay has not reported for %.0fs", time.time() - at)
+            return None
+        replicas = state.get("replicas")
+        return replicas if isinstance(replicas, int) else None
+
+    def scale(self, replicas: int) -> bool:
+        if not self.available:
+            logger.info("no pool relay here; would size the pool to %d", replicas)
+            return False
+
+        tmp = self.dir / f"pool.want.{os.getpid()}"
+        try:
+            tmp.write_text(f"{replicas}\n")
+            tmp.replace(self.dir / "pool.want")
+        except OSError as exc:
+            logger.error("could not ask the relay for %d supervisors: %s", replicas, exc)
+            tmp.unlink(missing_ok=True)
+            return False
+
+        logger.info("asked the pool relay for %d supervisors", replicas)
+        return True
+
+
 class NullPoolScaler:
     """Stands in where nothing can be scaled, so the loop still runs.
 
@@ -289,6 +361,13 @@ def make_pool_scaler(**kwargs: Any) -> PoolScaler:
     kubernetes = KubernetesPoolScaler(**kwargs)
     if kubernetes.available:
         return kubernetes
+
+    # Before Slurm, because where both are present we are in a container that
+    # has the client tools bound in but cannot actually use them.
+    relay = RelayPoolScaler()
+    if relay.available:
+        logger.info("scaling the supervisor pool through the host relay")
+        return relay
 
     slurm = SlurmPoolScaler()
     if slurm.available:

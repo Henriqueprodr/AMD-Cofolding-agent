@@ -89,7 +89,10 @@ else
     ARGS+=(--tool-call-parser gemma4 --reasoning-parser gemma4 --max-model-len 262144)
 fi
 
-TMP=$DATA_DIR/tmp
+# Per-port, not shared: two tiers start at the same moment, and both the AITER
+# copy below and Triton's compile cache are written by whichever gets there
+# first. One scratch each costs a second JIT compile and removes the race.
+TMP=$DATA_DIR/tmp/vllm-$PORT
 # Gemma's RMS norm goes through AITER, whose JIT copies itself into $HOME on first use;
 # the tensor-parallel workers race that copy and the engine dies. Seed one copy first.
 export AITER_JIT_DIR=$TMP/aiter-jit
@@ -106,6 +109,14 @@ export HIP_VISIBLE_DEVICES=$GPUS
 export VLLM_CACHE_ROOT=$TMP/vllm-cache
 export TRITON_CACHE_DIR=$TMP/triton-cache
 mkdir -p "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR"
+
+# VLLM_PORT is ours above but also vLLM's own: it is the base it derives the
+# tensor-parallel workers' rendezvous port from, so two tiers started from
+# here would both reach for the same one and the second engine dies with
+# EADDRINUSE. Dropped so vLLM picks a free port per instance; the rest go with
+# it only to keep "Unknown vLLM environment variable" out of the log.
+unset VLLM_PORT VLLM_MODEL VLLM_GPUS VLLM_HOST VLLM_SIF \
+      VLLM_MAX_MODEL_LEN VLLM_MOE_BACKEND VLLM_SPEC_TOKENS VLLM_LONG_CONTEXT
 
 exec singularity exec -B /pfs,/scratch,/project,/appl "$SIF" \
     vllm serve "$MODEL" "${ARGS[@]}"

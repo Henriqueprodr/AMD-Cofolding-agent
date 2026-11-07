@@ -46,6 +46,10 @@ NODE=$(hostname)
 export DATA_DIR=${DATA_DIR:-$REPO/data}
 LOGS=$REPO/logs/session-$JOB
 mkdir -p "$LOGS"
+# How the conductor, which cannot run sbatch from inside its container, asks
+# for supervisors. Per-session so a stale request cannot resize a new pool.
+POOL_DIR=$DATA_DIR/pool-$JOB
+mkdir -p "$POOL_DIR"
 
 # --- The two model tiers ----------------------------------------------------
 # Named by role rather than by model so swapping a checkpoint is one variable.
@@ -53,6 +57,7 @@ CHAT_MODEL=${CHAT_MODEL:-gemma}           # what people and the conductor use
 SUPERVISOR_MODEL=${SUPERVISOR_MODEL:-gemma}
 CHAT_PORT=8001
 SUPERVISOR_PORT=8002
+RUNNER_PORT=8086
 CHAT_GPUS=${CHAT_GPUS:-0,1}
 SUPERVISOR_GPUS=${SUPERVISOR_GPUS:-2,3}
 
@@ -110,6 +115,20 @@ part.replace(registry)
 print(f"registry at {registry} -> {node}")
 PY
 
+# The MCP config is the other half of discovery: the registry carries the URLs
+# the agent's tools dial, this carries the ones the scoring components dial
+# from inside an RL job. Generated from the checkout's template so there is one
+# place to edit, with the two things only this node knows substituted in.
+MCP_CONFIG=$DATA_DIR/reinvent4_mcp_config.session.yaml
+sed -e "s|http://localhost:|http://$NODE:|g" \
+    -e "/^runner:/,\$ s|enabled: false|enabled: true|" \
+    -e "s|max_concurrent_jobs: 2|max_concurrent_jobs: ${MAX_CONCURRENT_JOBS:-4}|" \
+    "$REPO/services/singularity/reinvent4_mcp_config.singularity.yaml" > "$MCP_CONFIG.part"
+grep -q "http://$NODE:8086" "$MCP_CONFIG.part" || { echo "config generation missed the runner URL"; exit 1; }
+mv "$MCP_CONFIG.part" "$MCP_CONFIG"
+export MCP_CONFIG_FILE=$MCP_CONFIG
+echo "MCP config at $MCP_CONFIG -> $NODE"
+
 # What a supervisor job needs to know to join this session. Written as a file
 # rather than passed through --export so a supervisor submitted an hour later
 # still picks up the right node.
@@ -121,18 +140,65 @@ export SESSION_JOB=$JOB
 export REPO=$REPO
 export DATA_DIR=$DATA_DIR
 export DD_SERVICE_REGISTRY=$REGISTRY
+export MCP_CONFIG_FILE=$MCP_CONFIG
+export SUPERVISOR_POOL_CONTROL=$POOL_DIR
 export SUPERVISOR_BASE_URL=http://$NODE:$SUPERVISOR_PORT/v1
 export SUPERVISOR_MODEL_ID=$SUPERVISOR_MODEL_ID
 export CHAT_BASE_URL=http://$NODE:$CHAT_PORT/v1
 export CHAT_MODEL_ID=$CHAT_MODEL_ID
+export RUNNER_BASE_URL=http://$NODE:$RUNNER_PORT
+export CAMPAIGN_STORE_URL=http://$NODE:8087
 EOF
 
-# The conductor runs inside this allocation and submits supervisors from it.
+# The conductor runs inside this allocation and asks the relay below to submit
+# supervisors; it cannot submit them itself, see pool_relay.
 export DD_SERVICE_REGISTRY=$REGISTRY
 export SUPERVISOR_JOB_NAME=${SUPERVISOR_JOB_NAME:-dd-supervisor}
 export SUPERVISOR_SBATCH=$REPO/services/lumi/supervisor.sbatch
 export SLURM_ACCOUNT=${SLURM_JOB_ACCOUNT:-}
 export CAMPAIGN_STORE_URL=http://127.0.0.1:8087
+
+# --- The supervisor pool relay ----------------------------------------------
+# Slurm's clients do not work inside the container: sbatch needs the host's
+# munge socket and user database, and bind-mounting them gets as far as
+# "Invalid user: $USER" before failing. So the conductor writes the number it
+# wants to pool.want and this loop, on the host and inside the allocation,
+# makes it true -- the submitting and cancelling that SlurmPoolScaler would
+# have done, in the one place that can actually do it.
+pool_relay() {
+    local want have ids id n
+    while true; do
+        want=$(cat "$POOL_DIR/pool.want" 2>/dev/null | tr -dc '0-9')
+        want=${want:-0}
+        # --sort V is submission order, so the tail of this list is the
+        # youngest work and therefore the cheapest to throw away.
+        ids=$(squeue --noheader --user "$USER" --name "$SUPERVISOR_JOB_NAME" \
+                     --states PENDING,CONFIGURING,RUNNING,COMPLETING,SUSPENDED \
+                     --format %i --sort V 2>/dev/null)
+        have=$(echo "$ids" | grep -c '[0-9]' || true)
+        if (( want > have )); then
+            for ((n = have; n < want; n++)); do
+                id=$(sbatch --parsable --job-name "$SUPERVISOR_JOB_NAME" \
+                            ${SLURM_ACCOUNT:+--account "$SLURM_ACCOUNT"} \
+                            "$SUPERVISOR_SBATCH" 2>&1) \
+                    && echo "relay: submitted supervisor $id" \
+                    || echo "relay: sbatch failed: $id"
+            done
+        elif (( want < have )); then
+            # shellcheck disable=SC2086
+            scancel $(echo "$ids" | tail -n $((have - want))) \
+                && echo "relay: cancelled $((have - want)) supervisor(s)"
+        fi
+        printf '{"replicas": %d, "want": %d, "jobs": [%s], "at": %d}\n' \
+            "$have" "$want" \
+            "$(echo "$ids" | grep '[0-9]' | sed 's/.*/"&"/' | paste -sd, -)" \
+            "$(date +%s)" > "$POOL_DIR/pool.state.part"
+        mv "$POOL_DIR/pool.state.part" "$POOL_DIR/pool.state"
+        sleep "${POOL_RELAY_SECONDS:-20}"
+    done
+}
+pool_relay >> "$LOGS/pool-relay.log" 2>&1 &
+RELAY_PID=$!
 
 # --- The two vLLM tiers -----------------------------------------------------
 # Serving both at once rather than swapping: the conductor's turn and its
@@ -149,10 +215,48 @@ serve() {  # model gpus port host logfile
 CHAT_PID=$(serve "$CHAT_MODEL" "$CHAT_GPUS" "$CHAT_PORT" 127.0.0.1 "$LOGS/vllm-chat.log")
 SUP_PID=$(serve "$SUPERVISOR_MODEL" "$SUPERVISOR_GPUS" "$SUPERVISOR_PORT" 0.0.0.0 "$LOGS/vllm-supervisor.log")
 
+# --- The RL runner ----------------------------------------------------------
+# One process owns the GPU REINVENT runs on, and every agent -- the one behind
+# the UI and every supervisor in the pool -- starts jobs through it. Not an
+# indirection for its own sake: supervisors are CPU jobs with no GPU to run on,
+# and a shared job table is what keeps the pool from oversubscribing this GCD.
+AGENT_SIF=$REPO/services/singularity/dd-agent-amd.sif
+SITE=/opt/venv/lib/python3.12/site-packages
+mkdir -p "$DATA_DIR"/{shared,jobs,logs,tb_logs,ttps,agent_logs}
+singularity exec \
+    --env ROCR_VISIBLE_DEVICES=$REINVENT_GPU \
+    --env REINVENT4_ROOT=/app/REINVENT4 \
+    --env REINVENT4_MCP_CONFIG=/app/reinvent4_mcp_config.singularity.yaml \
+    --env PYTHONPATH=$SITE/reinvent4_mcp/_plugins \
+    --env REINVENT_RUNNER_SELF=1 \
+    --env PORT=$RUNNER_PORT \
+    --bind "$DATA_DIR/shared:/shared" \
+    --bind "$MCP_CONFIG:/app/reinvent4_mcp_config.singularity.yaml" \
+    --bind "$DATA_DIR/ttps:/data/reinvent4_mcp/ttps" \
+    --bind "$DATA_DIR/jobs:/data/reinvent4_mcp/jobs" \
+    --bind "$DATA_DIR/logs:/data/reinvent4_mcp/logs" \
+    --bind "$DATA_DIR/tb_logs:/data/reinvent4_mcp/tb_logs" \
+    --bind "$REPO/reinvent4_agent:$SITE/reinvent4_agent" \
+    --bind "$REPO/reinvent4_mcp:$SITE/reinvent4_mcp" \
+    --bind "$REPO/services/reinvent-runner:/app/runner" \
+    --pwd /app/runner \
+    "$AGENT_SIF" uvicorn app:app --host 0.0.0.0 --port $RUNNER_PORT --workers 1 \
+    > "$LOGS/runner.log" 2>&1 &
+RUNNER_PID=$!
+
 bash "$REPO/services/singularity/run.sh" --vendor amd --web > "$LOGS/stack.log" 2>&1 &
 STACK=$!
 
-trap 'kill $STACK $CHAT_PID $SUP_PID 2>/dev/null; pkill -f "vllm serve" 2>/dev/null; wait' EXIT TERM
+# Supervisors outlive this script unless they are cancelled: they are separate
+# jobs, and the session they joined is gone the moment this exits.
+cleanup() {
+    kill "$RELAY_PID" 2>/dev/null
+    scancel --name "$SUPERVISOR_JOB_NAME" --user "$USER" 2>/dev/null
+    kill "$STACK" "$RUNNER_PID" "$CHAT_PID" "$SUP_PID" 2>/dev/null
+    pkill -f "vllm serve" 2>/dev/null
+    wait
+}
+trap cleanup EXIT TERM
 
 wait_for() {  # name url pid
     for _ in $(seq 1 240); do
@@ -164,6 +268,7 @@ wait_for() {  # name url pid
 }
 wait_for "vLLM chat ($CHAT_MODEL)" "http://127.0.0.1:$CHAT_PORT/health" "$CHAT_PID" || exit 1
 wait_for "vLLM supervisor ($SUPERVISOR_MODEL)" "http://127.0.0.1:$SUPERVISOR_PORT/health" "$SUP_PID" || exit 1
+wait_for reinvent-runner "http://127.0.0.1:$RUNNER_PORT/health" "$RUNNER_PID" || exit 1
 wait_for dd-web http://127.0.0.1:8000/api/health "$STACK" || exit 1
 
 curl -s -o /dev/null -w "without token: HTTP %{http_code}\n" "http://$NODE:8000/api/session"

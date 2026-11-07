@@ -39,18 +39,24 @@ if ! curl -sf --max-time 10 "${SUPERVISOR_BASE_URL%/v1}/health" >/dev/null; then
     exit 1
 fi
 
-export REINVENT4_AGENT_BACKEND=openai
-export REINVENT4_AGENT_BASE_URL=$SUPERVISOR_BASE_URL
-export REINVENT4_AGENT_MODEL=$SUPERVISOR_MODEL_ID
-export REINVENT4_AGENT_API_KEY=local-vllm
-export REINVENT4_AGENT_LOG_DIR=/logs
+# Passed with --env rather than exported: the image's %environment declares
+# defaults for these three, and a declared variable beats an inherited one, so
+# exporting them here would leave the supervisor talking to api.anthropic.com.
 # Driver only, no Reviewer: the same choice the cluster's supervisors make.
 # A pool of ten supervisors each running a Reviewer would double the load on
 # the Gemma tier to second-guess work the conductor already scores.
-export REINVENT4_AGENT_MULTI_AGENT=false
-export CAMPAIGN_STORE_URL=${CAMPAIGN_STORE_URL:-http://$SESSION_NODE:8087}
-# The rest of the service URLs come from here, applied by supervisor.main().
-export DD_SERVICE_REGISTRY
+AGENT_ENV=(
+    --env REINVENT4_AGENT_BACKEND=openai
+    --env "REINVENT4_AGENT_BASE_URL=$SUPERVISOR_BASE_URL"
+    --env "REINVENT4_AGENT_MODEL=$SUPERVISOR_MODEL_ID"
+    --env REINVENT4_AGENT_API_KEY=local-vllm
+    --env REINVENT4_AGENT_LOG_DIR=/logs
+    --env REINVENT4_AGENT_MULTI_AGENT=false
+    --env REINVENT4_AGENT_NO_VERIFY_SSL=false
+    --env "CAMPAIGN_STORE_URL=${CAMPAIGN_STORE_URL:-http://$SESSION_NODE:8087}"
+    # The rest of the service URLs come from here, applied by supervisor.main().
+    --env DD_SERVICE_REGISTRY=/tmp/service-registry.json
+)
 
 SIF=$REPO/services/singularity/dd-agent-amd.sif
 [[ -f $SIF ]] || { echo "no agent image at $SIF (build it with build.sbatch)" >&2; exit 1; }
@@ -58,11 +64,19 @@ SIF=$REPO/services/singularity/dd-agent-amd.sif
 mkdir -p "$DATA_DIR/agent_logs" "$DATA_DIR/shared"
 echo "supervisor $SLURM_JOB_ID on $(hostname) joining session $SESSION_JOB on $SESSION_NODE"
 
+# Bound over the copies installed in the image, the same way run.sh does it
+# with DEV_SOURCE=1, so a pool job started now runs the code in the checkout.
+SITE=/opt/venv/lib/python3.12/site-packages
 exec singularity exec \
     --bind "$DATA_DIR/shared:/shared" \
     --bind "$DATA_DIR/agent_logs:/logs" \
     --bind "$DATA_DIR/ttps:/data/reinvent4_mcp/ttps" \
     --bind "$DATA_DIR/jobs:/data/reinvent4_mcp/jobs" \
-    --bind "$REPO/reinvent4_agent:/app/reinvent4_agent_src" \
-    --env PYTHONPATH=/app/reinvent4_agent_src/.. \
+    --bind "$REPO/reinvent4_agent:$SITE/reinvent4_agent" \
+    --bind "$REPO/reinvent4_mcp:$SITE/reinvent4_mcp" \
+    --bind "$MCP_CONFIG_FILE:/app/reinvent4_mcp_config.singularity.yaml" \
+    --bind "$DD_SERVICE_REGISTRY:/tmp/service-registry.json" \
+    --env REINVENT4_MCP_CONFIG=/app/reinvent4_mcp_config.singularity.yaml \
+    --env PYTHONPATH=$SITE/reinvent4_mcp/_plugins \
+    "${AGENT_ENV[@]}" \
     "$SIF" python -m reinvent4_agent.supervisor

@@ -221,7 +221,14 @@ def queue_pressure(stats_url: str = GATEWAY_STATS_URL) -> Optional[float]:
 
     One batch per replica is a scorer that is busy and keeping up; the
     threshold that holds dispatch back sits above that.
+    Set the URL empty where there is no gateway to ask -- a single Boltz
+    behind no proxy, as on a scheduler -- and admission control is simply not
+    exercised, rather than warning once a tick about a host that was never
+    going to resolve.
     """
+
+    if not stats_url:
+        return None
 
     try:
         response = requests.get(stats_url, timeout=10)

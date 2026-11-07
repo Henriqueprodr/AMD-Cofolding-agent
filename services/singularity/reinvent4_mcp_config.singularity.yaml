@@ -62,11 +62,28 @@ scoring:
     interaction_type: "all"    # default family counted by /score (hbond, ionic, ... , all)
     radius: 8.0
     ph: 7.4
+  synthesis_planner:
+    enabled: true
+    service_url: "http://localhost:8088/score"
+    # The RL budget, not the planner's default: 25 iterations costs 0.3-0.8 s
+    # per molecule, which is affordable per batch. The agent's out-of-band
+    # plan_synthesis tool asks for a deeper search itself.
+    iteration_limit: 25
+    score_fn: "solved_steps"
 
 jobs:
   working_dir: "/data/reinvent4_mcp/jobs"
   max_concurrent_jobs: 2
   checkpoint_on_stop: true
+
+# Off by default: this image carries REINVENT4, so an agent started by run.sh
+# runs its own jobs. It is turned on where the agents are not all on the GPU
+# node -- a supervisor pool on CPU nodes has no REINVENT4 to run, and even the
+# ones that do must share a single job table or they oversubscribe the GPU.
+# services/lumi/session.sbatch flips this and starts the runner.
+runner:
+  enabled: false
+  base_url: "http://localhost:8086"
 
 # Absolute (not ~-relative): under Apptainer the container runs as the invoking
 # host user with the host $HOME auto-mounted, so "~" would resolve to the host

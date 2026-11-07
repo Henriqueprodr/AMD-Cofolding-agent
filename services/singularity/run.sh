@@ -277,11 +277,19 @@ fi
 mkdir -p "${DATA_DIR}/ttps" "${DATA_DIR}/jobs" "${DATA_DIR}/logs" \
          "${DATA_DIR}/tb_logs" "${DATA_DIR}/agent_logs"
 
+# Normally the checkout's config, overlaid on the baked one so config edits
+# (e.g. service ports/URLs) take effect without rebuilding the agent SIF. On a
+# scheduler there is no DNS and no fixed node, so the caller generates a config
+# naming the node it got and passes it here.
+MCP_CONFIG_FILE="${MCP_CONFIG_FILE:-${SCRIPT_DIR}/reinvent4_mcp_config.singularity.yaml}"
+if [ "${DRY_RUN}" -eq 0 ] && [ ! -f "${MCP_CONFIG_FILE}" ]; then
+    echo "error: MCP config not found: ${MCP_CONFIG_FILE}" >&2
+    exit 1
+fi
+
 AGENT_BINDS=(
     --bind "${SHARED_BIND}"
-    # Overlay the baked MCP config with the current source so config edits
-    # (e.g. service ports/URLs) take effect without rebuilding the agent SIF.
-    --bind "${SCRIPT_DIR}/reinvent4_mcp_config.singularity.yaml:/app/reinvent4_mcp_config.singularity.yaml"
+    --bind "${MCP_CONFIG_FILE}:/app/reinvent4_mcp_config.singularity.yaml"
     --bind "${DATA_DIR}/ttps:/data/reinvent4_mcp/ttps"
     --bind "${DATA_DIR}/jobs:/data/reinvent4_mcp/jobs"
     --bind "${DATA_DIR}/logs:/data/reinvent4_mcp/logs"
