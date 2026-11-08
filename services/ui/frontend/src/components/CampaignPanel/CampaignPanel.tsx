@@ -38,6 +38,8 @@ type View = "trajectory" | "results";
 export function CampaignPanel({ sessionId, theme, onOpenMolecule }: Props) {
   const now = useNow();
   const [campaigns, setCampaigns] = useState<FleetCampaign[] | null>(null);
+  /** The ones shown belong to no conversation, so the tab has to say so. */
+  const [orphan, setOrphan] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [chosen, setChosen] = useState<string | null>(null);
   const [detail, setDetail] = useState<CampaignDetail | null>(null);
@@ -48,15 +50,29 @@ export function CampaignPanel({ sessionId, theme, onOpenMolecule }: Props) {
 
   useEffect(() => {
     let cancelled = false;
-    fetchCampaigns(sessionId)
-      .then((list) => {
+    void (async () => {
+      try {
+        const mine = sessionId ? await fetchCampaigns(sessionId) : [];
         if (cancelled) return;
-        setCampaigns(list);
+        if (mine.length) {
+          setCampaigns(mine);
+          setOrphan(false);
+        } else {
+          // The ledger leaves campaigns belonging to no conversation out of a
+          // filtered list, which is right for "which are mine" and wrong for
+          // a tab that would then say nothing is running while something is.
+          // One started from the command line is still worth showing, said as
+          // what it is.
+          const all = await fetchCampaigns();
+          if (cancelled) return;
+          setCampaigns(all.filter((campaign) => !campaign.session_id));
+          setOrphan(true);
+        }
         setListError(null);
-      })
-      .catch((reason: unknown) => {
+      } catch (reason) {
         if (!cancelled) setListError(message(reason));
-      });
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -118,6 +134,7 @@ export function CampaignPanel({ sessionId, theme, onOpenMolecule }: Props) {
         campaigns={campaigns}
         current={current}
         now={now}
+        orphan={orphan}
         onChoose={(id) => {
           setChosen(id);
           setTask(null);
@@ -186,11 +203,13 @@ function Header({
   campaigns,
   current,
   now,
+  orphan,
   onChoose,
 }: {
   campaigns: readonly FleetCampaign[];
   current: FleetCampaign | null;
   now: number;
+  orphan: boolean;
   onChoose: (id: string) => void;
 }) {
   if (!current) return null;
@@ -216,6 +235,7 @@ function Header({
       <p className="text-faint mt-0.5 text-[10.5px]">
         {campaignActive(current) ? "ongoing" : current.state} · started {relativeTime(current.created_at, now)}
         {current.base_ttp_id && ` · varying ${current.base_ttp_id}`}
+        {orphan && " · not this conversation's"}
       </p>
     </div>
   );
