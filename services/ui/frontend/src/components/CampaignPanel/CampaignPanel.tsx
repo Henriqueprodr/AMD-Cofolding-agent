@@ -281,5 +281,11 @@ function message(reason: unknown): string {
   if (reason instanceof ApiError && reason.status === 503) {
     return `The campaign ledger cannot be reached, so what is running is unknown. ${reason.message}`;
   }
+  if (reason instanceof ApiError && reason.status === 404) {
+    // The route itself is absent, so this gateway is older than campaigns.
+    // Left as the bare "Not Found" it reads as "you have no campaigns",
+    // which sends the reader looking for a campaign that was never possible.
+    return "This gateway does not serve campaigns. It is running a build from before the fleet existed, so no campaign can be started or read until it is updated.";
+  }
   return reason instanceof Error ? reason.message : String(reason);
 }
