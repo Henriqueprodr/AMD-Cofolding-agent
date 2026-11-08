@@ -86,6 +86,7 @@ __all__ = [
     "authored_ttp_id",
     "build_goal",
     "default_run_substitutes_for",
+    "driver_denied_tools",
     "job_for_ttp",
     "main",
     "objective_profile",
@@ -546,6 +547,24 @@ DRIVER_DENIED_TOOLS = frozenset({
     "finalize_campaign",
 })
 
+
+def driver_denied_tools(authored: bool) -> frozenset[str]:
+    """What this particular Driver must not touch.
+
+    ``create_ttp`` is denied to a Driver running a variant of the campaign's
+    base TTP, where the weights are the experiment and writing a new profile
+    would quietly measure something else. It cannot be denied to a Driver
+    asked to write its own: that is the task.
+
+    ``update_ttp`` and ``delete_ttp`` stay denied either way. Writing one
+    profile is the task; rewriting a profile that already has a run behind
+    it, or removing someone else's, is not.
+    """
+
+    if not authored:
+        return DRIVER_DENIED_TOOLS
+    return DRIVER_DENIED_TOOLS - {"create_ttp"}
+
 # What one RL step costs when every molecule is folded, measured on demo-lux.
 # Quoted to the Driver so its patience has a basis: without a number it has no
 # way to tell a slow step from a broken one.
@@ -794,7 +813,7 @@ class CoscientistTaskRunner:
             # only the denied names have to be maintained.
             driver_tools = {
                 tool["name"] for tool in await mcp.list_tools()
-            } - DRIVER_DENIED_TOOLS
+            } - driver_denied_tools(authored=not base_ttp_id)
 
             driver = Agent(
                 mcp, _backend(DRIVER_SYSTEM_PROMPT),

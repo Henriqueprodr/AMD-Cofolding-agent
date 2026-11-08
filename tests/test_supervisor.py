@@ -406,6 +406,37 @@ class TestDriverToolBoundary:
         # something other than the point the campaign is measuring.
         assert {"create_ttp", "update_ttp", "delete_ttp"} <= DRIVER_DENIED_TOOLS
 
+    def test_a_driver_writing_its_own_ttp_may_create_one(self):
+        """Otherwise the task is impossible.
+
+        Observed on LUMI: told to write a profile and start a run against it,
+        two sub-agents in a row called create_generation_campaign and
+        run_optimization in a loop instead -- the only TTP-less tools left to
+        them -- and both tasks failed. The denial is right for a sweep, where
+        the weights are the experiment; it cannot apply when writing the
+        profile is the experiment.
+        """
+
+        from reinvent4_agent.supervisor import driver_denied_tools
+
+        assert "create_ttp" not in driver_denied_tools(authored=True)
+
+    def test_it_still_cannot_rewrite_or_remove_one(self):
+        """Writing a profile is the task. Rewriting one that already has a
+        run behind it, or deleting someone else's, is not."""
+
+        from reinvent4_agent.supervisor import driver_denied_tools
+
+        denied = driver_denied_tools(authored=True)
+        assert {"update_ttp", "delete_ttp"} <= denied
+        assert "stop_optimization" in denied
+
+    def test_a_driver_varying_a_base_ttp_still_cannot_write_one(self):
+        from reinvent4_agent.supervisor import driver_denied_tools
+
+        assert "create_ttp" in driver_denied_tools(authored=False)
+        assert driver_denied_tools(authored=False) == DRIVER_DENIED_TOOLS
+
     def test_it_cannot_steer_the_fleet(self):
         # A worker must not open campaigns, queue work, or cancel its peers.
         assert {
