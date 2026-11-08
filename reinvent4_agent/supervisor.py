@@ -606,12 +606,21 @@ def build_goal(
         lines = [
             f"Run a lead-optimisation task, under TTP id '{ttp_id}'.",
             "",
-            "There is no therapeutic target profile for this task yet. Write "
-            f"one, with the id '{ttp_id}' exactly -- that id is how your run "
-            "is found afterwards, so a different one loses the work even "
-            "though it ran. Choose the objectives and their weights from "
-            "what this task is for: look the target up rather than recalling "
-            "it, and say what you chose to score and why before you start.",
+            "There is no therapeutic target profile for this task yet, so "
+            "your first step is to write one:",
+            "",
+            f"  1. Call create_ttp with the id '{ttp_id}' exactly. That id "
+            "is how your run is found afterwards, so a different one loses "
+            "the work even though it ran. Choose the objectives and their "
+            "weights from what this task is for -- look the target up "
+            "rather than recalling it, and say what you chose to score and "
+            "why before you start.",
+            f"  2. Start the run against '{ttp_id}'.",
+            "",
+            "Do not reach for run_optimization or create_generation_campaign "
+            "to skip step 1. They start a run with no TTP behind it, which "
+            "scores nothing this task asked for and cannot be found later, "
+            "so the task fails exactly as if you had done nothing.",
         ]
         if campaign_goal:
             lines += [

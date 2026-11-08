@@ -267,8 +267,19 @@ class TestBuildGoal:
         goal = build_goal(_task(), "ttp-t1", authored=True)
 
         assert "ttp-t1" in goal
-        assert "Write" in goal or "write" in goal
+        assert "create_ttp" in goal, "naming the tool is the whole instruction"
         assert "do not modify" not in goal, "there is nothing yet to modify"
+
+    def test_it_names_the_tools_that_would_skip_writing_the_ttp(self):
+        """Observed on LUMI: told only to "write one", a sub-agent called
+        create_generation_campaign thirty-six times and run_optimization ten,
+        never once create_ttp, and failed the task. Both of those start a run
+        with no TTP behind it, so they look like progress and are not."""
+
+        goal = build_goal(_task(), "ttp-t1", authored=True)
+
+        assert "run_optimization" in goal
+        assert "create_generation_campaign" in goal
 
     def test_an_authored_task_is_given_the_campaign_goal(self):
         """It has to choose objectives, and cannot do that from the task
