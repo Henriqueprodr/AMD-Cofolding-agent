@@ -134,6 +134,35 @@ class TransformConfig(BaseModel):
             self.__pydantic_extra__[name] = number
         return self
 
+    @model_validator(mode="after")
+    def _conventional_parameters_are_filled_in(self) -> "TransformConfig":
+        """Supply the parameters REINVENT4 requires but conventionally fixes.
+
+        The sigmoid family's ``k`` is required by REINVENT4 and built while
+        constructing the ``Scorer``, so omitting it surfaced as
+        ``Parameters.__init__() missing 1 required positional argument: 'k'``
+        five seconds into a GPU job, naming neither the transform nor the
+        component it belonged to. Observed on LUMI, where it failed a campaign
+        task whose sibling had already produced molecules.
+
+        Only parameters with a conventional value are filled. A sigmoid with
+        no ``low`` is a transform nobody can guess, and saying so belongs to
+        whoever checks the TTP is complete, not to a field coercion.
+        """
+
+        from reinvent4_mcp.transforms import transform_spec
+
+        spec = transform_spec(self.type)
+        if spec is None:
+            return self
+        extra = self.__pydantic_extra__
+        if extra is None:
+            return self
+        for name, value in spec.defaults.items():
+            if extra.get(name) is None:
+                extra[name] = value
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Target

@@ -25,6 +25,7 @@ from reinvent4_agent.supervisor import (
     Supervisor,
     TaskOutcome,
     _deadline_seconds,
+    _overdue_seconds,
     apply_overrides,
     build_goal,
     job_for_ttp,
@@ -1418,6 +1419,35 @@ class TestDeadlines:
 
     def test_an_unparseable_deadline_is_ignored_not_fatal(self):
         assert _deadline_seconds(_task(deadline="whenever")) is None
+
+
+class TestOverdueTasks:
+    """A deadline is absolute, so a queued task can outlive its own.
+
+    Two LUMI attempts on one task were claimed two hours after its deadline,
+    started, stopped inside their first RL step with nothing to checkpoint,
+    and reported as an unreadable results CSV -- the real reason appearing
+    nowhere. Zero time left and no deadline at all have to read differently.
+    """
+
+    def test_a_task_claimed_after_its_deadline_is_overdue(self):
+        when = datetime.now(timezone.utc) - timedelta(minutes=120)
+
+        overdue = _overdue_seconds(_task(deadline=when.isoformat()))
+
+        assert 7150 < overdue <= 7200
+
+    def test_a_task_still_inside_its_deadline_is_not(self):
+        when = datetime.now(timezone.utc) + timedelta(seconds=600)
+
+        assert _overdue_seconds(_task(deadline=when.isoformat())) is None
+
+    def test_no_deadline_is_never_overdue(self):
+        assert _overdue_seconds(_task()) is None
+
+    def test_an_unparseable_deadline_is_not_treated_as_passed(self):
+        """Refusing the task would be worse than running it unbounded."""
+        assert _overdue_seconds(_task(deadline="whenever")) is None
 
 
 # ---------------------------------------------------------------------------

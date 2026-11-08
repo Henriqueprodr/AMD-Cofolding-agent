@@ -212,6 +212,41 @@ class TestTransformNumbersWrittenAsText:
         assert TransformConfig(type="sigmoid", note="steep").note == "steep"
 
 
+class TestTransformSteepnessIsFilledIn:
+    """REINVENT4 requires the sigmoid family's ``k`` and defaults it nowhere.
+
+    A TTP written without it reached the GPU and raised
+    ``Parameters.__init__() missing 1 required positional argument: 'k'``
+    while the ``Scorer`` was being built, naming neither the transform nor its
+    component. Observed on LUMI, where it failed a campaign task whose sibling
+    had already produced molecules.
+    """
+
+    def test_a_sigmoid_without_k_gets_the_conventional_one(self):
+        assert TransformConfig(type="sigmoid", low=-2.0, high=0.0).k == 0.5
+
+    def test_a_reverse_sigmoid_too(self):
+        assert TransformConfig(type="reverse_sigmoid", low=-2.0, high=0.0).k == 0.5
+
+    def test_a_supplied_steepness_is_never_overwritten(self):
+        assert TransformConfig(type="sigmoid", low=0, high=1, k=0.2).k == 0.2
+
+    def test_a_quoted_steepness_is_still_the_caller_s(self):
+        """Coerced to a number first, so it must not look absent."""
+        assert TransformConfig(type="sigmoid", low=0, high=1, k="0.2").k == 0.2
+
+    def test_transforms_that_take_no_steepness_do_not_grow_one(self):
+        t = TransformConfig(type="right_step", low=1, high=2)
+
+        assert "k" not in t.model_dump()
+
+    def test_an_unguessable_parameter_is_left_missing(self):
+        """Saying a sigmoid has no bounds belongs to whoever checks the TTP."""
+        t = TransformConfig(type="sigmoid")
+
+        assert t.model_dump() == {"type": "sigmoid", "k": 0.5}
+
+
 class TestTransformConfig:
     def test_valid_types(self):
         for t in [

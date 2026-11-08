@@ -520,6 +520,31 @@ def _deadline_seconds(task: dict[str, Any]) -> Optional[float]:
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
+def _overdue_seconds(task: dict[str, Any]) -> Optional[float]:
+    """Seconds since the task's deadline passed, if it has passed.
+
+    A task's deadline is absolute and set when the campaign enqueues it, so a
+    task that waited behind the job backend's concurrency limit can be claimed
+    after its own deadline. :func:`_deadline_seconds` floors at zero, which
+    reads as "stop now" and is how two LUMI attempts on one task were started,
+    stopped inside their first RL step with nothing to checkpoint, and
+    reported as an unreadable results CSV -- the real reason, that the
+    deadline had passed two hours before the claim, appearing nowhere.
+    """
+
+    raw = (task.get("spec") or {}).get("deadline")
+    if not raw:
+        return None
+    try:
+        when = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    overdue = (datetime.now(timezone.utc) - when).total_seconds()
+    return overdue if overdue > 0 else None
+
+
 # Tools a supervisor's Driver must not have. It runs the task it was given; it
 # does not get to redefine it, abandon it, or steer the fleet.
 #
@@ -770,6 +795,16 @@ class CoscientistTaskRunner:
         # would answer current_job_id() with the previous task's run for as
         # long as this one takes to prepare its own.
         self._ttp_id = None
+        overdue = _overdue_seconds(task)
+        if overdue is not None:
+            # Refused before the TTP variant, the model load and the GPU: with
+            # no time left the run would be stopped inside its first RL step,
+            # which has nothing to checkpoint, and the task would fail anyway
+            # with the empty results CSV as its only explanation.
+            raise RuntimeError(
+                f"the task deadline passed {overdue / 60:.0f} minutes before "
+                "it was claimed, so there is no time to run it in"
+            )
         # Both reach the store and the TTP tools over HTTP, and a call that
         # blocks here also stops _heartbeat_forever and _presence_forever.
         campaign = await asyncio.to_thread(self._campaign_of, task)
