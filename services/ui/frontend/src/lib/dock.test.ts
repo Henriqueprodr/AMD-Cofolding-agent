@@ -11,7 +11,7 @@ function memory() {
 
 describe("DOCK_TABS", () => {
   it("lists every tab, in order", () => {
-    expect(DOCK_TABS).toEqual(["structure", "molecules", "jobs", "target", "ttp", "assets"]);
+    expect(DOCK_TABS).toEqual(["structure", "molecules", "jobs", "campaign", "target", "ttp", "assets"]);
   });
 });
 

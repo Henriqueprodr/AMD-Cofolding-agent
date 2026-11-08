@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCampaignJobs } from "../../hooks/useCampaignJobs";
 import { refreshSessionList, useJobOwners, useRunsKnown, useSessionRuns } from "../../hooks/useSessions";
 import type { Theme } from "../../hooks/useTheme";
 import { callTool, download, jobFileUrl } from "../../lib/api";
@@ -91,11 +92,12 @@ export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
   const runs = useSessionRuns(sessionId);
   const owners = useJobOwners();
   const known = useRunsKnown();
+  const campaignJobs = useCampaignJobs(sessionId);
   const summary = useMemo(() => {
     if (!allJobs || known === null) return undefined;
     // A gateway that does not say who launched what: every job is the conversation's.
-    return scopedJob(allJobs, known ? conversationJobs(allJobs, runs, focused, owners, sessionId).own : allJobs, focused);
-  }, [allJobs, known, runs, focused, owners, sessionId]);
+    return scopedJob(allJobs, known ? conversationJobs(allJobs, runs, focused, owners, sessionId, campaignJobs).own : allJobs, focused);
+  }, [allJobs, known, runs, focused, owners, sessionId, campaignJobs]);
   const [tick, setTick] = useState(0);
   const [status, setStatus] = useState<Loaded<JobStatus | null> | null>(null);
   const [candidates, setCandidates] = useState<Loaded<Candidate[]> | null>(null);

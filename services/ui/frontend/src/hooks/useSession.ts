@@ -44,6 +44,10 @@ interface SessionState {
   autoUntil: string | null;
   /** Give the agent *minutes* to work on its own, or 0 to take that back. */
   setAuto: (minutes: number) => void;
+  /** Sub-agents this conversation may run at once; 1, the default, is alone. */
+  agents: number;
+  /** Allow up to *count* sub-agents. Starts nothing; the agent decides whether to spend them. */
+  setAgents: (count: number) => void;
   reconnect: () => void;
 }
 
@@ -105,6 +109,7 @@ export function useSession(request: SessionRequest, onAttached: (session: Sessio
   const [gatewayError, setGatewayError] = useState<string | null>(null);
   const [notices, setNotices] = useState<Notice[]>([]);
   const [autoUntil, setAutoUntil] = useState<string | null>(null);
+  const [agents, setAgentCount] = useState(1);
 
   const socketRef = useRef<WebSocket | null>(null);
   const attemptRef = useRef(0);
@@ -150,11 +155,13 @@ export function useSession(request: SessionRequest, onAttached: (session: Sessio
             turns: event.turns,
             busy: event.busy,
             auto_until: autoDeadline(event),
+            agents_allowed: event.agents_allowed,
             inputTokens: event.inputTokens,
             outputTokens: event.outputTokens,
           };
-          // The budget outlives the socket, so a reconnect picks it up again.
+          // Both settings outlive the socket, so a reconnect picks them up again.
           setAutoUntil(summary.auto_until ?? null);
+          setAgentCount(summary.agents_allowed ?? 1);
           // What is on screen belongs to another conversation: start over.
           // The replay that follows fills it in.
           if (shownRef.current !== summary.id) {
@@ -172,6 +179,9 @@ export function useSession(request: SessionRequest, onAttached: (session: Sessio
           return;
         case "auto":
           setAutoUntil(autoDeadline(event));
+          return;
+        case "agents":
+          setAgentCount(Math.max(1, event.count));
           return;
         default:
           if (event.type === "error" && typeof event.seq !== "number") {
@@ -314,6 +324,15 @@ export function useSession(request: SessionRequest, onAttached: (session: Sessio
     [sendMessage],
   );
 
+  // No local echo, for the same reason as the budget: the gateway answers
+  // with an 'agents' event, so every tab shows the same allowance.
+  const setAgents = useCallback(
+    (count: number) => {
+      sendMessage({ type: "agents", count: Math.max(1, Math.round(count)) });
+    },
+    [sendMessage],
+  );
+
   const reconnect = useCallback(() => {
     attemptRef.current = 0;
     setConnection("connecting");
@@ -338,6 +357,8 @@ export function useSession(request: SessionRequest, onAttached: (session: Sessio
     cancel,
     autoUntil,
     setAuto,
+    agents,
+    setAgents,
     reconnect,
   };
 }

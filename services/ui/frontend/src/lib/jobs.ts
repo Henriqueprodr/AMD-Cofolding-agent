@@ -347,6 +347,11 @@ export const isActive = (state: JobState) => state === "running" || state === "q
  * apart those it only referenced. *pinned*, the run the workbench is about,
  * counts as launched while no other conversation claims it: a run just
  * started from the panel is not in the gateway's list yet.
+ *
+ * *campaignJobs* are the runs of this conversation's campaigns. A sub-agent
+ * starts them from its own session, so the gateway does not record them as
+ * launched here -- but they are this conversation's work, and without them a
+ * campaign makes the user's own list of runs go empty.
  */
 export function conversationJobs<T extends { id: string }>(
   jobs: readonly T[],
@@ -354,8 +359,10 @@ export function conversationJobs<T extends { id: string }>(
   pinned: string | null,
   owners: ReadonlyMap<string, string>,
   sessionId: string | null | undefined,
+  campaignJobs: ReadonlySet<string> = new Set(),
 ): { own: T[]; seen: T[] } {
   const launched = new Set((runs?.jobs ?? []).filter((j) => j.launched).map((j) => j.id));
+  for (const id of campaignJobs) launched.add(id);
   if (pinned && (owners.get(pinned) ?? sessionId) === sessionId) launched.add(pinned);
   const referenced = new Set((runs?.jobs ?? []).filter((j) => !j.launched).map((j) => j.id));
   return {

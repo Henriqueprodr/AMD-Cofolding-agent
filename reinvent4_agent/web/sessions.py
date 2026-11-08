@@ -163,7 +163,7 @@ _DONE_MARKUP = re.compile(r"\s*[*_#]*\bAUTONOMY\s+DONE\b[*_#.!]*", re.IGNORECASE
 
 #: Events that speak to whoever is watching now rather than to the
 #: conversation, so they are neither numbered nor recorded.
-_LIVE_ONLY = frozenset({"notice", "auto"})
+_LIVE_ONLY = frozenset({"notice", "auto", "agents"})
 
 
 def valid_session_id(session_id: str | None) -> bool:
@@ -352,6 +352,10 @@ class LiveSession:
     subscribers: set[asyncio.Queue[dict[str, Any]]] = field(default_factory=set)
     #: End of the autonomy budget; None when the agent only answers requests.
     auto_until: datetime | None = None
+    #: Sub-agents the user allows this conversation to run at once.  One means
+    #: the agent works alone, which is the default; more switches campaign
+    #: mode on.  A ceiling the user set, not a promise the scheduler made.
+    agents_allowed: int = 1
     #: The continuation turn waiting out its pause, if one is queued.
     auto_task: asyncio.Task[None] | None = None
     #: Automatic turns taken since the last user message.
@@ -493,6 +497,11 @@ class LiveSession:
         """
         if self.busy:
             return False
+        # The allowance rides with the turn rather than the system prompt: the
+        # user can move the slider between turns, and the agent has to be told
+        # the number in force for this one.  Published without it, so the
+        # user's own message reads back as they typed it.
+        sent = self._with_allowance(content)
         # The user leads: whatever the agent was about to do on its own is dropped.
         self.cancel_continuation()
         self.auto_turns = 0
@@ -504,7 +513,7 @@ class LiveSession:
             self.meta["title"] = first_line[:_TITLE_CHARS]
             self.meta["auto_title"] = True
         self.publish({"type": "user_message", "content": content, **({"effort": effort} if effort else {})})
-        self._begin(content)
+        self._begin(sent)
         return True
 
     def cancel(self) -> bool:
@@ -519,6 +528,39 @@ class LiveSession:
         assert self.running is not None
         self.running.cancel()
         return True
+
+    # -- sub-agents ---------------------------------------------------------
+
+    def set_agents(self, count: int) -> int:
+        """Allow this conversation up to *count* sub-agents at once.
+
+        Nothing is started here.  The number is what the agent is told it may
+        spend, and it decides whether a campaign is the right shape for what
+        was asked; one means it works alone.  Published so every tab watching
+        the conversation shows the same setting.
+        """
+
+        self.agents_allowed = max(1, int(count))
+        self.publish({"type": "agents", "count": self.agents_allowed})
+        return self.agents_allowed
+
+    def _with_allowance(self, content: str) -> str:
+        """*content* with the sub-agent allowance appended, when there is one.
+
+        Only above one: at one there is nothing to say, and a line on every
+        turn saying the agent may run one sub-agent would read as a standing
+        instruction to run campaigns.
+        """
+
+        if self.agents_allowed <= 1 or not content.strip():
+            return content
+        return (
+            f"{content}\n\n"
+            f"[The user allows up to {self.agents_allowed} sub-agents at once "
+            "for this conversation. Run a campaign if the work divides into "
+            "experiments worth running side by side; if it does not, say so "
+            "and do it yourself.]"
+        )
 
     # -- working on its own ------------------------------------------------
 
@@ -769,7 +811,12 @@ class LiveSession:
             self.meta["auto_title"] = False
 
     def summary(self) -> dict[str, Any]:
-        return {**self.meta, "busy": self.busy, "auto_until": self._auto_iso()}
+        return {
+            **self.meta,
+            "busy": self.busy,
+            "auto_until": self._auto_iso(),
+            "agents_allowed": self.agents_allowed,
+        }
 
 
 #: Builds an agent whose events go to the given sink.

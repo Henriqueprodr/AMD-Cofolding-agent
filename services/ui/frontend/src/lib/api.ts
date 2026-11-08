@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { ConversationEvent, Panel, SessionSummary } from "../types/api";
+import type { CampaignDetail, ConversationEvent, FleetCampaign, FleetCapacity, Panel, SessionSummary } from "../types/api";
 import type { CofoldStatus } from "./cofold";
 import type { JobStructure } from "./jobStructures";
 
@@ -137,6 +137,23 @@ export function callTool<T = unknown>(name: string, args: Record<string, unknown
 
 /** What Boltz is cofolding now; `{ available: false }` when the service cannot be read. */
 export const fetchCofoldStatus = () => request<CofoldStatus>("/api/services/cofold");
+
+/**
+ * The fleet: campaigns run by sub-agents. Read-only and outside the tool
+ * surface, because these are for a person looking rather than the agent
+ * acting; polling them must not reach the conversation.
+ *
+ * They answer 503 while the ledger is away, which the panels show as such:
+ * an empty fleet would read as "nothing is running".
+ */
+export const fetchCampaigns = (sessionId?: string | null) =>
+  request<FleetCampaign[]>(`/api/fleet/campaigns${sessionId ? `?session=${encodeURIComponent(sessionId)}` : ""}`);
+
+export const fetchCampaign = (campaignId: string) =>
+  request<CampaignDetail>(`/api/fleet/campaigns/${encodeURIComponent(campaignId)}`);
+
+/** The largest supervisor pool this deployment could run; null is unknown, not unlimited. */
+export const fetchCapacity = () => request<FleetCapacity>("/api/fleet/capacity");
 
 export const jobFileUrl = (jobId: string, name: string) =>
   `/api/jobs/${encodeURIComponent(jobId)}/files/${encodeURIComponent(name)}`;

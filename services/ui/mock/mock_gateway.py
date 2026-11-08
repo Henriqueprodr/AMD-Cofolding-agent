@@ -59,6 +59,126 @@ LIGANDS = [
 SHARED = Path(tempfile.gettempdir()) / "cofolding-mock-shared"
 
 
+def _ago(minutes: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
+
+#: A campaign with no base TTP, which is the usual way round: each task
+#: writes its own profile from the conductor's intent.
+MOCK_CAMPAIGN = {
+    "campaign_id": "camp-mock-1",
+    "goal": "Improve on the JQ1 series against BRD4 without losing selectivity",
+    "base_ttp_id": None,
+    "objectives": [],
+    "concurrency": 3,
+    "state": "open",
+    "created_at": _ago(95),
+    "dispatch_until": None,
+    "hard_stop_at": None,
+    "finalized_at": None,
+    "session_id": None,
+}
+
+
+def _task(task_id, state, minutes, intent, *, owner=None, parents=(), job=None, error=None):
+    return {
+        "task_id": task_id,
+        "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+        "spec": {"intent": intent, **({"derived_from": list(parents)} if parents else {})},
+        "state": state,
+        "attempts": 1,
+        "created_at": _ago(minutes + 2),
+        "lease_owner": owner,
+        "lease_expires_at": None,
+        "claimed_at": None if owner is None else _ago(minutes),
+        "finished_at": None,
+        "error": error,
+        "job_id": job,
+    }
+
+
+MOCK_TASKS = [
+    _task("t-aaa1", "done", 90, "Hold the JQ1 triazolodiazepine core and vary the pendant aryl", owner="sup-1", job="81000001"),
+    _task("t-aaa2", "done", 86, "Scaffold-hop away from the diazepine; keep the acetyl-lysine mimic", owner="sup-2", job="81000002"),
+    _task("t-aaa3", "failed", 60, "Push logP below 3 on the best of the first round", owner="sup-1", parents=("t-aaa1",), error="the run stopped at step 4"),
+    _task("t-aaa4", "done", 48, "Merge what held affinity in the first task with the polarity of the second", owner="sup-3", parents=("t-aaa1", "t-aaa2"), job="81000004"),
+    _task("t-aaa5", "claimed", 12, "Grow into the ZA channel from the merged series", owner="sup-2", parents=("t-aaa4",), job="81000005"),
+    _task("t-aaa6", "queued", 2, "Re-score the merged series with a pose-quality gate", parents=("t-aaa4",)),
+]
+
+MOCK_RESULTS = [
+    {
+        "task_id": "t-aaa1",
+        "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+        "job_id": "81000001",
+        "objective_profile": {"Boltz affinity": 0.71, "QED": 0.58, "MW": 0.62},
+        "candidates": [
+            {"smiles": LIGANDS[0][1], "score": 0.74},
+            {"smiles": LIGANDS[1][1], "score": 0.61},
+        ],
+        "summary": "The core tolerates a para-chloro; affinity held and QED slipped.",
+        "posted_at": _ago(80),
+    },
+    {
+        "task_id": "t-aaa2",
+        "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+        "job_id": "81000002",
+        "objective_profile": {"Boltz affinity": 0.52, "QED": 0.77, "MW": 0.81},
+        "candidates": [{"smiles": LIGANDS[2][1], "score": 0.66}, {"smiles": LIGANDS[3][1], "score": 0.49}],
+        "summary": "Cleaner properties, a clear step down in affinity.",
+        "posted_at": _ago(74),
+    },
+    {
+        "task_id": "t-aaa4",
+        "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+        "job_id": "81000004",
+        "objective_profile": {"Boltz affinity": 0.79, "QED": 0.69, "MW": 0.7},
+        "candidates": [{"smiles": LIGANDS[0][1], "score": 0.83}, {"smiles": LIGANDS[4][1], "score": 0.55}],
+        "summary": "The merge is the best of the campaign so far on both counts.",
+        "posted_at": _ago(35),
+    },
+]
+
+MOCK_SUPERVISORS = [
+    {
+        "owner": "sup-1",
+        "state": "idle",
+        "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+        "task_id": None,
+        "tasks_completed": 1,
+        "tasks_failed": 1,
+        "detail": None,
+        "first_seen_at": _ago(95),
+        "last_seen_at": _ago(1),
+        "last_seen_seconds_ago": 7,
+    },
+    {
+        "owner": "sup-2",
+        "state": "working",
+        "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+        "task_id": "t-aaa5",
+        "tasks_completed": 1,
+        "tasks_failed": 0,
+        "detail": "step 18 of 50",
+        "first_seen_at": _ago(92),
+        "last_seen_at": _ago(1),
+        "last_seen_seconds_ago": 4,
+    },
+    {
+        "owner": "sup-3",
+        "state": "gone",
+        "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+        "task_id": None,
+        "tasks_completed": 1,
+        "tasks_failed": 0,
+        "detail": "finished its task and exited",
+        "first_seen_at": _ago(70),
+        "last_seen_at": _ago(30),
+        "last_seen_seconds_ago": 1800,
+    },
+]
+
+
 def write_sample_structures() -> list[str]:
     """Write small PDB files so the 3D viewer has something real to load."""
     out = SHARED / "boltz_run"
@@ -128,6 +248,34 @@ def make_app() -> FastAPI:
             "endpoint": "mock",
             "tools": TOOLS,
             "ready": True,
+        }
+
+    # -- the fleet ------------------------------------------------------------
+    # A campaign part way through, so the Campaign tab has a shape to be
+    # developed against: tasks at different stages, lineage between them, and
+    # results from the ones that finished.
+
+    @app.get("/api/fleet/capacity")
+    async def fleet_capacity() -> dict:
+        return {
+            "max_supervisors": 6,
+            "binding_limit": "jobs",
+            "detail": "the job backend is the binding limit at 6 (mock)",
+        }
+
+    @app.get("/api/fleet/campaigns")
+    async def fleet_campaigns(session: str | None = None) -> list[dict]:
+        return [MOCK_CAMPAIGN]
+
+    @app.get("/api/fleet/campaigns/{campaign_id}")
+    async def fleet_campaign(campaign_id: str) -> dict:
+        if campaign_id != MOCK_CAMPAIGN["campaign_id"]:
+            raise HTTPException(status_code=404, detail=f"No campaign {campaign_id}")
+        return {
+            "campaign": MOCK_CAMPAIGN,
+            "tasks": MOCK_TASKS,
+            "results": MOCK_RESULTS,
+            "supervisors": MOCK_SUPERVISORS,
         }
 
     @app.get("/api/artifacts/{path:path}")

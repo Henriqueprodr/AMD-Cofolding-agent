@@ -19,6 +19,7 @@ import { RunAnalysis } from "../RunAnalysis/RunAnalysis";
 import { TtpPanel } from "../TtpPanel/TtpPanel";
 import { TargetPanel } from "../TargetCard/TargetPanel";
 import { AssetsPanel } from "../AssetsPanel/AssetsPanel";
+import { CampaignPanel } from "../CampaignPanel/CampaignPanel";
 import { JobPicker } from "../JobPicker/JobPicker";
 
 /** A tab, or a view inside one: "candidates" and "properties" open Molecules, "results" and "activity" (Analysis) views of Jobs. */
@@ -47,6 +48,7 @@ const LABEL: Record<DockTab, string> = {
   structure: "Structure",
   molecules: "Molecules",
   jobs: "Jobs",
+  campaign: "Campaign",
   target: "Target",
   ttp: "TTP",
   assets: "Assets",
@@ -235,6 +237,9 @@ export const Workbench = memo(function Workbench(props: Props) {
                 </div>
               )}
             </>
+          )}
+          {active === "campaign" && (
+            <CampaignPanel sessionId={sessionId} theme={props.theme} onOpenMolecule={(smiles) => show(smiles)} />
           )}
           {(active === "ttp" || active === "target" || active === "assets") && <ContextTab {...props} />}
         </div>

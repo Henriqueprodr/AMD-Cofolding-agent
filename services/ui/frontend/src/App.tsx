@@ -224,6 +224,7 @@ export default function App() {
       { id: "tab-jobs", group: "Workbench", label: "Show REINVENT jobs", hint: "/jobs", run: () => showWorkbench("jobs") },
       { id: "tab-results", group: "Workbench", label: "Show run results", hint: "Jobs", run: () => showWorkbench("results") },
       { id: "tab-activity", group: "Workbench", label: "Show run analysis", hint: "Jobs", run: () => showWorkbench("activity") },
+      { id: "tab-campaign", group: "Workbench", label: "Show the campaign", hint: "Sub-agents", run: () => showWorkbench("campaign") },
       { id: "tab-target", group: "Workbench", label: "Show the target", run: () => showWorkbench("target") },
       { id: "tab-ttp", group: "Workbench", label: "Show the therapeutic target profile", run: () => showWorkbench("ttp") },
       { id: "tab-assets", group: "Workbench", label: "Show shared assets", hint: "/shared", run: () => showWorkbench("assets") },
@@ -379,6 +380,8 @@ export default function App() {
             molecules={molecules}
             autoUntil={chat.autoUntil}
             onAuto={chat.setAuto}
+            agents={chat.agents}
+            onAgents={chat.setAgents}
           />
         </main>
 

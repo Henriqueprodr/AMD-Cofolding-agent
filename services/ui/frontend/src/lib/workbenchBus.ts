@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: MIT
 
 import { useSyncExternalStore } from "react";
+import type { DockView } from "./dock";
 
 /**
  * Lets anything in the page bring up a workbench tab: an "Open candidates"
  * link under an answer, "Open jobs" on a monitor alert. The app listens and
  * switches tabs.
+ *
+ * The same set the dock knows, so a tab added there can be asked for here
+ * without the two lists drifting apart.
  */
-export type WorkbenchTab = "candidates" | "molecules" | "properties" | "shortlist" | "jobs" | "results" | "ttp" | "target" | "assets" | "tables" | "activity";
+export type WorkbenchTab = DockView;
 
 type Listener = (tab: WorkbenchTab) => void;
 

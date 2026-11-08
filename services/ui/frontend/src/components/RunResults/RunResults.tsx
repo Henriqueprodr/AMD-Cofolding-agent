@@ -7,6 +7,7 @@ import { callTool, download, jobFileUrl } from "../../lib/api";
 import { sameFile, type Artifacts } from "../../lib/artifacts";
 import { assetUrl } from "../../lib/assets";
 import { fileName } from "../../lib/csv";
+import { useCampaignJobs } from "../../hooks/useCampaignJobs";
 import { useJobOwners, useRunsKnown, useSessionRuns } from "../../hooks/useSessions";
 import { canResume, conversationJobs, isActive, parseJobs, resultsFile, toolError, type JobSummary } from "../../lib/jobs";
 import { scopedJob } from "../../lib/jobScope";
@@ -84,11 +85,12 @@ export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk 
   const sessionRuns = useSessionRuns(sessionId);
   const owners = useJobOwners();
   const known = useRunsKnown();
+  const campaignJobs = useCampaignJobs(sessionId);
   const scoped = useMemo(() => {
     // Until the list says who launched what, no job: the newest of all is often another conversation's.
     if (!jobs || known === null) return null;
-    return scopedJob(jobs, known ? conversationJobs(jobs, sessionRuns, focused, owners, sessionId).own : jobs, focused);
-  }, [jobs, known, sessionRuns, focused, owners, sessionId]);
+    return scopedJob(jobs, known ? conversationJobs(jobs, sessionRuns, focused, owners, sessionId, campaignJobs).own : jobs, focused);
+  }, [jobs, known, sessionRuns, focused, owners, sessionId, campaignJobs]);
   const job = scoped?.type === "optimization" ? scoped : null;
   const runId = job?.id ?? null;
 

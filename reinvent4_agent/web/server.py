@@ -659,6 +659,31 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
 
         return await _from_ledger(f"campaign {campaign_id}", read)
 
+    @app.get("/api/fleet/capacity")
+    async def fleet_capacity() -> dict[str, Any]:
+        """The largest supervisor pool this deployment could run.
+
+        What the composer's sub-agent control offers a choice under. Not from
+        the ledger, so it answers while the ledger is away: the number comes
+        from the scheduler and the job backend, and the browser needs it
+        before there is any campaign to read.
+        """
+
+        from reinvent4_mcp.tools.campaign import max_supervisors
+
+        try:
+            return await asyncio.to_thread(max_supervisors)
+        except Exception as exc:
+            # Unknown, not unlimited -- the same distinction the tool draws,
+            # and the caller offering somebody a choice has to keep it.
+            logger.warning("Could not read the supervisor ceiling: %s", exc)
+            return {
+                "max_supervisors": None,
+                "binding_limit": None,
+                "detail": f"the ceiling could not be read: {exc}",
+                "limits": {},
+            }
+
     @app.get("/api/fleet/campaigns/{campaign_id}/events")
     async def fleet_events(campaign_id: str) -> dict[str, Any]:
         """What has happened in this campaign, oldest first."""
@@ -864,7 +889,8 @@ async def _forward_events(websocket: WebSocket, queue: asyncio.Queue[dict[str, A
 
 
 async def _receive_loop(websocket: WebSocket, live: Any, takes_effort: Any = None) -> None:
-    """Read the browser's messages: a question, a stop, or an autonomy budget.
+    """Read the browser's messages: a question, a stop, an autonomy budget,
+    or how many sub-agents the user allows.
 
     Turns are serialised per session: the agent keeps conversation state, so
     two overlapping turns would interleave tool calls into one history.  A
@@ -875,6 +901,11 @@ async def _receive_loop(websocket: WebSocket, live: Any, takes_effort: Any = Non
     working by itself between questions; 0 takes that back (see
     ``sessions.py``).  The budget belongs to the session, so the ``auto``
     event it publishes reaches every tab watching it.
+
+    ``{"type": "agents", "count": N}`` is the same shape of thing for the
+    sub-agent allowance: a session setting, echoed to every tab.  It starts
+    nothing by itself; the next turn is told the number and the agent decides
+    whether the work is worth a campaign.
 
     An effort asked for while a model without efforts is serving is dropped:
     that model thinks regardless, and the request carries the chat template
@@ -901,6 +932,13 @@ async def _receive_loop(websocket: WebSocket, live: Any, takes_effort: Any = Non
                 await websocket.send_json({"type": "notice", "message": f"Not a budget in minutes: {minutes!r}"})
                 continue
             live.set_autonomy(float(minutes))
+            continue
+        if kind == "agents":
+            count = message.get("count")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                await websocket.send_json({"type": "notice", "message": f"Not a number of sub-agents: {count!r}"})
+                continue
+            live.set_agents(count)
             continue
         if kind != "user_message":
             await websocket.send_json({"type": "notice", "message": f"Unknown message type: {kind!r}"})

@@ -17,6 +17,7 @@ import { uploadedStructure, uploadFile } from "../../lib/uploads";
 import { addUserStructure } from "../../lib/userStructures";
 import { sendToViewer } from "../../lib/viewerBus";
 import { MolDepiction } from "../MolDepiction/MolDepiction";
+import { AgentsButton } from "./AgentsButton";
 import { AutoButton } from "./AutoButton";
 
 const Sketcher = lazy(() => import("../Sketcher/Sketcher").then((module) => ({ default: module.Sketcher })));
@@ -43,6 +44,10 @@ interface Props {
   autoUntil?: string | null;
   /** Give the agent *minutes* on its own, 0 to stop. Without it the button is hidden. */
   onAuto?: (minutes: number) => void;
+  /** Sub-agents this conversation may run at once; 1 is working alone. */
+  agents?: number;
+  /** Change that allowance. Without it the control is hidden. */
+  onAgents?: (count: number) => void;
 }
 
 export interface ComposerHandle {
@@ -94,7 +99,7 @@ let attachmentId = 0;
  * stopping must not need a page reload.
  */
 export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer(
-  { value, onChange, onSend, onStop, busy, connected, tools, theme, sessionId, model, defaultEffort, molecules, autoUntil, onAuto },
+  { value, onChange, onSend, onStop, busy, connected, tools, theme, sessionId, model, defaultEffort, molecules, autoUntil, onAuto, agents, onAgents },
   ref,
 ) {
   const rootRef = useRef<HTMLDivElement>(null);
@@ -459,6 +464,7 @@ export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer
               <circle cx="12" cy="12" r="0.6" fill="currentColor" />
             </ToolButton>
             {onAuto && <AutoButton key={autoUntil ?? "off"} until={autoUntil ?? null} onSet={onAuto} />}
+            {onAgents && <AgentsButton count={agents ?? 1} onSet={onAgents} />}
             <input
               ref={fileRef}
               type="file"

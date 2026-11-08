@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import { useEffect, useMemo, useState } from "react";
+import { useCampaignJobs } from "../../hooks/useCampaignJobs";
 import { useJobOwners, useRunsKnown, useSessionRuns } from "../../hooks/useSessions";
 import { callTool } from "../../lib/api";
 import { conversationJobs, parseAlerts, parseJobs, toolError, uniqueAlerts, type JobAlert, type JobSummary } from "../../lib/jobs";
@@ -34,6 +35,7 @@ export function useJobScope(sessionId: string | null): JobScope {
   const sessionRuns = useSessionRuns(sessionId);
   const owners = useJobOwners();
   const known = useRunsKnown();
+  const campaignJobs = useCampaignJobs(sessionId);
 
   useEffect(() => onRunsChanged(() => setTick((t) => t + 1)), []);
   useEffect(() => {
@@ -64,7 +66,7 @@ export function useJobScope(sessionId: string | null): JobScope {
   const scope = useMemo(() => {
     if (!jobs || known === null) return null;
     // Without per-conversation runs from the gateway, every job counts as the conversation's, as in Summary, Results and Analysis.
-    const mine = known ? conversationJobs(jobs, sessionRuns, focused, owners, sessionId) : { own: [], seen: [] };
+    const mine = known ? conversationJobs(jobs, sessionRuns, focused, owners, sessionId, campaignJobs) : { own: [], seen: [] };
     const optimization = (j: JobSummary) => j.type === "optimization";
     return {
       runs: jobs.filter(optimization),
@@ -72,7 +74,7 @@ export function useJobScope(sessionId: string | null): JobScope {
       seen: mine.seen.filter(optimization),
       job: scopedJob(jobs, known ? mine.own : jobs, focused),
     };
-  }, [jobs, known, sessionRuns, focused, owners, sessionId]);
+  }, [jobs, known, sessionRuns, focused, owners, sessionId, campaignJobs]);
 
   const alerts = useMemo(() => alertCounts(alertList), [alertList]);
   return { runs: scope?.runs ?? null, own: scope?.own ?? [], seen: scope?.seen ?? [], job: scope?.job ?? null, alerts, error };

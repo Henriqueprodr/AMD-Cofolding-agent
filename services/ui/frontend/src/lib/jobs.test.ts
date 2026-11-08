@@ -454,4 +454,13 @@ describe("conversationJobs", () => {
     expect(ids(conversationJobs(all, runs, "d", new Map([["d", "s2"]]), "s1").own)).toEqual(["a", "c"]);
     expect(ids(conversationJobs(all, null, "b", new Map(), "s1").own)).toEqual(["b"]);
   });
+
+  it("keeps the runs of the conversation's campaigns, which its sub-agents launched elsewhere", () => {
+    const campaign = new Set(["d"]);
+    expect(ids(conversationJobs(all, runs, null, new Map([["d", "s2"]]), "s1", campaign).own)).toEqual(["a", "c", "d"]);
+  });
+
+  it("does not list a campaign run twice when it is also the focused one", () => {
+    expect(ids(conversationJobs(all, runs, "d", new Map(), "s1", new Set(["d"])).own)).toEqual(["a", "c", "d"]);
+  });
 });

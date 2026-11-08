@@ -259,6 +259,115 @@ export interface CampaignEvent extends Recorded {
   campaign: Campaign;
 }
 
+// ---------------------------------------------------------------------------
+// the fleet — campaigns run by sub-agents, GET /api/fleet/*
+//
+// A different thing from the `Campaign` above, which is the log one agent
+// keeps of its own goal. A FleetCampaign is a piece of work the conductor
+// split into tasks and handed to supervisors; the names collide because both
+// are called a campaign by the people who use them.
+// ---------------------------------------------------------------------------
+
+/** A campaign the conductor opened: one conversation's worth of work. */
+export interface FleetCampaign {
+  campaign_id: string;
+  goal: string;
+  /** The TTP every task varies; null when each task writes its own, the usual way round. */
+  base_ttp_id: string | null;
+  /** Declared objectives; empty when the tasks bring their own. */
+  objectives: string[];
+  /** Sub-agents the conductor wants working at once. */
+  concurrency: number;
+  state: string;
+  created_at: string;
+  dispatch_until: string | null;
+  hard_stop_at: string | null;
+  finalized_at: string | null;
+  session_id: string | null;
+}
+
+/** What the conductor asked for, in its own words. */
+export interface TaskSpec {
+  /** Handed to the sub-agent verbatim; this is what the graph labels a task with. */
+  intent?: string;
+  /** Tasks whose results led the conductor here: the edges of the graph. */
+  derived_from?: string[];
+  /** Only on campaigns with a declared objective list. */
+  weight_overrides?: Record<string, number>;
+  /** One line for the person watching. */
+  rationale?: string;
+}
+
+/** One experiment, from proposed to finished. */
+export interface FleetTask {
+  task_id: string;
+  campaign_id: string;
+  spec: TaskSpec;
+  state: string;
+  attempts: number;
+  created_at: string;
+  /** The supervisor holding it; null when nobody has claimed it. */
+  lease_owner: string | null;
+  lease_expires_at: string | null;
+  claimed_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+  /** The REINVENT run it started, once it has one. */
+  job_id: string | null;
+}
+
+/** One molecule a task put forward. */
+export interface FleetCandidate {
+  smiles: string;
+  score?: number;
+  [key: string]: unknown;
+}
+
+/** What a finished task reported. */
+export interface FleetResult {
+  task_id: string;
+  campaign_id: string;
+  job_id: string | null;
+  /** Mean score per objective: the task's coordinates on the front. */
+  objective_profile: Record<string, number>;
+  candidates: FleetCandidate[];
+  summary: string | null;
+  posted_at: string;
+}
+
+/** One sub-agent, as it last reported itself. */
+export interface FleetSupervisor {
+  owner: string;
+  state: string;
+  campaign_id: string | null;
+  task_id: string | null;
+  tasks_completed: number;
+  tasks_failed: number;
+  detail: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+  /** Age of the report: what says whether to believe the state beside it. */
+  last_seen_seconds_ago: number | null;
+}
+
+/** GET /api/fleet/campaigns/{id}: read together because separately they tear. */
+export interface CampaignDetail {
+  campaign: FleetCampaign;
+  tasks: FleetTask[];
+  results: FleetResult[];
+  supervisors: FleetSupervisor[];
+}
+
+/**
+ * GET /api/fleet/capacity. A null *max_supervisors* is unknown, not
+ * unlimited, and a control offering a choice under it has to say so.
+ */
+export interface FleetCapacity {
+  max_supervisors: number | null;
+  binding_limit: string | null;
+  detail?: string;
+}
+
 /** Events that belong to the conversation and are replayed on reconnect. */
 export type ConversationEvent =
   | UserMessageEvent
@@ -273,7 +382,16 @@ export type ConversationEvent =
   | MonitorResponseEvent
   | CampaignEvent;
 
-export type AgentEvent = ReadyEvent | SessionEvent | NoticeEvent | AutoEvent | ConversationEvent;
+/**
+ * The sub-agent allowance changed. Not recorded, like the autonomy budget:
+ * a browser that reconnects reads the count from the session summary.
+ */
+export interface AgentsEvent {
+  type: "agents";
+  count: number;
+}
+
+export type AgentEvent = ReadyEvent | SessionEvent | NoticeEvent | AutoEvent | AgentsEvent | ConversationEvent;
 
 /** How hard the model reasons on a turn; the gateway sets it on the session's backend. */
 export type Effort = "low" | "medium" | "high";
@@ -285,7 +403,9 @@ export type Effort = "low" | "medium" | "high";
 export type ClientMessage =
   | { type: "user_message"; content: string; effort?: Effort }
   | { type: "cancel" }
-  | { type: "auto"; minutes: number };
+  | { type: "auto"; minutes: number }
+  /** How many sub-agents the conversation may run at once; 1 is working alone. */
+  | { type: "agents"; count: number };
 
 // ---------------------------------------------------------------------------
 // models — which model answers, and switching to the other one
@@ -328,6 +448,8 @@ export interface SessionSummary {
   busy: boolean;
   /** End of the autonomy budget, ISO 8601 UTC; null when there is none. */
   auto_until?: string | null;
+  /** Sub-agents this conversation may run at once; 1, the default, is alone. */
+  agents_allowed?: number;
   inputTokens?: number;
   outputTokens?: number;
   /** The REINVENT jobs of the conversation; absent when it has none. */
