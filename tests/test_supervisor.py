@@ -1365,6 +1365,17 @@ class TestHarvestedProfileIsScopedToTheCampaign:
 
         assert runner._objectives(_task()) is None
 
+    def test_a_campaign_that_declares_none_falls_back_the_same_way(self):
+        """A campaign whose tasks write their own TTPs declares no
+        objectives. Narrowing a result to an empty list keeps no scores at
+        all, and the task then fails for having no coordinates on a front
+        that campaign does not have -- seen on LUMI, on a run that had
+        already produced 25 molecules."""
+
+        runner = self._runner({"objectives": []})
+
+        assert runner._objectives(_task()) is None
+
     def test_the_profile_drops_the_diagnostic_columns(self):
         candidates = [{
             "total_score": 0.9,

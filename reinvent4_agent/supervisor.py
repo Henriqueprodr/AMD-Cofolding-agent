@@ -718,14 +718,21 @@ class CoscientistTaskRunner:
         self.store = store
 
     def _objectives(self, task: dict[str, Any]) -> Optional[list[str]]:
-        """The campaign's objectives, or None if they cannot be read.
+        """The campaign's objectives, or None if there are none to read.
 
         None keeps the old behaviour -- report whatever the CSV scored --
         rather than reporting nothing, which would fail the task.
+
+        An empty list has to become None rather than pass through. A
+        campaign whose tasks write their own TTPs declares no objectives,
+        and narrowing a result to an empty list keeps no scores at all: the
+        run finishes, the molecules are there, and the task fails for having
+        "no coordinates on the front" -- a front that campaign does not
+        have. Seen on LUMI, on a run that had produced 25 molecules.
         """
 
         try:
-            return self.store.campaign(task["campaign_id"]).get("objectives")
+            return self.store.campaign(task["campaign_id"]).get("objectives") or None
         except Exception:
             logger.warning(
                 "could not read campaign %s objectives; reporting every scored "
