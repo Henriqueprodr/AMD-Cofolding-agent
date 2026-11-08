@@ -636,7 +636,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="open a campaign and conduct it, instead of attaching to one",
     )
     opening.add_argument("--goal", help="what the campaign is for")
-    opening.add_argument("--base-ttp", help="TTP every task varies the weights of")
+    opening.add_argument(
+        "--base-ttp",
+        help="TTP every task varies the weights of. Omit it and each task "
+             "writes the TTP its own experiment needs, which is the usual case",
+    )
     opening.add_argument(
         "--objectives", nargs="*", default=None,
         help="objective names the Pareto front is over "
@@ -690,16 +694,21 @@ def main(argv: Optional[list[str]] = None) -> None:
             parser.error(
                 "--start opens a new campaign, so do not also name one to attach to"
             )
-        if not args.goal or not args.base_ttp:
-            parser.error("--start needs --goal and --base-ttp")
+        if not args.goal:
+            parser.error("--start needs --goal")
 
-        objectives = args.objectives or objectives_of(args.base_ttp)
-        campaign_id = start_campaign(
-            store, args.goal, args.base_ttp, objectives,
+        campaign = start_campaign(
+            store, args.goal, args.base_ttp, args.objectives,
             concurrency=args.concurrency, hours=args.hours,
             grace_hours=args.grace_hours,
-        )["campaign_id"]
-        print(f"campaign {campaign_id} open over {', '.join(objectives)}")
+        )
+        campaign_id = campaign["campaign_id"]
+        objectives = campaign["objectives"]
+        print(
+            f"campaign {campaign_id} open over {', '.join(objectives)}"
+            if objectives
+            else f"campaign {campaign_id} open; each task scores its own run"
+        )
     else:
         campaign_id = args.campaign_id or live_campaign_id(store)
 
