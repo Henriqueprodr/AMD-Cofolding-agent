@@ -123,6 +123,18 @@ def _by_kind(kind: str) -> dict[str, dict[str, Any]]:
     return {d["metadata"]["name"]: d for d in _load_all() if d["kind"] == kind}
 
 
+def _conductor_rule(resource: str) -> dict[str, Any]:
+    """The conductor Role's rule for *resource*, found by what it grants.
+
+    By resource rather than by position, so adding a grant does not silently
+    move what another test is asserting about.
+    """
+    rules = _by_kind("Role")["dd-agentic-conductor"]["rules"]
+    matching = [rule for rule in rules if resource in rule["resources"]]
+    assert len(matching) == 1, f"expected one rule for {resource}, got {matching}"
+    return matching[0]
+
+
 @pytest.fixture(scope="module")
 def deployments() -> dict[str, dict[str, Any]]:
     return _by_kind("Deployment")
@@ -891,19 +903,41 @@ class TestConductor:
 
     def test_the_scale_grant_is_scoped_to_the_supervisor_pool(self):
         # So a conductor cannot scale Boltz or the runner, which hold the GPUs.
-        role = _by_kind("Role")["dd-agentic-conductor"]
-        rules = role["rules"]
+        rule = _conductor_rule("deployments/scale")
 
-        assert len(rules) == 1
-        assert rules[0]["resources"] == ["deployments/scale"]
-        assert rules[0]["resourceNames"] == [SUPERVISOR_DEPLOYMENT]
+        assert rule["resourceNames"] == [SUPERVISOR_DEPLOYMENT]
 
     def test_the_grant_withholds_everything_but_read_and_patch(self):
-        rules = _by_kind("Role")["dd-agentic-conductor"]["rules"][0]
+        rule = _conductor_rule("deployments/scale")
 
         # `list` and `watch` cannot be restricted by resourceNames, so
         # granting them would widen the scope above to every Deployment.
-        assert set(rules["verbs"]) == {"get", "patch"}
+        assert set(rule["verbs"]) == {"get", "patch"}
+
+    def test_the_namespace_quota_is_readable(self):
+        """The ceiling the composer's sub-agent control offers a choice under.
+
+        Without it ``KubernetesPoolScaler.capacity`` gets a 403 it logs and
+        swallows, so the cluster reports its ceiling as unknown however much
+        room the namespace has.
+        """
+        rule = _conductor_rule("resourcequotas")
+
+        assert rule["apiGroups"] == [""]
+        assert set(rule["verbs"]) == {"get", "list"}
+
+    def test_the_conductor_grants_nothing_else(self):
+        rules = _by_kind("Role")["dd-agentic-conductor"]["rules"]
+
+        assert [r["resources"] for r in rules] == [
+            ["deployments/scale"], ["resourcequotas"],
+        ]
+
+    def test_reading_the_quota_cannot_write_anything(self):
+        """A ResourceQuota states limits; editing one would raise the ceiling."""
+        rule = _conductor_rule("resourcequotas")
+
+        assert not {"create", "update", "patch", "delete"} & set(rule["verbs"])
 
     def test_the_binding_names_the_service_account(self):
         binding = _by_kind("RoleBinding")["dd-agentic-conductor"]

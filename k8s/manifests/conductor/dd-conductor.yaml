@@ -35,6 +35,20 @@ rules:
     verbs:
       - get
       - patch
+  # How many supervisors this namespace has room for. A quota is the only
+  # ceiling a namespace can state about itself, and it is what the sub-agent
+  # control in the composer offers a choice under -- without this the read is
+  # a 403 the scaler logs and swallows, so the cluster reports its ceiling as
+  # unknown however much room it has. Read-only, and a ResourceQuota is a
+  # statement of limits rather than anything sensitive; resourceNames cannot
+  # scope it, since the quota's name is the cluster administrator's to choose.
+  - apiGroups:
+      - ""
+    resources:
+      - resourcequotas
+    verbs:
+      - get
+      - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
