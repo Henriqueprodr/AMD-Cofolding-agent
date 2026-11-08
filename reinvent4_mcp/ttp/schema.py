@@ -106,6 +106,34 @@ class TransformConfig(BaseModel):
             )
         return v
 
+    @model_validator(mode="after")
+    def _numbers_written_as_text_are_still_numbers(self) -> "TransformConfig":
+        """Coerce ``"500"`` to ``500.0`` in the type-specific parameters.
+
+        Every parameter here except ``mapping`` is a number, and the field is
+        ``extra: allow``, so nothing was checking. An agent writing a TTP
+        quotes them about half the time -- JSON from a language model does
+        that -- and the result reached REINVENT as a string, where the first
+        ``high - low`` raised "unsupported operand type(s) for -: 'str' and
+        'str'" five seconds into a GPU job, naming neither the field nor the
+        transform. Observed on LUMI, twice, on consecutive attempts at the
+        same task.
+
+        Coerced rather than rejected: "500" has exactly one meaning here, and
+        failing the TTP would turn a typo the agent cannot see into a task it
+        cannot complete.
+        """
+
+        for name, value in list((self.__pydantic_extra__ or {}).items()):
+            if not isinstance(value, str):
+                continue
+            try:
+                number = float(value)
+            except ValueError:
+                continue
+            self.__pydantic_extra__[name] = number
+        return self
+
 
 # ---------------------------------------------------------------------------
 # Target

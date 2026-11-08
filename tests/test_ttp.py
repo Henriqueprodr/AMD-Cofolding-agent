@@ -172,6 +172,46 @@ def tmp_store(tmp_path: Path) -> TTPStore:
 # ---------------------------------------------------------------------------
 
 
+class TestTransformNumbersWrittenAsText:
+    """An agent writing a TTP quotes its numbers about half the time.
+
+    The parameters are extras, so nothing checked them, and a quoted bound
+    reached REINVENT intact: the first ``high - low`` raised "unsupported
+    operand type(s) for -: 'str' and 'str'" five seconds into a GPU job,
+    naming neither the field nor the transform.
+    """
+
+    def test_quoted_bounds_become_numbers(self):
+        t = TransformConfig(type="double_sigmoid", low="200", high="500")
+
+        assert t.low == 200.0
+        assert t.high == 500.0
+
+    def test_a_quoted_decimal_survives_its_decimals(self):
+        assert TransformConfig(type="sigmoid", k="0.5").k == 0.5
+
+    def test_a_quoted_negative_keeps_its_sign(self):
+        assert TransformConfig(type="sigmoid", low="-3").low == -3.0
+
+    def test_numbers_already_numbers_are_untouched(self):
+        t = TransformConfig(type="sigmoid", low=0, high=1.5)
+
+        assert t.low == 0
+        assert t.high == 1.5
+
+    def test_a_value_mapping_is_left_alone(self):
+        """The one parameter here that is not a number."""
+        mapping = {"a": 1.0, "b": 0.0}
+
+        t = TransformConfig(type="value_mapping", mapping=mapping)
+
+        assert t.mapping == mapping
+
+    def test_text_that_is_not_a_number_is_left_alone(self):
+        """Rejecting it belongs to whoever understands the field, not here."""
+        assert TransformConfig(type="sigmoid", note="steep").note == "steep"
+
+
 class TestTransformConfig:
     def test_valid_types(self):
         for t in [
