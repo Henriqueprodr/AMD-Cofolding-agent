@@ -144,7 +144,12 @@ export MCP_CONFIG_FILE=$MCP_CONFIG
 export SUPERVISOR_POOL_CONTROL=$POOL_DIR
 export SUPERVISOR_BASE_URL=http://$NODE:$SUPERVISOR_PORT/v1
 export SUPERVISOR_MODEL_ID=$SUPERVISOR_MODEL_ID
-export CHAT_BASE_URL=http://$NODE:$CHAT_PORT/v1
+# Loopback, unlike every other URL in this file. The others are read by
+# supervisors, which run on other nodes; this one is read by the conductor,
+# which runs inside this allocation -- and the chat tier binds the loopback
+# precisely because nothing outside should reach it. Addressed by node name
+# it resolves to the node's network IP and the connection is refused.
+export CHAT_BASE_URL=http://127.0.0.1:$CHAT_PORT/v1
 export CHAT_MODEL_ID=$CHAT_MODEL_ID
 export RUNNER_BASE_URL=http://$NODE:$RUNNER_PORT
 export CAMPAIGN_STORE_URL=http://$NODE:8087
