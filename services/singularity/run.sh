@@ -213,10 +213,16 @@ for row in "${INSTANCES[@]}"; do
     if [ "${name}" = "admet-predictor" ]; then
         opts+=(--env "PRED_LOADER_WORKERS=${PRED_LOADER_WORKERS:-0}")
     fi
-    # The ledger is a SQLite file, so it has to outlive the instance.
+    # The ledger is a SQLite file, so it has to outlive the instance. The app
+    # itself is bound over the baked-in copy for the same reason the profiler
+    # is below: the ledger's shape is the contract between the conductor and
+    # its supervisors, so it changes whenever they do, and a rebuild per
+    # change would mean running the two against different schemas until one
+    # finished building.
     if [ "${name}" = "campaign-store" ]; then
         mkdir -p "${DATA_DIR}/shared/campaign-store"
         opts+=(--env "CAMPAIGN_STORE_DB=/shared/campaign-store/campaigns.db")
+        opts+=(--bind "${ROOT_DIR}/services/campaign-store/app.py:/app/app.py")
     fi
     # The 1.3 GB ZINC catalog is too big to bake in. Without it the planner
     # still answers, but every building block comes back "unknown" instead of
