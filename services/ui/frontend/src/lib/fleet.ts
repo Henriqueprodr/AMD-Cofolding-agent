@@ -72,6 +72,36 @@ export function campaignProgress(detail: Pick<CampaignDetail, "campaign" | "task
   };
 }
 
+/**
+ * What a campaign is actually doing, as against what the ledger last wrote.
+ *
+ * ``closed`` is the ledger's word. The other three are read off the work,
+ * because a conductor that dies with its allocation never closes the books:
+ * a campaign whose every task had failed hours earlier still said
+ * ``dispatching``, and the panel repeated it back as "ongoing".
+ */
+export type CampaignStanding = "running" | "stalled" | "stopped" | "closed";
+
+export function campaignStanding(
+  detail: Pick<CampaignDetail, "campaign" | "tasks" | "results" | "supervisors">,
+): CampaignStanding {
+  if (!campaignActive(detail.campaign)) return "closed";
+  const { running, pending, agentsLive } = campaignProgress(detail);
+  if (running || agentsLive) return "running";
+  // Nothing is working. Whether that is temporary turns on there being
+  // anything left to pick up: with tasks still queued a supervisor could
+  // arrive, without them nobody is coming.
+  return pending ? "stalled" : "stopped";
+}
+
+/** How the standing reads in the panel, as a phrase that follows the goal. */
+export const STANDING_LABEL: Record<CampaignStanding, string> = {
+  running: "ongoing",
+  stalled: "waiting for a sub-agent",
+  stopped: "stopped, with nothing left to run",
+  closed: "closed",
+};
+
 /** Whether a supervisor's last report is recent enough to believe its state. */
 export function isLive(supervisor: Pick<FleetSupervisor, "last_seen_seconds_ago" | "state">): boolean {
   const age = supervisor.last_seen_seconds_ago;

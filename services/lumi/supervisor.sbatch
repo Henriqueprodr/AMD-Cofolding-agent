@@ -1,5 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=dd-supervisor
+# The pool scaler passes --account itself, from the session job's own, and a
+# flag beats this. It is here for the other caller: a person submitting one
+# supervisor by hand, who would otherwise be told AssocMaxSubmitJobLimit.
+#SBATCH --account=project_462001170
 #SBATCH --partition=small
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

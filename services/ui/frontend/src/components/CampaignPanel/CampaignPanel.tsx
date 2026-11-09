@@ -6,7 +6,8 @@ import type { Theme } from "../../hooks/useTheme";
 import type { CampaignDetail, FleetCampaign } from "../../types/api";
 import { ApiError, fetchCampaign, fetchCampaigns } from "../../lib/api";
 import { relativeTime } from "../../lib/campaign";
-import { campaignActive, campaignProgress } from "../../lib/fleet";
+import { campaignActive, campaignProgress, campaignStanding, STANDING_LABEL } from "../../lib/fleet";
+import type { CampaignStanding } from "../../lib/fleet";
 import { openRun, openWorkbench } from "../../lib/workbenchBus";
 import { Placeholder } from "../RunAnalysis/shared";
 import { CampaignResults } from "./CampaignResults";
@@ -37,9 +38,10 @@ type View = "trajectory" | "results";
  */
 export function CampaignPanel({ sessionId, theme, onOpenMolecule }: Props) {
   const now = useNow();
-  const [campaigns, setCampaigns] = useState<FleetCampaign[] | null>(null);
-  /** The ones shown belong to no conversation, so the tab has to say so. */
-  const [orphan, setOrphan] = useState(false);
+  const [fetched, setCampaigns] = useState<FleetCampaign[] | null>(null);
+  // No conversation is not a conversation with no campaigns yet to arrive,
+  // so it answers now rather than leaving the panel reading the ledger.
+  const campaigns = useMemo(() => (sessionId ? fetched : []), [sessionId, fetched]);
   const [listError, setListError] = useState<string | null>(null);
   const [chosen, setChosen] = useState<string | null>(null);
   const [detail, setDetail] = useState<CampaignDetail | null>(null);
@@ -48,31 +50,21 @@ export function CampaignPanel({ sessionId, theme, onOpenMolecule }: Props) {
   const [task, setTask] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
 
+  // This conversation's campaigns and no others. A campaign belonging to
+  // somebody else's conversation answers a question nobody asked here, and
+  // showing one put a BRD4 campaign in front of a reader designing for JAK3.
   useEffect(() => {
+    if (!sessionId) return;
     let cancelled = false;
-    void (async () => {
-      try {
-        const mine = sessionId ? await fetchCampaigns(sessionId) : [];
+    fetchCampaigns(sessionId)
+      .then((mine) => {
         if (cancelled) return;
-        if (mine.length) {
-          setCampaigns(mine);
-          setOrphan(false);
-        } else {
-          // The ledger leaves campaigns belonging to no conversation out of a
-          // filtered list, which is right for "which are mine" and wrong for
-          // a tab that would then say nothing is running while something is.
-          // One started from the command line is still worth showing, said as
-          // what it is.
-          const all = await fetchCampaigns();
-          if (cancelled) return;
-          setCampaigns(all.filter((campaign) => !campaign.session_id));
-          setOrphan(true);
-        }
+        setCampaigns(mine);
         setListError(null);
-      } catch (reason) {
+      })
+      .catch((reason: unknown) => {
         if (!cancelled) setListError(message(reason));
-      }
-    })();
+      });
     return () => {
       cancelled = true;
     };
@@ -134,7 +126,7 @@ export function CampaignPanel({ sessionId, theme, onOpenMolecule }: Props) {
         campaigns={campaigns}
         current={current}
         now={now}
-        orphan={orphan}
+        standing={shown ? campaignStanding(shown) : null}
         onChoose={(id) => {
           setChosen(id);
           setTask(null);
@@ -203,13 +195,14 @@ function Header({
   campaigns,
   current,
   now,
-  orphan,
+  standing,
   onChoose,
 }: {
   campaigns: readonly FleetCampaign[];
   current: FleetCampaign | null;
   now: number;
-  orphan: boolean;
+  /** Null until the detail has loaded, when only the ledger's word is known. */
+  standing: CampaignStanding | null;
   onChoose: (id: string) => void;
 }) {
   if (!current) return null;
@@ -226,16 +219,17 @@ function Header({
           >
             {campaigns.map((campaign) => (
               <option key={campaign.campaign_id} value={campaign.campaign_id}>
-                {campaignActive(campaign) ? "Ongoing" : "Past"} · {relativeTime(campaign.created_at, now)}
+                {/* The ledger's word, not a claim about what is running:
+                    the list has no tasks to read that off. */}
+                {campaignActive(campaign) ? "Open" : "Closed"} · {relativeTime(campaign.created_at, now)}
               </option>
             ))}
           </select>
         )}
       </div>
       <p className="text-faint mt-0.5 text-[10.5px]">
-        {campaignActive(current) ? "ongoing" : current.state} · started {relativeTime(current.created_at, now)}
+        {standing ? STANDING_LABEL[standing] : current.state} · started {relativeTime(current.created_at, now)}
         {current.base_ttp_id && ` · varying ${current.base_ttp_id}`}
-        {orphan && " · not this conversation's"}
       </p>
     </div>
   );

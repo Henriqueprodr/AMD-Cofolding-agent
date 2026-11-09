@@ -7,6 +7,7 @@ import {
   agentSummaries,
   campaignGraph,
   campaignProgress,
+  campaignStanding,
   objectiveProgress,
   pooledCandidates,
   taskPhase,
@@ -100,6 +101,38 @@ describe("campaignProgress", () => {
 
   it("has no fraction before there is a task", () => {
     expect(campaignProgress({ campaign, tasks: [], results: [], supervisors: [] }).fraction).toBeNull();
+  });
+});
+
+describe("campaignStanding", () => {
+  const standing = (tasks: FleetTask[], supervisors: FleetSupervisor[], c = campaign) =>
+    campaignStanding({ campaign: c, tasks, results: [], supervisors });
+
+  it("is running while a task is", () => {
+    expect(standing([task("a", { state: "claimed" })], [])).toBe("running");
+  });
+
+  it("is running while a sub-agent is reporting, before it claims anything", () => {
+    expect(standing([task("a", { state: "queued" })], [supervisor("s1")])).toBe("running");
+  });
+
+  it("is waiting when work is queued and nobody is there to take it", () => {
+    expect(standing([task("a", { state: "queued" })], [supervisor("s1", { last_seen_seconds_ago: 600 })])).toBe("stalled");
+  });
+
+  it("is stopped when every task is settled and no agent is left", () => {
+    // The BRD4 campaign: both tasks failed, the conductor died with the
+    // allocation, and the ledger still said "dispatching" five hours on.
+    const dispatching = { ...campaign, state: "dispatching" };
+    const dead = [task("a", { state: "failed" }), task("b", { state: "failed" })];
+
+    expect(standing(dead, [supervisor("s1", { last_seen_seconds_ago: 9000 })], dispatching)).toBe("stopped");
+  });
+
+  it("takes the ledger's word once the books are closed", () => {
+    const closed = { ...campaign, finalized_at: minutes(1) };
+
+    expect(standing([task("a", { state: "claimed" })], [supervisor("s1")], closed)).toBe("closed");
   });
 });
 

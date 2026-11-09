@@ -1,5 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=cofolding-session
+# Overridable with `sbatch --account=...`, but not omittable: without one
+# Slurm falls to the default association, whose submit limit is zero, and
+# refuses the job with AssocMaxSubmitJobLimit -- which reads like a quota
+# that has run out rather than an account that was never named.
+#SBATCH --account=project_462001170
 #SBATCH --partition=standard-g
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=8
