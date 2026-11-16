@@ -38,6 +38,7 @@ import { MolDepiction } from "../MolDepiction/MolDepiction";
 import { DetailsColumns } from "../MoleculeFacts/FactBars";
 import { cofoldBars, predictionBars, propertyBars } from "../../lib/factBars";
 import { pickKind, pickQuestion, pickTitle, structureRef, type PickedResidue } from "./pickQuestion";
+import { StructureBrowser } from "./StructureBrowser";
 
 interface Props {
   structures: Sourced<StructurePanel>[];
@@ -670,10 +671,13 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
               if (other) compareWith(other.item);
             }}
             aria-label="Compare with"
+            // Says which structure it is against, rather than leaving the
+            // one word "Compare" whether anything is overlaid or not.
+            title={comparing ? `Comparing with ${structureTitle(comparing)}` : "Superpose another structure on this one, pairwise"}
             className={`w-[4.6rem] shrink-0 cursor-pointer rounded-md px-1 py-1 text-[11px] outline-none ${comparing ? "bg-inset text-body" : "text-muted hover:text-body hover:bg-inset bg-transparent"}`}
           >
             <option value="" disabled hidden>
-              Compare
+              {comparing ? "Comparing" : "Compare"}
             </option>
             {structures
               .filter(({ item }) => item.path !== active.path)
@@ -696,34 +700,7 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
       </header>
 
       {entries.length > 1 && (
-        <div role="group" aria-label="Basket" className="border-subtle flex shrink-0 items-center gap-1 overflow-x-auto border-b px-3 py-1">
-          <span className="text-faint shrink-0 pr-1 text-[10px] font-semibold tracking-wide uppercase">Basket</span>
-          {entries.map((entry) => {
-            const colour = basketColour(shown, entry.key);
-            const fit = placed?.[others.indexOf(entry.key)];
-            const note = fit ? (fit.superposed ? (fit.caRmsd !== null ? `${fit.caRmsd.toFixed(1)} Å` : null) : "not superposed") : null;
-            return (
-              <button
-                key={entry.key}
-                type="button"
-                aria-pressed={colour !== null}
-                onClick={() => void tick(entry)}
-                title={
-                  fit && !fit.superposed
-                    ? "Its protein shares too little with the first one's to superpose; it is drawn in its own frame."
-                    : colour
-                      ? "Shown; click to take it out"
-                      : "Show it with the others"
-                }
-                className={`flex max-w-[15rem] shrink-0 cursor-pointer items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] ${colour ? "border-strong text-body" : "border-subtle text-muted hover:text-body"}`}
-              >
-                <span aria-hidden="true" className="size-2.5 shrink-0 rounded-full border" style={{ background: colour ?? "transparent", borderColor: colour ?? "currentColor" }} />
-                <span className="truncate">{entry.label}</span>
-                {note && <span className="text-faint shrink-0 text-[10px]">{note}</span>}
-              </button>
-            );
-          })}
-        </div>
+        <StructureBrowser entries={entries} shown={shown} others={others} placed={placed} onPick={(entry) => void tick(entry)} session={sessionId ?? "new"} />
       )}
 
       <div className="relative min-h-[280px] flex-1 overflow-hidden" style={{ background: `#${backgroundValue.toString(16).padStart(6, "0")}` }}>
@@ -778,6 +755,15 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
             )}
           </div>
         </div>
+
+        {others.length > 0 && loaded && !comparing && (
+          <StackLegend
+            names={shown.map((path) => ({ path, label: structureOption(structureTitle(panels.find((one) => one.path === path) ?? active), path, runOf(path)) }))}
+            placed={placed}
+            onRemove={(path) => setStacked((list) => list.filter((one) => one !== path))}
+            onClear={() => setStacked([])}
+          />
+        )}
 
         {comparing && loaded && (
           <CompareLegend
@@ -936,6 +922,64 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
 // ---------------------------------------------------------------------------
 
 const SIDE_COLORS: Record<Side, string> = { primary: "var(--color-molecule)", other: "var(--color-structure)" };
+
+/**
+ * What is superposed on the active structure: each in its own colour, with
+ * how well it aligned and a way to take it out again.
+ *
+ * Without it an overlay is a set of colours with nothing saying which is
+ * which, and the only way out is to find the ticked entries again and untick
+ * each one.
+ */
+function StackLegend({
+  names,
+  placed,
+  onRemove,
+  onClear,
+}: {
+  /** The shown structures, the active one first. */
+  names: readonly { path: string; label: string }[];
+  /** How each of the others aligned, in their order after the first. */
+  placed: Stacked[] | null;
+  onRemove: (path: string) => void;
+  onClear: () => void;
+}) {
+  return (
+    <div className="bg-raised border-subtle shadow-card absolute top-9 left-2 z-20 max-w-[min(20rem,calc(100%-1rem))] rounded-lg border py-1 pr-1 pl-2 text-[11px]">
+      <div className="flex items-center gap-2 pb-0.5">
+        <span className="text-faint text-[10px] font-semibold tracking-wide uppercase">Overlaid</span>
+        <button type="button" onClick={onClear} className="text-muted hover:text-body ml-auto cursor-pointer px-1 text-[10px]">
+          Clear
+        </button>
+      </div>
+      <ul>
+        {names.map((one, at) => {
+          const fit = at === 0 ? null : (placed?.[at - 1] ?? null);
+          return (
+            <li key={one.path} className="flex min-w-0 items-center gap-1.5 py-px">
+              <span aria-hidden="true" className="size-2 shrink-0 rounded-full" style={{ background: basketColour(names.map((n) => n.path), one.path) ?? "transparent" }} />
+              <span className="min-w-0 flex-1 truncate" title={one.label}>
+                {one.label}
+              </span>
+              {fit && (
+                <span className="text-faint shrink-0 tabular-nums" title={fit.superposed ? "Cα RMSD against the first" : "Its protein shares too little with the first one's to superpose"}>
+                  {fit.superposed ? (fit.caRmsd !== null ? `${fit.caRmsd.toFixed(2)} Å` : "") : "not superposed"}
+                </span>
+              )}
+              {at > 0 ? (
+                <button type="button" aria-label={`Take ${one.label} out of the overlay`} onClick={() => onRemove(one.path)} className="text-muted hover:text-body shrink-0 cursor-pointer px-1 leading-none">
+                  ×
+                </button>
+              ) : (
+                <span className="w-[1.1rem] shrink-0" />
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
 
 /** The two structures of an overlay, each a toggle, and how far apart they are. */
 function CompareLegend({

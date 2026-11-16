@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 import type { StructurePanel } from "../types/api";
+import { structureKind } from "./poses";
 
 /**
  * The structure basket: what the viewer can show of the conversation, and
@@ -42,6 +43,59 @@ export function basketEntries(structures: readonly StructurePanel[], pdbIds: rea
     out.push({ kind: "pdb", key: `pdb:${code}`, label: `PDB ${code}`, id: code });
   }
   return out;
+}
+
+/**
+ * The basket as a flat strip was unreadable past a handful of entries: a
+ * conversation that retrieves a dozen PDB entries, prepares each and folds
+ * against them puts fifty chips in one scrolling row, all alike. Browsing
+ * is by where a structure came from instead.
+ */
+export type BrowseCategory = "experimental" | "prepared" | "predicted" | "other" | "kept";
+
+export interface BrowseGroup {
+  key: BrowseCategory;
+  label: string;
+  hint: string;
+  entries: BasketEntry[];
+}
+
+const BROWSE: Record<BrowseCategory, { label: string; hint: string }> = {
+  experimental: { label: "RCSB PDB", hint: "Deposited entries, retrieved or offered by the target" },
+  prepared: { label: "Prepared", hint: "Receptors and complexes preparation wrote" },
+  predicted: { label: "Predicted", hint: "Cofolded and docked complexes" },
+  other: { label: "Other", hint: "Structures whose path does not say where they came from" },
+  kept: { label: "Basket", hint: "What you kept, from here and from the chat" },
+};
+
+/** Kept last: it repeats entries the groups above already hold, which is the point of it. */
+const BROWSE_ORDER: BrowseCategory[] = ["experimental", "prepared", "predicted", "other", "kept"];
+
+/**
+ * The entries grouped for browsing, empty groups left out.
+ *
+ * A kept structure appears both under what it is and under Basket, since
+ * the Basket is a shortcut to it rather than another place it lives.
+ */
+export function browseGroups(entries: readonly BasketEntry[], kept: ReadonlySet<string>): BrowseGroup[] {
+  const groups = new Map<BrowseCategory, BasketEntry[]>();
+  const into = (key: BrowseCategory, entry: BasketEntry) => {
+    const list = groups.get(key) ?? [];
+    list.push(entry);
+    groups.set(key, list);
+  };
+  for (const entry of entries) {
+    if (entry.kind === "pdb") {
+      into("experimental", entry);
+      continue;
+    }
+    into(structureKind(entry.panel.path, Boolean(entry.panel.metrics), entry.panel.tool) ?? "other", entry);
+    if (kept.has(entry.panel.path)) into("kept", entry);
+  }
+  return BROWSE_ORDER.flatMap((key) => {
+    const list = groups.get(key);
+    return list?.length ? [{ key, label: BROWSE[key].label, hint: BROWSE[key].hint, entries: list }] : [];
+  });
 }
 
 /**
