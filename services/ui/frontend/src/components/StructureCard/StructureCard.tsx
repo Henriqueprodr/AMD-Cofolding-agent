@@ -14,6 +14,8 @@ interface Props {
   panel: StructurePanel;
   theme: Theme;
   isOpen: boolean;
+  /** In the chat's one row, where the depiction and the footer do not fit. */
+  compact?: boolean;
 }
 
 /**
@@ -24,7 +26,7 @@ interface Props {
  * not, affinity, confidence, PoseBusters) and the ligand in 2D; the buttons drive the one
  * viewer in the workbench.
  */
-export function StructureCard({ panel, theme, isOpen }: Props) {
+export function StructureCard({ panel, theme, isOpen, compact = false }: Props) {
   const verdict = gate(panel.metrics);
   const badge = verdictLabel(verdict.status);
   const facts = structureFacts(panel.metrics);
@@ -32,12 +34,17 @@ export function StructureCard({ panel, theme, isOpen }: Props) {
   const show = () => sendToViewer({ path: panel.path, source: "chat" });
 
   if (facts.length === 0 && !panel.smiles) {
-    const kind = structureKind(panel.path, false, panel.tool);
+    // The kind is on the card in the Structures tab, where the structures of
+    // several tools sit together and it tells them apart. Here they are all of
+    // one call, so "Prepared" four times across a row says nothing and costs
+    // the width the names need.
+    const kind = compact ? null : structureKind(panel.path, false, panel.tool);
     return (
-      <figure className="bg-raised border-subtle m-0 flex items-center gap-2 rounded-xl border py-1.5 pr-1.5 pl-3">
+      <figure className="bg-raised border-subtle m-0 flex h-full items-center gap-2 rounded-xl border py-1.5 pr-1.5 pl-3">
         <button
           type="button"
           onClick={show}
+          title={structureTitle(panel)}
           className="flex min-w-0 flex-1 cursor-pointer items-baseline gap-2 text-left"
         >
           <span className="min-w-0 truncate text-xs font-semibold">{structureTitle(panel)}</span>
@@ -49,10 +56,10 @@ export function StructureCard({ panel, theme, isOpen }: Props) {
   }
 
   return (
-    <figure className="bg-raised border-subtle m-0 overflow-hidden rounded-xl border">
+    <figure className="bg-raised border-subtle m-0 flex h-full flex-col overflow-hidden rounded-xl border">
       <figcaption className="border-subtle flex items-center gap-2 border-b px-3 py-2">
         <span aria-hidden="true" className="size-2 shrink-0 rounded-full" style={{ background: "var(--color-structure)" }} />
-        <span className="min-w-0 truncate text-xs font-semibold">
+        <span className="min-w-0 truncate text-xs font-semibold" title={structureTitle(panel)}>
           {structureTitle(panel)}
         </span>
         {runOf(panel.path) && <span className="text-faint shrink-0 font-mono text-[10px]">{runOf(panel.path)}</span>}
@@ -69,10 +76,17 @@ export function StructureCard({ panel, theme, isOpen }: Props) {
       <button
         type="button"
         onClick={() => show()}
-        className="hover:bg-sunken flex w-full cursor-pointer items-center gap-3 px-3 py-2 text-left"
+        className="hover:bg-sunken flex w-full flex-1 cursor-pointer items-center gap-3 px-3 py-2 text-left"
       >
         {panel.smiles && (
-          <MolDepiction smiles={panel.smiles} theme={theme} width={150} height={120} label={panel.label ?? undefined} className="h-20 w-24 shrink-0" />
+          <MolDepiction
+            smiles={panel.smiles}
+            theme={theme}
+            width={150}
+            height={120}
+            label={panel.label ?? undefined}
+            className={compact ? "h-14 w-14 shrink-0" : "h-20 w-24 shrink-0"}
+          />
         )}
         {facts.length > 0 && (
           <dl className="min-w-0 flex-1 space-y-0.5 text-[11px]">
@@ -93,9 +107,9 @@ export function StructureCard({ panel, theme, isOpen }: Props) {
         <button
           type="button"
           onClick={show}
-          className="border-subtle text-body hover:bg-inset cursor-pointer rounded-md border px-2 py-1 text-[11px] font-medium whitespace-nowrap touch:min-h-11 touch:px-3"
+          className="border-subtle text-body hover:bg-inset min-w-0 cursor-pointer truncate rounded-md border px-2 py-1 text-[11px] font-medium whitespace-nowrap touch:min-h-11 touch:px-3"
         >
-          {isOpen ? "Showing in viewer" : "Open viewer"}
+          {isOpen ? (compact ? "Showing" : "Showing in viewer") : "Open viewer"}
         </button>
         <span className="ml-auto" />
         <DownloadLink panel={panel} />
