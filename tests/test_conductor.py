@@ -74,12 +74,16 @@ class FakeStore:
         status: dict[str, Any],
         tasks: list[dict[str, Any]] | None = None,
         results: list[dict[str, Any]] | None = None,
+        campaigns: list[dict[str, Any]] | None = None,
     ):
         self.base_url = "http://store"
         self.owner = "conductor"
         self._status = status
         self._tasks = tasks or []
         self._results = results or []
+        # The other campaigns drawing on the shared pool. Empty by default, so
+        # a conductor alone sizes the pool to its own concurrency as before.
+        self._campaigns = campaigns or []
         self.enqueued: list[dict[str, Any]] = []
         self.closed = 0
         self.finalized = 0
@@ -87,6 +91,9 @@ class FakeStore:
 
     def status(self, campaign_id):
         return self._status
+
+    def campaigns(self, session_id=None):
+        return self._campaigns
 
     def conducted(self, campaign_id):
         self.calls.append("conducted")
@@ -325,6 +332,42 @@ class TestDispatchWindow:
         _conductor(store, scaler=scaler).tick()
 
         assert scaler.scaled_to == [2]
+
+    def test_the_pool_covers_every_live_campaign_not_just_this_one(self):
+        """Two conversations asking for two sub-agents each need four.
+
+        Sized to its own concurrency, each conductor set the shared pool to
+        two, the older campaign's queue took both, and the newer one's tasks
+        stayed queued with no supervisor ever claiming them.
+        """
+        other = _campaign(campaign_id="cafe0002", conducted_at=time.time())
+        store = FakeStore(_status(), campaigns=[_campaign(), other])
+        scaler = FakeScaler()
+
+        _conductor(store, scaler=scaler).tick()
+
+        assert scaler.scaled_to == [4]
+
+    def test_quiet_finalized_and_lead_campaigns_do_not_hold_the_pool_open(self):
+        """Only campaigns a supervisor may claim from add to the pool.
+
+        A finalized campaign, one whose conductor stopped ticking, and a
+        lead's campaign (already counted through its parent's team) must not
+        each buy supervisors that would sit idle.
+        """
+        stale = time.time() - CampaignConductor.POOL_DEMAND_WINDOW_SECONDS - 1
+        store = FakeStore(_status(), campaigns=[
+            _campaign(campaign_id="dead0001", state="finalized",
+                      conducted_at=time.time()),
+            _campaign(campaign_id="quiet0002", conducted_at=stale),
+            _campaign(campaign_id="lead0003", conducted_at=time.time(),
+                      parent_campaign_id="feed0001"),
+        ])
+        scaler = FakeScaler()
+
+        _conductor(store, scaler=scaler).tick()
+
+        assert scaler.scaled_to == [2], "only this campaign's own concurrency"
 
     def test_the_proposer_is_told_what_the_campaign_has_already_done(self):
         """It cannot avoid repeating work it was never shown."""

@@ -212,6 +212,58 @@ class CampaignConductor:
             1, floor=1, cooldown=max(60.0, 2 * tick_seconds), clock=clock,
         )
 
+    # -- pool sizing -------------------------------------------------------
+
+    #: How recently a campaign must have been conducted to still draw on the
+    #: pool. Mirrors CAMPAIGN_CONDUCTED_WITHIN_SECONDS in the campaign store,
+    #: which is what decides whether a supervisor may claim its tasks.
+    POOL_DEMAND_WINDOW_SECONDS = float(
+        os.getenv("CAMPAIGN_CONDUCTED_WITHIN_SECONDS", "300")
+    )
+
+    def _pool_target(self, own: int) -> int:
+        """How many supervisors the shared pool needs, across all campaigns.
+
+        The pool is one Slurm job array shared by every campaign, but a
+        supervisor started with no campaign of its own claims from *any*
+        campaign conducted recently. Sizing the pool to this campaign's
+        concurrency alone therefore starves whichever campaign's tasks are
+        younger: two conversations each asking for two sub-agents got a pool
+        of two, both taken by the older queue, and the newer campaign sat at
+        "queued, no supervisor has claimed them yet" forever.
+
+        Summing the concurrency of the campaigns a supervisor may claim from
+        makes the pool match the demand the claim rule actually creates.
+        Falls back to this campaign's own figure when the ledger cannot be
+        listed, which is the old behaviour and never sizes the pool to zero.
+        """
+
+        try:
+            campaigns = self.store.campaigns()
+        except (StoreUnavailable, requests.RequestException) as exc:
+            logger.warning("could not size the pool against other campaigns: %s", exc)
+            return own
+
+        cutoff = time.time() - self.POOL_DEMAND_WINDOW_SECONDS
+        demand = 0
+        for one in campaigns:
+            if one.get("campaign_id") == self.campaign_id:
+                continue
+            if one.get("state") not in ("dispatching", "draining"):
+                continue
+            # A campaign whose conductor has gone quiet keeps its queue but is
+            # not claimable, so it must not hold supervisors open either.
+            conducted = one.get("conducted_at")
+            if conducted is None or float(conducted) < cutoff:
+                continue
+            # A lead's campaign already draws on its parent's slots through
+            # team_counts; counting it again would double its share.
+            if one.get("parent_campaign_id"):
+                continue
+            demand += int(one.get("concurrency") or 1)
+
+        return own + demand
+
     # -- deadlines ---------------------------------------------------------
 
     def _task_deadline(self, campaign: dict[str, Any]) -> Optional[str]:
@@ -286,7 +338,9 @@ class CampaignConductor:
         # Dispatch window.
         target = campaign.get("concurrency") or 1
         if self.scaler:
-            self.scaler.scale(target)
+            # Sized against every campaign drawing on the pool, not just this
+            # one, or concurrent campaigns starve each other.
+            self.scaler.scale(self._pool_target(target))
 
         # The leads' campaigns draw on this pool, so their tasks hold slots too.
         team = status.get("team_counts") or counts
@@ -499,7 +553,11 @@ class CampaignConductor:
         self._stop_jobs_for(campaign.get("base_ttp_id") or "", orphans)
 
         if self.scaler:
-            self.scaler.scale(0)
+            # Zero only when nothing else is using the pool. This campaign is
+            # finalized by now, so _pool_target(0) is exactly what the other
+            # live campaigns still need; dropping to 0 unconditionally would
+            # cancel supervisors mid-task on a campaign nobody finalized.
+            self.scaler.scale(self._pool_target(0))
 
     def _stop_jobs_for(
         self, base_ttp_id: str, tasks: list[dict[str, Any]]
