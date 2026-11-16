@@ -37,14 +37,24 @@ _TIMEOUT = 120.0
 _TIMEOUT_ENSEMBLE = 1800.0  # hotspot_ensemble over 100s of structures can take minutes
 
 
+#: How many families and pairs travel back inline. The service already caps
+#: pairs, and both lists arrive ranked -- families by occupancy, pairs with
+#: the compatible ones first -- so a head is the useful part of each.
+_INLINE_FAMILIES = 20
+_INLINE_PAIRS = 20
+
+
 def _summarise_hotspot(data: dict) -> str:
     """Compact summary of a hotspot_ensemble result for the LLM context window.
 
     The raw response can be 2M+ tokens. Returns a compact summary with correct
     field names from the service schema:
       target_residue, occupancy, n_structures_observed, interaction_types_observed
+      fragment_families, compatible_pairs
     """
     hotspots: list[dict] = data.get("hotspots") or []
+    families: list[dict] = data.get("fragment_families") or []
+    pairs: list[dict] = data.get("compatible_pairs") or []
     warnings: list[str] = data.get("warnings") or []
     timing: float | None = data.get("timing_seconds")
 
@@ -71,8 +81,36 @@ def _summarise_hotspot(data: dict) -> str:
         "n_structures_total": n_total,
         "n_hotspot_residues": len(hotspots),
         "timing_seconds": timing,
-        "compatible_pairs_count": len(data.get("compatible_pairs") or []),
-        "fragment_families_count": len(data.get("fragment_families") or []),
+        "fragment_families_count": len(families),
+        # The families and pairs are the answer to "which fragments bind the
+        # same way, and which two could be joined" -- the question the mode
+        # exists for. Counting them and dropping them left the caller able to
+        # learn only that some existed. Members are counted rather than
+        # listed: the paths are long and the family is identified by its mode.
+        "top_fragment_families": [
+            {
+                "family_id": fam.get("family_id"),
+                "binding_mode_label": fam.get("binding_mode_label"),
+                "primary_residue": fam.get("primary_residue"),
+                "primary_interaction": fam.get("primary_interaction"),
+                "occupancy": fam.get("occupancy"),
+                "n_members": len(fam.get("members") or []),
+                "subpocket_ids": fam.get("subpocket_ids") or [],
+            }
+            for fam in families[:_INLINE_FAMILIES]
+        ],
+        "compatible_pairs_count": len(pairs),
+        "top_compatible_pairs": [
+            {
+                "fragment_a": pair.get("fragment_a"),
+                "fragment_b": pair.get("fragment_b"),
+                "compatible": pair.get("compatible"),
+                "linker_distance_A": pair.get("linker_distance_A"),
+                "n_overlap_residues": len(pair.get("overlap_residues") or []),
+                "notes": pair.get("notes"),
+            }
+            for pair in pairs[:_INLINE_PAIRS]
+        ],
         "top_50_residues_by_occupancy": [
             {
                 "target_residue": h.get("target_residue"),

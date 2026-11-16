@@ -138,7 +138,10 @@ def list_shared_assets(
         if not path.is_file():
             continue
         try:
-            rel = str(path.relative_to(root))
+            # as_posix, because these strings are a prefix contract with the
+            # caller and a path handed on to other services: a host separator
+            # would make prefix="predictions/out_0003" match nothing.
+            rel = path.relative_to(root).as_posix()
         except ValueError:
             continue
         if prefix and not rel.startswith(prefix):
@@ -285,6 +288,16 @@ def list_external_services() -> dict[str, Any]:
             entry["usage"] = (
                 "Direct: predict_retrodmta(smiles, target='FXA'). "
                 "RL objective: service_params={'target': 'FXA', 'endpoint': 'FXA_pKi'}."
+            )
+        elif name == "synthesis_planner":
+            entry["selector"] = "none (optional score_fn / iteration_limit)"
+            entry["score_functions"] = ["solved_steps", "is_solved", "n_routes"]
+            entry["usage"] = (
+                "Direct: plan_synthesis(smiles) for a full route. RL objective: "
+                "service_params={'score_fn': 'solved_steps', 'iteration_limit': 25} "
+                "-- returns 0-1 from real retrosynthesis, unlike the heuristic "
+                "native SAScore. Slower per step than SAScore; keep "
+                "iteration_limit low in an RL loop."
             )
         elif name == "interaction_profiler":
             entry["selector"] = "interaction_type (RL) / structure (interactions)"

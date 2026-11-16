@@ -598,10 +598,24 @@ def register_tools(mcp: Any) -> None:
             submission = mgr.submit_toml(
                 toml_str,
                 job_name=f"generation-{ttp_id}",
+                ttp_id=ttp_id,
                 extra_files=extra_files,
                 max_steps=int(generation_config.get("n_steps", 0)),
                 model=model_key,
             )
+            # A refused submission comes back as an error dict with no job id:
+            # the run window is closed, or every slot is taken. Indexing
+            # job_id first turned that into "Job submission failed: 'job_id'",
+            # which names neither the limit nor the runs holding it, so the
+            # one message that says what to stop was the one lost.
+            if "error" in submission:
+                return {
+                    "job_id": None,
+                    "submitted": False,
+                    "errors": [submission["error"]],
+                    "active_jobs": submission.get("active_jobs", []),
+                    "run_window": submission.get("run_window"),
+                }
             job_id = submission["job_id"]
         except Exception as exc:
             return {

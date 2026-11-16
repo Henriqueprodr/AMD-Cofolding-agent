@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,21 @@ _DEFAULT_ENTRY_TYPES: tuple[str, ...] = ("Domain", "Family", "Site")
 # service (which handles caching + 204 normalisation).  Falls back to the
 # direct-API + local-file-cache path when absent.
 _ANN_URL: str = os.environ.get("ANNOTATION_SERVICE_URL", "").rstrip("/")
+
+
+@lru_cache(maxsize=1)
+def _note_direct_route() -> None:
+    """Record once that lookups are bypassing the annotation service.
+
+    A failing service logs a warning, but an unset one used to fall through in
+    silence, so a deployment that simply forgot the variable looked identical
+    to a healthy one while hitting EBI uncached on every call.
+    """
+
+    logger.info(
+        "ANNOTATION_SERVICE_URL is not set; InterPro lookups go directly to "
+        "EBI without the service's shared cache."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +125,8 @@ def _fetch_interpro(
                 accession, exc,
             )
             # fall through to local cache / direct API
+    else:
+        _note_direct_route()
 
     # ── 2. Local file cache (legacy path) ────────────────────────────────────
     # Try cache first (before network call).
@@ -145,6 +163,12 @@ def _fetch_interpro(
                 f"No InterPro entries found for UniProt accession {accession!r} (HTTP 404)."
             )
         }
+    # 204 is a good accession that simply has no entries. The annotation
+    # service already reports that as an empty list, so this path has to agree
+    # with it: the same protein must not look domain-free through one route and
+    # broken through the other depending on whether the service is configured.
+    if resp.status_code == 204:
+        return {"uniprot_accession": accession, "interpro_entries": []}
     if resp.status_code != 200:
         return {
             "error": (

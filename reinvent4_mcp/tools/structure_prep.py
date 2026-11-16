@@ -185,6 +185,68 @@ def register_tools(mcp) -> None:
             return json.dumps({"error": str(e)}, indent=2)
 
     @mcp.tool()
+    def prepare_structures_batch(
+        paths: Annotated[
+            list[str],
+            Field(description="Shared-volume paths to PDB or CIF files, one job each."),
+        ],
+        profile: Annotated[
+            dict[str, Any],
+            Field(
+                description=(
+                    "The same PreparationProfile JSON prepare_structure takes, "
+                    "applied to every path. Validate one of the structures first "
+                    "and reuse the profile it justified."
+                ),
+            ),
+        ],
+    ) -> str:
+        """Submit one preparation job per path, in a single call.
+
+        For the usual structure-based start -- several PDB entries of one
+        target, prepared the same way so their pockets can be compared --
+        this is one call and one set of job ids instead of one round trip
+        per entry.
+
+        Returns ``{batch_size, jobs: [{path, job_id, status}]}``; a path that
+        could not be resolved carries an ``error`` in place of its job id, so
+        one bad path does not lose the rest. Poll each id with
+        ``get_preparation_status``; they run concurrently.
+        """
+        payload = {"paths": paths, "profile": profile}
+        try:
+            with httpx.Client(base_url=_SP_URL, timeout=30.0) as client:
+                resp = client.post("/jobs/batch", json=payload)
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        except httpx.HTTPStatusError as e:
+            return json.dumps({"error": str(e), "detail": e.response.text}, indent=2)
+        except Exception as e:
+            return json.dumps({"error": str(e)}, indent=2)
+
+    @mcp.tool()
+    def cancel_preparation(
+        job_id: Annotated[str, Field(description="Job ID returned by prepare_structure")],
+    ) -> str:
+        """Stop a structure preparation job.
+
+        ``get_preparation_status`` has always been able to report
+        ``cancelled``; nothing could cause it. A preparation that will not
+        finish -- a structure whose protonation stage is stuck, a batch
+        submitted against the wrong profile -- otherwise holds its worker
+        until the service is restarted.
+        """
+        try:
+            with _client() as client:
+                resp = client.post(f"/jobs/{job_id}/cancel")
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        except httpx.HTTPStatusError as e:
+            return json.dumps({"error": str(e), "detail": e.response.text}, indent=2)
+        except Exception as e:
+            return json.dumps({"error": str(e)}, indent=2)
+
+    @mcp.tool()
     def get_preparation_status(
         job_id: Annotated[str, Field(description="Job ID returned by prepare_structure")],
     ) -> str:

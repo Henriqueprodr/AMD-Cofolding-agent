@@ -53,13 +53,14 @@ def run_optimization(
     ttp_id: Optional[str] = None,
     ttp: Optional[dict[str, Any]] = None,
     model: str = ".reinvent",
-    max_steps: int = 300,
+    max_steps: Optional[int] = None,
     batch_size: Optional[int] = None,
     sigma: Optional[int] = None,
     learning_rate: Optional[float] = None,
     resume_from: Optional[str] = None,
     termination: Optional[dict[str, Any]] = None,
     seed_smiles: Optional[list[str]] = None,
+    fidelity_tier: str = "exploration",
 ) -> dict[str, Any]:
     """Launch an RL optimization campaign with full TTP scoring.
 
@@ -78,7 +79,8 @@ def run_optimization(
     model:
         Prior model registry key or file path.
     max_steps:
-        Maximum RL steps.
+        Maximum RL steps.  None lets the system choose: 64 for
+        exploration-tier Boltz-scored runs, 300 otherwise.
     batch_size:
         Molecules per step (overrides process config).
     sigma, learning_rate:
@@ -103,6 +105,7 @@ def run_optimization(
     from reinvent4_mcp.tools.ttp import resolve_ttp
     from reinvent4_mcp.ttp.mapper import get_mapper_summary, ttp_to_scorer_config
     from reinvent4_mcp.ttp.schema import TTP as TTPModel
+    from reinvent4_mcp.ttp.schema import GenerationMode
 
     is_mol2mol = _is_mol2mol_model(model)
     if is_mol2mol and not seed_smiles:
@@ -128,13 +131,22 @@ def run_optimization(
                 "Invalid seeds may cause a downstream failure in mol2mol."
             )
         else:
-            cleaned, bad = [], []
+            cleaned, bad, stripped = [], [], []
             for s in seed_smiles:
                 s2 = (s or "").strip()
-                if not s2 or Chem.MolFromSmiles(s2) is None:
+                mol = None if not s2 else Chem.MolFromSmiles(s2)
+                if not s2 or mol is None:
                     bad.append(s)
-                else:
-                    cleaned.append(s2)
+                    continue
+                # REINVENT's token vocabulary does not include isotope labels
+                # such as [2H], [13C], [18F]. Strip them before writing the
+                # seed file, and warn so the agent knows what changed.
+                for atom in mol.GetAtoms():
+                    atom.SetIsotope(0)
+                canonical = Chem.MolToSmiles(mol)
+                if canonical != Chem.MolToSmiles(Chem.MolFromSmiles(s2)):
+                    stripped.append(s2)
+                cleaned.append(canonical)
             if bad:
                 return {
                     "error": (
@@ -142,6 +154,13 @@ def run_optimization(
                         f"RDKit): {bad}"
                     ),
                 }
+            if stripped:
+                logger.warning(
+                    "stripped isotope labels from seed_smiles (%d SMILES affected); "
+                    "REINVENT's vocabulary does not include isotope tokens. "
+                    "Originals: %s",
+                    len(stripped), stripped,
+                )
             seed_smiles = cleaned
 
     resolved = resolve_ttp(ttp_id=ttp_id, ttp_data=ttp)
@@ -150,8 +169,22 @@ def run_optimization(
 
     assert isinstance(resolved, TTPModel)
 
+    # This path builds de novo and Mol2Mol TOML only. A TTP asking for a
+    # scaffold or linker run would otherwise launch the default prior and
+    # report a healthy campaign that never decorated the scaffold, so name the
+    # tool that can build it rather than quietly running something else.
+    declared = resolved.generation.mode if resolved.generation else None
+    if declared in (GenerationMode.libinvent, GenerationMode.linkinvent):
+        return {
+            "error": (
+                f"TTP '{resolved.id}' asks for generation.mode="
+                f"'{declared.value}', which run_optimization cannot build. "
+                f"Call run_generation_campaign(ttp_id='{resolved.id}') instead."
+            ),
+        }
+
     try:
-        scorer_config = ttp_to_scorer_config(resolved)
+        scorer_config = ttp_to_scorer_config(resolved, fidelity_tier=fidelity_tier)
     except Exception as exc:
         return {"error": f"Failed to build scorer config from TTP: {exc}"}
 
@@ -160,13 +193,25 @@ def run_optimization(
 
     mapper_summary = get_mapper_summary(resolved, scorer_config)
 
+    # When max_steps is not explicitly set, cap Boltz-scored exploration runs
+    # at 64 steps: exploration defaults make each step ~2 min, so 64 steps
+    # fits in a session; 300 steps would run 10+ hours.
+    effective_max_steps = max_steps
+    if max_steps is None:
+        uses_boltz = any(
+            obj.service == "boltz"
+            for obj in resolved.scoring.objectives
+            if obj.type == "external"
+        )
+        effective_max_steps = 64 if (uses_boltz and fidelity_tier == "exploration") else 300
+
     manager = get_job_manager()
     result = manager.create_and_start(
         ttp_id=resolved.id,
         ttp_version=resolved.version,
         scorer_config=scorer_config,
         model=model,
-        max_steps=max_steps,
+        max_steps=effective_max_steps,
         batch_size=batch_size,
         sigma=sigma,
         learning_rate=learning_rate,

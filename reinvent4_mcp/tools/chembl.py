@@ -516,6 +516,10 @@ def register_tools(mcp: Any) -> None:
         except ChEMBLError as exc:
             return _err(op, getattr(exc, "code", "chembl_error"), str(exc))
 
+        # A raw search record carries every component's cross-references and
+        # synonyms: twenty of them were ~190k tokens, more than a whole turn.
+        if not only:
+            result["records"] = [_normalize_target(r) for r in result["records"]]
         return _ok(op, result, provenance=_provenance("/target/search", params))
 
     # ── 4. get_chembl_target ───────────────────────────────────────────────

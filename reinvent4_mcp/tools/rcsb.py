@@ -1652,6 +1652,27 @@ def register_tools(mcp: Any) -> None:
         return {"entries": normalized, "schema_version": SCHEMA_VERSION}
 
     @mcp.tool()
+    def rcsb_get_chem_comps(comp_ids: list[str]) -> dict:
+        """Return the chemical component definition for ligand or residue codes.
+
+        Takes three-letter PDB component ids such as ['ATP', 'HEM', 'STI'] and
+        returns name, type, formula, formula weight, formal charge and the
+        descriptor block carrying SMILES and InChI. Use it to find out what a
+        ligand in an entry actually is, or to turn a residue code seen in a
+        structure into a SMILES that the other tools accept.
+        """
+        return {"chem_comps": MetadataClient().get_chem_comps(comp_ids)}
+
+    @mcp.tool()
+    def rcsb_get_pubmed(pubmed_ids: list[int]) -> dict:
+        """Return PubMed abstracts for the papers behind entries.
+
+        Takes the pubmed ids found on an entry's citation, so what a structure
+        was determined for can be read rather than guessed from its metadata.
+        """
+        return {"pubmed": MetadataClient().get_pubmed(pubmed_ids)}
+
+    @mcp.tool()
     def rcsb_fetch_files(
         entry_ids: list[str],
         formats: list[str] | None = None,

@@ -284,3 +284,28 @@ def register_tools(mcp) -> None:
             return json.dumps({"error": str(exc), "detail": exc.response.text}, indent=2)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, indent=2)
+
+    @mcp.tool()
+    def cancel_synthesis_job(
+        job_id: Annotated[
+            str,
+            Field(description="Job ID returned by submit_synthesis_job."),
+        ],
+    ) -> str:
+        """Stop an async synthesis planning job.
+
+        ``cancelled`` is one of the states the status tool reports, and until
+        now nothing could produce it. A retrosynthesis search is an MCTS with
+        a time limit per molecule, so a batch submitted against the wrong
+        stock file or too high an iteration limit otherwise occupies the
+        planner for its full budget with an answer nobody wants.
+        """
+        try:
+            with _client() as client:
+                resp = client.post(f"/jobs/{job_id}/cancel")
+                resp.raise_for_status()
+                return json.dumps(resp.json(), indent=2)
+        except httpx.HTTPStatusError as exc:
+            return json.dumps({"error": str(exc), "detail": exc.response.text}, indent=2)
+        except Exception as exc:
+            return json.dumps({"error": str(exc)}, indent=2)

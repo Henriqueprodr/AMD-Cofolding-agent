@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from functools import lru_cache
 from typing import Any
 
 import requests
@@ -30,6 +31,22 @@ _TIMEOUT = 30
 # the service which returns features[] + sequence in a single upstream hit and
 # caches results on disk.  Falls back to direct API when absent.
 _ANN_URL: str = os.environ.get("ANNOTATION_SERVICE_URL", "").rstrip("/")
+
+
+@lru_cache(maxsize=1)
+def _note_direct_route() -> None:
+    """Record once that lookups are bypassing the annotation service.
+
+    A failing service logs a warning, but an unset one used to fall through in
+    silence, so a deployment that simply forgot the variable looked identical
+    to a healthy one while hitting UniProt uncached on every call.
+    """
+
+    logger.info(
+        "ANNOTATION_SERVICE_URL is not set; UniProt feature lookups go "
+        "directly to the upstream API without the service's shared cache."
+    )
+
 
 # All feature types we understand; None = include everything.
 _ALL_FEATURE_TYPES: frozenset[str] = frozenset(
@@ -135,6 +152,8 @@ def _fetch_features(
                 accession, exc,
             )
             # fall through to direct API
+    else:
+        _note_direct_route()
 
     # ── 2. Direct UniProt API (legacy) ───────────────────────────────────────
     url = f"{_BASE}/{accession}.json"
