@@ -369,7 +369,10 @@ def start_own_task(
         # No lease: the conductor is not a pool member, and a swept lease
         # would requeue work that is being done for a sub-agent to redo.
         store.claim_named(task_id)
-        return {"task_id": task_id, "title": spec.get("title"), "kind": spec["kind"]}
+        # Include campaign_id so the caller can pass it to finish_own_task and
+        # any get_task_reports call without having to remember it separately.
+        return {"task_id": task_id, "title": spec.get("title"), "kind": spec["kind"],
+                "campaign_id": campaign_id}
 
     return _guard(f"Could not record your own task on campaign {campaign_id}", take)
 

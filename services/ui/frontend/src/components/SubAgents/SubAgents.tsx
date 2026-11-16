@@ -11,8 +11,30 @@ import { useStuckTasks } from "../../hooks/useTaskConversations";
 /** Narrowest a card gets and still reads: its label and a few words of its task, plus the gap. */
 const CARD_MIN = 126;
 
-/** Calls after which the ledger has something new to say about this conversation's campaigns. */
-const CHANGES_CAMPAIGNS = new Set(["start_campaign", "enqueue_task", "conduct_campaign", "cancel_supervisor", "close_campaign", "finalize_campaign"]);
+/** Calls after which the ledger has something new to say about this conversation's campaigns.
+ *
+ * start_own_task / finish_own_task are the single-agent equivalents of
+ * enqueue_task / conduct_campaign: they add a task and post a result. Without
+ * them here the campaign panel would not refresh after own-task activity and
+ * the Overview would stay empty. atlas_finding / atlas_note / set_campaign_plan
+ * also mutate visible campaign state, as does take_proposals.
+ */
+const CHANGES_CAMPAIGNS = new Set([
+  "start_campaign",
+  "enqueue_task",
+  "conduct_campaign",
+  "cancel_supervisor",
+  "close_campaign",
+  "finalize_campaign",
+  // Single-agent own-task tools — equivalent campaign mutations to the above.
+  "start_own_task",
+  "finish_own_task",
+  // Plan and atlas writes update what the Overview shows.
+  "set_campaign_plan",
+  "atlas_finding",
+  "atlas_note",
+  "take_proposals",
+]);
 
 interface Props {
   sessionId: string | null;
