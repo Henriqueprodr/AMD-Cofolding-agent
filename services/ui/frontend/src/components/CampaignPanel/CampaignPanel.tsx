@@ -8,16 +8,15 @@ import { useCampaigns } from "../../hooks/useCampaignJobs";
 import { useJobList } from "../../hooks/useJobList";
 import { useStuckTasks } from "../../hooks/useTaskConversations";
 import { history } from "../../lib/activity";
-import { learnt } from "../../lib/atlas";
 import { campaignView } from "../../lib/campaign";
 import { agentLabels, knownAgent, taskPhase, taskReports } from "../../lib/fleet";
 import { focusTask, openRun, useFocusedAgent, useFocusedTask } from "../../lib/workbenchBus";
 import { Card, Placeholder } from "../RunAnalysis/shared";
 import { AgentConversation } from "../SubAgents/AgentConversation";
+import { CampaignMemory } from "./CampaignMemory";
 import { IterationGraph } from "./IterationGraph";
 import { useNow } from "./shared";
 import { TaskDetail } from "./TaskDetail";
-import { WhatWeKnow } from "./WhatWeKnow";
 
 interface Props {
   /** The conversation on screen. */
@@ -101,6 +100,19 @@ export function CampaignPanel({ sessionId, log = null, theme, onOpenMolecule, on
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto p-3">
+      {/* Above the graph: what the campaign knows is read far more often
+          than the shape of how it got there. */}
+      <CampaignMemory
+        details={details}
+        events={events}
+        memory={memory}
+        reports={written}
+        labels={labels}
+        runs={knownRuns}
+        now={now}
+        onOpenRun={showRun}
+        onOpenReport={(report) => focusTask({ campaignId: report.campaignId, taskId: report.taskId })}
+      />
       <Card title="Iteration graph">
         {error && !details.length ? (
           <p className="text-faint py-6 text-center text-xs">{error}</p>
@@ -117,49 +129,6 @@ export function CampaignPanel({ sessionId, log = null, theme, onOpenMolecule, on
           />
         )}
       </Card>
-      {details.map((one) => (
-        <WhatWeKnow
-          key={one.campaign.campaign_id}
-          campaignId={one.campaign.campaign_id}
-          goal={details.length > 1 ? one.campaign.goal : null}
-          learnt={learnt(events.get(one.campaign.campaign_id), one)}
-          labels={labels}
-          runs={knownRuns}
-          now={now}
-          onOpenRun={showRun}
-        />
-      ))}
-      {memory && (
-        <Card title="Memory">
-          <div className="space-y-2 text-[11px] leading-relaxed">
-            {memory.goal && <p><span className="text-faint mr-1.5 font-medium uppercase tracking-wide">Goal</span>{memory.goal}</p>}
-            {memory.next && <p><span className="text-faint mr-1.5 font-medium uppercase tracking-wide">Next</span>{memory.next}</p>}
-            {memory.findings.length > 0 && (
-              <ul className="border-subtle space-y-1 border-t pt-2">
-                {memory.findings.map((finding, index) => <li key={`${finding.ts}-${index}`} className="text-muted">• {finding.text}</li>)}
-              </ul>
-            )}
-          </div>
-        </Card>
-      )}
-      {written.length > 0 && (
-        <Card title="Reports" actions={<span className="text-faint text-[11px]">{written.length}</span>}>
-          <ul className="flex flex-col gap-1.5">
-            {written.map((report) => (
-              <li key={report.taskId}>
-                <button
-                  type="button"
-                  onClick={() => focusTask({ campaignId: report.campaignId, taskId: report.taskId })}
-                  className="border-subtle hover:bg-inset grid w-full cursor-pointer grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-3 rounded-lg border px-2.5 py-2 text-left"
-                >
-                  <span className="min-w-0 truncate text-[11.5px] font-medium">{report.title}</span>
-                  <span className="text-muted line-clamp-3 text-[11px] leading-snug">{report.excerpt || "No summary written."}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        </Card>
-      )}
     </div>
   );
 }

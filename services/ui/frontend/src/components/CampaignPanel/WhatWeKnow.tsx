@@ -56,18 +56,9 @@ export function WhatWeKnow({
   now,
   onOpenRun,
 }: Props) {
-  const { atlas, error, retry } = useCampaignAtlas(campaignId, learnt);
+  const { atlas } = useCampaignAtlas(campaignId, learnt);
   const views = useMemo(() => (atlas ? branchViews(atlas) : []), [atlas]);
-  const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set());
   const disputed = views.reduce((sum, view) => sum + view.disputed, 0);
-  const who = (author: string) => labels.get(author) ?? author;
-
-  const toggle = (branch: string) =>
-    setOpen((previous) => {
-      const next = new Set(previous);
-      if (!next.delete(branch)) next.add(branch);
-      return next;
-    });
 
   // Before anything is planned or recorded there is nothing to say; the graph already says the campaign started.
   if (atlas && atlas.findings === 0 && atlas.branches.length === 0) return null;
@@ -89,52 +80,92 @@ export function WhatWeKnow({
         ) : null
       }
     >
-      {!atlas ? (
-        error ? (
-          <p className="text-faint py-3 text-center text-[11px]">
-            {error}{" "}
-            <button
-              type="button"
-              onClick={retry}
-              className="text-muted hover:text-body cursor-pointer underline"
-            >
-              Try again
-            </button>
-          </p>
-        ) : (
-          <Placeholder height={48}>
-            Reading what the campaign knows…
-          </Placeholder>
-        )
-      ) : (
-        <>
-          {error && (
-            <p className="text-faint pb-1.5 text-[11px]">
-              Could not refresh: {error}
-            </p>
-          )}
-          <ul className="flex flex-col">
-            {views.map((view) => (
-              <BranchRow
-                key={view.branch}
-                view={view}
-                open={open.has(view.branch)}
-                onToggle={() => toggle(view.branch)}
-                who={who}
-                runs={runs}
-                now={now}
-                onOpenRun={onOpenRun}
-              />
-            ))}
-          </ul>
-          {atlas.truncated && (
-            <p className="text-faint pt-1.5 text-[11px]">
-              Showing the newest {atlas.items.length} of {atlas.findings}.
-            </p>
-          )}
-        </>
-      )}
+      <CampaignBranches
+        campaignId={campaignId}
+        learnt={learnt}
+        labels={labels}
+        runs={runs}
+        now={now}
+        onOpenRun={onOpenRun}
+      />
     </Card>
+  );
+}
+
+/**
+ * One campaign's branches, without a card of its own.
+ *
+ * Split out so several campaigns can share a single Memory card: a card
+ * each meant a conversation with two campaigns showed two "What we know"
+ * headings, which reads as the panel having duplicated itself rather than
+ * as two campaigns.
+ */
+export function CampaignBranches({
+  campaignId,
+  learnt,
+  labels,
+  runs,
+  now,
+  onOpenRun,
+}: Omit<Props, "goal">) {
+  const { atlas, error, loading, retry } = useCampaignAtlas(campaignId, learnt);
+  const views = useMemo(() => (atlas ? branchViews(atlas) : []), [atlas]);
+  const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set());
+  const who = (author: string) => labels.get(author) ?? author;
+
+  const toggle = (branch: string) =>
+    setOpen((previous) => {
+      const next = new Set(previous);
+      if (!next.delete(branch)) next.add(branch);
+      return next;
+    });
+
+  if (loading) {
+    return <Placeholder height={48}>Reading what the campaign knows…</Placeholder>;
+  }
+
+  if (!atlas) {
+    return (
+      <p className="text-faint py-3 text-center text-[11px]">
+        {/* Read, but nothing came back for this campaign. Saying so beats
+            sitting on a spinner that will never resolve. */}
+        {error ?? "Nothing is recorded for this campaign yet."}{" "}
+        <button
+          type="button"
+          onClick={retry}
+          className="text-muted hover:text-body cursor-pointer underline"
+        >
+          Try again
+        </button>
+      </p>
+    );
+  }
+
+  return (
+    <>
+      {error && (
+        <p className="text-faint pb-1.5 text-[11px]">Could not refresh: {error}</p>
+      )}
+      <ul className="flex flex-col">
+        {views.map((view) => (
+          <BranchRow
+            key={view.branch}
+            view={view}
+            open={open.has(view.branch)}
+            onToggle={() => toggle(view.branch)}
+            who={who}
+            runs={runs}
+            now={now}
+            onOpenRun={onOpenRun}
+          />
+        ))}
+      </ul>
+      {atlas.truncated && (
+        <p className="text-faint pt-1.5 text-[11px]">
+          Showing the newest {atlas.items.length} of {atlas.findings}.
+        </p>
+      )}
+    </>
   );
 }
 
@@ -163,7 +194,9 @@ function BranchRow({
         onClick={onToggle}
         disabled={empty}
         aria-expanded={empty ? undefined : open}
-        className="grid w-full grid-cols-[9rem_minmax(0,1fr)_auto] items-baseline gap-3 py-1.5 text-left enabled:cursor-pointer enabled:hover:bg-inset rounded-md px-1"
+        /* Workstream names are full phrases ("JQ1-based Lead Optimization"),
+           which 9rem truncated to the point of being unreadable. */
+        className="grid w-full grid-cols-[14rem_minmax(0,1fr)_auto] items-baseline gap-3 py-1.5 text-left enabled:cursor-pointer enabled:hover:bg-inset rounded-md px-1"
       >
         <span
           className={`min-w-0 truncate text-[11.5px] ${empty ? "text-faint" : "font-medium"}`}

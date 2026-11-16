@@ -9,6 +9,14 @@ import { usePanelShown } from "./panelShownContext";
 export interface AtlasRead {
   atlas: CampaignAtlas | null;
   error: string | null;
+  /** Still reading. False once this key has been answered, however it answered.
+   *
+   * Distinguishes "no atlas yet" from "read, and there was nothing usable in
+   * it". Without it a read that came back for another campaign left the panel
+   * on "Reading what the campaign knows…" for good: the key was recorded so
+   * nothing refetched, and no error was set so no retry was offered.
+   */
+  loading: boolean;
   /** Read again now: a failed read is otherwise retried only once something new is learnt. */
   retry: () => void;
 }
@@ -58,6 +66,9 @@ export function useCampaignAtlas(
   return {
     atlas: mine,
     error: read.error,
+    // Hidden panels read nothing, so they are not loading either; they show
+    // what was last read until they are shown again.
+    loading: shown && read.key !== key,
     retry: () => setAttempt((n) => n + 1),
   };
 }
