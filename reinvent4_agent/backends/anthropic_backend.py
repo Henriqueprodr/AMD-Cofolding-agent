@@ -198,8 +198,13 @@ class AnthropicBackend(LLMBackend):
         if not self._messages or self._messages[-1].get("role") != "assistant":
             return
         last = self._messages[-1]["content"]
+        # Blocks are SDK objects within a run and dicts once a history has
+        # been imported, and an unanswered call has to be healed either way.
         ids = [
-            b.id for b in last if getattr(b, "type", None) == "tool_use"
+            (b.get("id") if isinstance(b, dict) else b.id)
+            for b in last
+            if (b.get("type") if isinstance(b, dict) else getattr(b, "type", None))
+            == "tool_use"
         ]
         if ids:
             self._messages.append({
@@ -219,6 +224,36 @@ class AnthropicBackend(LLMBackend):
         self._system_prompt = system_prompt
         self._messages.clear()
 
+    def export_history(self) -> list[dict[str, Any]]:
+        return [
+            {"role": message["role"], "content": _plain_content(message["content"])}
+            for message in self._messages
+        ]
+
+    def import_history(self, messages: list[dict[str, Any]]) -> None:
+        self._messages[:] = [dict(message) for message in messages]
+
+    def forget_oldest(self) -> int:
+        """Drop the first exchange; the system prompt lives outside the history.
+
+        Cuts at the next question the user asked rather than at any user
+        message, because a tool result is also sent as one and starting a
+        history on it would orphan the tool call it answers.
+        """
+        nxt = next(
+            (
+                i
+                for i in range(1, len(self._messages))
+                if self._messages[i].get("role") == "user"
+                and not _answers_a_tool_call(self._messages[i])
+            ),
+            None,
+        )
+        if nxt is None:
+            return 0
+        del self._messages[:nxt]
+        return nxt
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -236,6 +271,32 @@ class AnthropicBackend(LLMBackend):
             }
             for t in mcp_tools
         ]
+
+
+def _plain_content(content: Any) -> Any:
+    """Content blocks as data, since an assistant turn holds SDK objects.
+
+    Only the shape travels; the blocks come back as dicts, which the API
+    accepts and the readers here already allow for.
+    """
+    if not isinstance(content, list):
+        return content
+    return [
+        block if isinstance(block, dict) else block.model_dump(exclude_none=True)
+        for block in content
+    ]
+
+
+def _answers_a_tool_call(message: dict[str, Any]) -> bool:
+    """Whether a user message carries tool results rather than a question."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        (block.get("type") if isinstance(block, dict) else getattr(block, "type", None))
+        == "tool_result"
+        for block in content
+    )
 
 
 def _get_username() -> str:

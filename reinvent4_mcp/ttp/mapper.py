@@ -89,7 +89,7 @@ _SELECTOR_PARAMS = ("endpoint", "target", "interaction_type", "affinity_mode", "
 # ---------------------------------------------------------------------------
 
 
-def ttp_to_scorer_config(ttp: TTP) -> dict[str, Any]:
+def ttp_to_scorer_config(ttp: TTP, fidelity_tier: str = "exploration") -> dict[str, Any]:
     """Build a full REINVENT4 Scorer configuration from a TTP.
 
     Merges ``pre_scoring`` components and ``scoring`` objectives into a
@@ -133,7 +133,7 @@ def ttp_to_scorer_config(ttp: TTP) -> dict[str, Any]:
                 _map_native_component(obj.component, obj)
             )
         elif obj.type == "external":
-            scorer_components.append(_map_external_objective(obj, ttp))
+            scorer_components.append(_map_external_objective(obj, ttp, fidelity_tier))
 
     # 3. Constraints (mapped as REINVENT4 filter components)
     if ttp.constraints:
@@ -550,6 +550,7 @@ def _native_component_params_with_defaults(
 def _map_external_objective(
     objective: ScoringObjective,
     ttp: TTP,
+    fidelity_tier: str = "exploration",
 ) -> dict[str, Any]:
     """Build an ``ExternalRESTScorer`` config entry.
 
@@ -595,7 +596,7 @@ def _map_external_objective(
 
     # Inject process config defaults for Boltz before TTP overrides
     if objective.service == "boltz":
-        params.update(_get_boltz_defaults())
+        params.update(_get_boltz_defaults(fidelity_tier))
 
     # Inject process config defaults for PoseBusters before TTP overrides
     if objective.service == "posebusters":
@@ -722,8 +723,24 @@ def _resolve_service_url(service: str | None, ttp_url: str | None) -> str | None
     return canonical
 
 
-def _get_boltz_defaults() -> dict[str, Any]:
-    """Pull Boltz operational defaults from the process config."""
+# Full-accuracy parameters for the validation tier.  These override the
+# per-environment config (which carries exploration-speed defaults on LUMI)
+# when a task is explicitly marked as validation-tier.
+_VALIDATION_BOLTZ_PARAMS: dict[str, Any] = {
+    "recycling_steps": 3,
+    "diffusion_samples": 1,
+    "diffusion_samples_affinity": 5,
+    "sampling_steps_affinity": 200,
+}
+
+
+def _get_boltz_defaults(fidelity_tier: str = "exploration") -> dict[str, Any]:
+    """Pull Boltz operational defaults from the process config.
+
+    Validation-tier tasks override to full-accuracy parameters regardless
+    of the per-environment config (which carries exploration defaults on LUMI).
+    TTP ``service_params`` applied by the caller always win over these.
+    """
 
     from reinvent4_mcp.config import get_config
 
@@ -732,12 +749,18 @@ def _get_boltz_defaults() -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "recycling_steps": boltz.recycling_steps,
         "diffusion_samples": boltz.diffusion_samples,
+        "diffusion_samples_affinity": boltz.diffusion_samples_affinity,
         "sampling_steps_affinity": boltz.sampling_steps_affinity,
         "affinity_mode": boltz.affinity_mode,
     }
     if boltz.use_msa_server:
         defaults["use_msa_server"] = True
         defaults["msa_server_url"] = boltz.msa_server_url
+
+    if fidelity_tier == "validation":
+        # Config carries exploration-speed defaults; validation needs accuracy.
+        defaults.update(_VALIDATION_BOLTZ_PARAMS)
+
     return defaults
 
 

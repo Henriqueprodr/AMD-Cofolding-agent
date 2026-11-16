@@ -72,6 +72,27 @@ class LLMBackend(ABC):
     format and handles schema conversion for tools.
     """
 
+    @property
+    def context_window(self) -> int | None:
+        """Tokens the endpoint accepts in one request, when it says.
+
+        Lets a caller act before the window fills rather than after the
+        request is refused.  ``None`` means the endpoint did not say and
+        nothing may be assumed from the model's name: how much of a model's
+        context is actually served is a deployment choice.
+        """
+        return None
+
+    def forget_oldest(self) -> int:
+        """Drop the oldest exchange from the history; how many messages went.
+
+        Last resort for a conversation that no longer fits: the gateway
+        condenses between turns, but a turn can also overflow in the middle
+        of a tool-call loop, and half a conversation answers better than an
+        error.  Backends that cannot do this keep everything and return 0.
+        """
+        return 0
+
     @abstractmethod
     def complete(
         self,
@@ -111,6 +132,24 @@ class LLMBackend(ABC):
     @abstractmethod
     def reset(self, system_prompt: str) -> None:
         """Clear history and reinitialise with the system prompt."""
+
+    @abstractmethod
+    def export_history(self) -> list[dict[str, Any]]:
+        """The conversation, for a caller that will hand it back verbatim.
+
+        Native format, not a common one: the only consumer is
+        ``import_history`` on a backend of the same kind, and translating
+        would lose the tool-call pairing each API validates.
+        """
+
+    @abstractmethod
+    def import_history(self, messages: list[dict[str, Any]]) -> None:
+        """Adopt a conversation from ``export_history``, system prompt aside.
+
+        The prompt is left as this process built it, since it carries the
+        tools and limits of the session running now rather than the one the
+        history came from.
+        """
 
 
 def connection_failure_report(

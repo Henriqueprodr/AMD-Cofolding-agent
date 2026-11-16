@@ -63,7 +63,11 @@ INVENTORY_TOOLS = frozenset(
 )
 
 #: Tools whose result names a job this conversation started.
-LAUNCH_TOOLS = frozenset({"run_optimization", "run_transfer_learning"})
+LAUNCH_TOOLS = frozenset({
+    "run_optimization",
+    "run_transfer_learning",
+    "run_generation_campaign",
+})
 
 #: Job states after which the job's directory is no longer written to.
 FINISHED_STATES = frozenset({"completed", "failed", "stopped"})

@@ -22,6 +22,7 @@ Endpoints
 ``GET    /api/sessions/{id}/events``         every event of one, for export.
 ``GET    /api/sessions/{id}/data``           what one produced or used, with sizes.
 ``POST   /api/sessions/{id}/purge``          delete one with the data picked from that list.
+``POST   /api/sessions/{id}/stop``           stop its turn, its campaigns and its runs.
 ``POST   /api/tools/{name}``                 call one MCP tool without the LLM.
 ``GET    /api/jobs/{job_id}/files/{name}``   a results, log or config file of a job.
 ``GET    /api/services/cofold``              what Boltz is cofolding now (see ``cofold_status.py``).
@@ -102,6 +103,16 @@ DIRECT_TOOLS = frozenset(
         "list_transforms",
         "fetch_target_info",
         "fetch_compound",
+        "derive_scaffold_from_series",
+        "decompose_series_r_groups",
+        "find_matched_molecular_pairs",
+        "cluster_molecules_by_similarity",
+        "fetch_target_genetic_evidence",
+        "fetch_target_expression",
+        "fetch_pathway_annotations",
+        "fetch_target_orthology",
+        "search_patents_by_structure",
+        "search_patents_by_target",
         "predict_admet",
         "predict_retrodmta",
         "stop_optimization",
@@ -166,6 +177,36 @@ def _store_upload(session: str, name: str, data: bytes) -> dict[str, Any]:
         "name": name,
         "size": len(data),
     }
+
+
+#: Pages of a campaign's history read for ``task_runners``, at the store's
+#: 200 events a page.
+_RUNNER_PAGES = 50
+
+#: Findings the atlas view reads at once: the most the store hands out.
+FINDINGS_SHOWN = 200
+
+
+def task_runners(ledger: Any, campaign_id: str) -> dict[str, str]:
+    """The sub-agent that last claimed each task of a campaign.
+
+    The ledger clears a task's ``lease_owner`` the moment it is done, so a
+    finished task names nobody; its claim is still in the history.
+    """
+    runners: dict[str, str] = {}
+    since = 0
+    for _ in range(_RUNNER_PAGES):
+        page = ledger.events(campaign_id, since=since)
+        events = page.get("events") or []
+        for event in events:
+            owner = (event.get("payload") or {}).get("owner")
+            if event.get("kind") == "task_claimed" and event.get("task_id") and owner:
+                runners[event["task_id"]] = owner
+        last = page.get("last_event_id", since)
+        if not events or last == since:
+            break
+        since = last
+    return runners
 
 
 def _download_rcsb(pdb_id: str) -> bytes:
@@ -364,7 +405,7 @@ class AgentGateway:
         from reinvent4_agent.agent import Agent
         from reinvent4_agent.backends import create_backend
         from reinvent4_agent.cli import permitted_tools
-        from reinvent4_agent.system_prompt import SYSTEM_PROMPT
+        from reinvent4_agent.system_prompt import CONDUCTOR_PLAYBOOK, SYSTEM_PROMPT
 
         if self._mcp is None:
             raise RuntimeError("MCP server is not running")
@@ -379,7 +420,9 @@ class AgentGateway:
             verify_ssl=self.config.verify_ssl,
             thinking_budget=self.config.thinking_budget,
             reasoning_effort=self.config.reasoning_effort,
-            system_prompt=SYSTEM_PROMPT,
+            # This is the agent the user talks to, and the only one that can
+            # dispatch sub-agents, so it carries the conducting half too.
+            system_prompt=SYSTEM_PROMPT + CONDUCTOR_PLAYBOOK,
         )
         # The conductor's deny-list and its writable TTP mount are one decision
         # (AGENTS.md, rules that must not be broken), so a web session must
@@ -414,10 +457,50 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
         alerts = json.loads(await gateway.call_tool("get_job_alerts", {}))
         return [alert for alert in alerts if isinstance(alert, dict)] if isinstance(alerts, list) else []
 
+    async def campaign_news(since: dict[str, int]) -> dict[str, dict[str, Any]]:
+        """What each campaign's sub-agents have done since the last look.
+
+        Read here rather than through a tool: a sub-agent reports into the
+        ledger, and the conductor has to be woken by that without a browser
+        or a turn in between. The pool counts come along because an idle
+        sub-agent with nothing queued is the state a campaign stalls in.
+        """
+
+        from reinvent4_agent.campaign_client import CampaignStoreClient, StoreUnavailable
+
+        ledger = CampaignStoreClient()
+
+        def read_one(campaign_id: str, seen: int) -> dict[str, Any]:
+            feed = ledger.events(campaign_id, since=seen)
+            status = ledger.status(campaign_id)
+            pool = ledger.supervisors(campaign_id)
+            return {
+                "events": feed.get("events") or [],
+                "last_event_id": feed.get("last_event_id", seen),
+                "idle": pool.get("idle", 0),
+                "alive": pool.get("n_alive", 0),
+                "queued": status.get("task_counts", {}).get("queued", 0),
+                "backlog": status.get("backlog_target"),
+                "open": (status.get("campaign") or {}).get("state") in ("dispatching", "draining"),
+            }
+
+        def read_all() -> dict[str, dict[str, Any]]:
+            news: dict[str, dict[str, Any]] = {}
+            for campaign_id, seen in since.items():
+                try:
+                    news[campaign_id] = read_one(campaign_id, seen)
+                except StoreUnavailable as exc:
+                    # One campaign the ledger cannot answer for must not cost
+                    # the others their news.
+                    logger.debug("no news for campaign %s: %s", campaign_id, exc)
+            return news
+
+        return await asyncio.to_thread(read_all)
+
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
         await gateway.start()
-        sessions.watch(session_runs, job_alerts)
+        sessions.watch(session_runs, job_alerts, campaign_news)
         try:
             yield
         finally:
@@ -572,6 +655,57 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
         body["busy"] = live.busy
         return body
 
+    @app.post("/api/sessions/{session_id}/stop")
+    async def stop_session_work(session_id: str) -> dict[str, Any]:
+        """Stop everything a conversation set going.
+
+        Its turn and its autonomy, its open campaigns with their sub-agents
+        and their runs, and the runs it started itself. Each has a control of
+        its own; this is the one for when something has gone wrong and the
+        point is to stop spending GPU hours before working out what.
+        """
+
+        from reinvent4_agent.campaign_client import StoreUnavailable
+        from reinvent4_agent.conducting import REGISTRY
+
+        live = _session_or_404(session_id)
+        live.cancel()
+        campaigns: list[str] = []
+        problems: list[str] = []
+        try:
+            listed = await asyncio.to_thread(_ledger().campaigns, session_id=session_id)
+        except StoreUnavailable as exc:
+            listed = []
+            problems.append(f"Could not read the campaigns: {exc}")
+        for campaign in listed:
+            if campaign.get("state") == "finalized":
+                continue
+            campaign_id = campaign["campaign_id"]
+            try:
+                await asyncio.to_thread(REGISTRY.wind_down, campaign_id)
+            except Exception as exc:
+                logger.exception("Could not stop campaign %s", campaign_id)
+                problems.append(f"Campaign {campaign_id}: {exc}")
+            else:
+                campaigns.append(campaign_id)
+        live.campaigns_open.difference_update(campaigns)
+
+        runs = await asyncio.to_thread(run_index.runs, [session_id], _data_roots())
+        active = [
+            job["id"] for job in runs.get(session_id, {}).get("jobs", [])
+            if job.get("launched") and job.get("state") in session_data.RunIndex.ACTIVE
+        ]
+        stopped: list[str] = []
+        for job_id in active:
+            try:
+                await gateway.call_tool("stop_optimization", {"job_id": job_id})
+            except Exception as exc:
+                logger.warning("Could not stop run %s: %s", job_id, exc)
+                problems.append(f"Run {job_id}: {exc}")
+            else:
+                stopped.append(job_id)
+        return {"campaigns": campaigns, "runs": stopped, "problems": problems}
+
     @app.post("/api/sessions/{session_id}/purge")
     async def purge_session(session_id: str, request: Request) -> dict[str, Any]:
         """Delete a conversation and the data picked from its data view.
@@ -650,14 +784,58 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
         ledger = _ledger()
 
         def read() -> dict[str, Any]:
+            from reinvent4_agent.campaign_client import StoreUnavailable
+
+            tasks = ledger.tasks(campaign_id)
+            try:
+                runners = task_runners(ledger, campaign_id)
+            except StoreUnavailable as exc:
+                # Who ran what labels the bubbles; the campaign is still
+                # worth showing without it.
+                logger.warning("Could not read who ran the tasks of %s: %s", campaign_id, exc)
+                runners = {}
+            for task in tasks:
+                task["ran_by"] = task.get("lease_owner") or runners.get(task.get("task_id"))
+            try:
+                metrics = ledger.metrics(campaign_id)
+            except StoreUnavailable as exc:
+                logger.warning("Could not read the metrics of %s: %s", campaign_id, exc)
+                metrics = None
             return {
                 "campaign": ledger.campaign(campaign_id),
-                "tasks": ledger.tasks(campaign_id),
+                "tasks": tasks,
                 "results": ledger.results(campaign_id),
                 "supervisors": ledger.supervisors(campaign_id).get("supervisors", []),
+                "metrics": metrics,
             }
 
         return await _from_ledger(f"campaign {campaign_id}", read)
+
+    @app.get("/api/fleet/campaigns/{campaign_id}/atlas")
+    async def fleet_atlas(campaign_id: str) -> dict[str, Any]:
+        """What the campaign knows: the branches and their current findings.
+
+        In one call for the same reason as the campaign itself: a finding
+        recorded between two reads would be counted in one and missing from
+        the other. Superseded findings are left out -- they are the record's
+        history, and the agents read them through their own tools.
+        """
+
+        ledger = _ledger()
+
+        def read() -> dict[str, Any]:
+            overview = ledger.atlas(campaign_id)
+            listed = ledger.findings(campaign_id, limit=FINDINGS_SHOWN)
+            findings = listed.get("findings", [])
+            return {
+                **overview,
+                "items": findings,
+                # The store caps a read; say so rather than let a branch look
+                # emptier than it is.
+                "truncated": len(findings) < overview.get("findings", 0),
+            }
+
+        return await _from_ledger(f"what campaign {campaign_id} knows", read)
 
     @app.get("/api/fleet/capacity")
     async def fleet_capacity() -> dict[str, Any]:
@@ -693,6 +871,47 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
             f"the history of campaign {campaign_id}",
             lambda: ledger.events(campaign_id),
         )
+
+    @app.get("/api/fleet/tasks/{task_id}/conversation")
+    async def fleet_task_conversation(task_id: str) -> dict[str, Any]:
+        """The conversation the sub-agent had while working on this task.
+
+        Read from the transcript it wrote into the shared log directory, which
+        is the only record of it: the ledger has the brief and the report and
+        nothing of what went on between them.
+        """
+
+        from reinvent4_agent.web.subagent_transcript import read_conversation, valid_task_id
+
+        if not valid_task_id(task_id):
+            raise HTTPException(status_code=422, detail="Not a task id")
+        if not settings.log_dir:
+            return {"task_id": task_id, "found": False, "events": [], "truncated": False, "queued": []}
+        return await asyncio.to_thread(read_conversation, Path(settings.log_dir).expanduser(), task_id)
+
+    @app.post("/api/fleet/tasks/{task_id}/messages", status_code=201)
+    async def fleet_task_message(task_id: str, request: Request) -> dict[str, Any]:
+        """Leave a message for the sub-agent working on this task.
+
+        It reads it after its current step, so an answer can take as long as
+        the tool call in flight; the conversation shows it queued till then.
+        """
+
+        from reinvent4_agent.task_inbox import post
+        from reinvent4_agent.web.subagent_transcript import valid_task_id
+
+        if not valid_task_id(task_id):
+            raise HTTPException(status_code=422, detail="Not a task id")
+        if not settings.log_dir:
+            raise HTTPException(status_code=503, detail="No shared log directory, so no way to reach the sub-agents")
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            raise HTTPException(status_code=422, detail="Nothing to send")
+        return await asyncio.to_thread(post, Path(settings.log_dir).expanduser(), task_id, text.strip())
 
     # -- direct tool calls and job files --------------------------------------
 
@@ -951,7 +1170,6 @@ async def _receive_loop(websocket: WebSocket, live: Any, takes_effort: Any = Non
         if effort and takes_effort is not None and not takes_effort():
             effort = None
         content = (message.get("content") or "").strip()
-        if content and not live.start_turn(content, effort=effort):
-            await websocket.send_json(
-                {"type": "notice", "message": "The agent is still working on the previous request."}
-            )
+        if content:
+            # Never refused: one sent mid-turn is read after the current step.
+            live.start_turn(content, effort=effort)

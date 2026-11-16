@@ -151,9 +151,9 @@ class BoltzConfig(BaseModel):
         description="Boltz2 REST endpoint URL",
     )
     recycling_steps: int = Field(
-        default=3,
+        default=2,
         ge=1,
-        description="Structure prediction recycling iterations",
+        description="Structure prediction recycling iterations (exploration default)",
     )
     diffusion_samples: int = Field(
         default=1,
@@ -161,9 +161,14 @@ class BoltzConfig(BaseModel):
         description="Number of diffusion samples per molecule",
     )
     sampling_steps_affinity: int = Field(
-        default=200,
+        default=50,
         ge=1,
-        description="Diffusion sampling steps for affinity prediction",
+        description="Diffusion sampling steps for affinity prediction (exploration default)",
+    )
+    diffusion_samples_affinity: int = Field(
+        default=1,
+        ge=1,
+        description="Number of affinity diffusion samples per molecule (exploration default)",
     )
     affinity_mode: Literal["pred_value", "probability_binary"] = Field(
         default="pred_value",

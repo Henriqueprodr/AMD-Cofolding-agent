@@ -33,9 +33,10 @@ scoring:
   boltz:
     enabled: true
     service_url: "http://boltz:8080/score"
-    recycling_steps: 3
+    recycling_steps: 2
     diffusion_samples: 1
-    sampling_steps_affinity: 200
+    sampling_steps_affinity: 50
+    diffusion_samples_affinity: 1
     # pred_value = log10(IC50/µM): MORE NEGATIVE = tighter = BETTER
     #   → use reverse_sigmoid(low=-2.0, high=0.0) in TTP transforms
     # probability_binary = P(IC50 < 1µM) ∈ [0,1]: higher = better

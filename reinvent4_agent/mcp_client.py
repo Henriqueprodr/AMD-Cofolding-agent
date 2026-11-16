@@ -98,6 +98,34 @@ class MCPClient:
             # fell back to the Compose hostname http://posebusters:8080 no
             # matter what the pod's environment said.
             "POSEBUSTERS_SERVICE_URL",
+            # The campaign ledger, and the registry the Slurm launcher writes
+            # the node-and-port of every service into. Without these the
+            # campaign tools reach for the in-cluster Service name, which
+            # resolves nowhere outside Kubernetes -- so start_campaign and
+            # every tool after it failed on Slurm with a DNS error.
+            "CAMPAIGN_STORE_URL",
+            # Who the atlas tools sign a finding with. Without it they fall
+            # back to the hostname, so every sub-agent on one node writes
+            # findings under the same name and the record cannot say which
+            # of them found what.
+            "SUPERVISOR_ID",
+            "BOLTZ_GATEWAY_STATS_URL",
+            "DD_SERVICE_REGISTRY",
+            # How the pool is sized. conduct_campaign runs the conducting loop
+            # in here, so these decide which scaler it picks; without them it
+            # finds no relay directory and no scheduler, settles for the null
+            # scaler, and holds a pool of zero while tasks sit queued -- the
+            # campaign looks alive and nothing ever claims a task.
+            "SUPERVISOR_POOL_CONTROL",
+            "SUPERVISOR_JOB_NAME",
+            "SUPERVISOR_SBATCH",
+            "SUPERVISOR_DEPLOYMENT",
+            "SUPERVISOR_CPUS",
+            "SUPERVISOR_MEM_GB",
+            "SUPERVISOR_MAX",
+            "POD_NAMESPACE",
+            "SLURM_ACCOUNT",
+            "SLURM_PARTITION",
             # GPU access for the MCP server + the RL worker it spawns. Under
             # Apptainer --nv/--rocm, LD_LIBRARY_PATH points at the injected
             # driver libs (libcuda.so, ...); dropping it makes torch report

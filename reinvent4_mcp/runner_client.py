@@ -150,6 +150,14 @@ class RemoteJobManager:
     def create_and_start_tl(self, **kwargs: Any) -> dict[str, Any]:
         return _request("POST", "/tl-jobs", json_body=kwargs)
 
+    def submit_toml(self, toml_str: str, **kwargs: Any) -> dict[str, Any]:
+        """Submit a pre-built generation TOML.
+
+        Positional in the local manager, so it is named here rather than
+        passed through ``**kwargs``: every caller passes it positionally.
+        """
+        return _request("POST", "/toml-jobs", json_body={"toml_str": toml_str, **kwargs})
+
     def get_status(self, job_id: str) -> dict[str, Any]:
         return _request("GET", f"/jobs/{quote(job_id, safe='')}")
 

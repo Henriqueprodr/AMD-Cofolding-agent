@@ -11,9 +11,38 @@ expects for ``staged_learning`` runs.
 from __future__ import annotations
 
 import logging
+from difflib import get_close_matches
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _known_component_names() -> frozenset[str]:
+    """Component names REINVENT4 has a class for; empty when it cannot say.
+
+    Empty means "unknown", not "none": this module also renders where
+    REINVENT4 is not installed, because the runner relays a TOML built
+    elsewhere. Refusing there would reject every component rather than the
+    misspelled one.
+    """
+
+    try:
+        from reinvent4_mcp.utils import ensure_reinvent4_importable  # noqa: PLC0415
+
+        ensure_reinvent4_importable()
+        from reinvent.scoring.importer import get_registry  # noqa: PLC0415
+
+        return frozenset(get_registry().keys())
+    except Exception:
+        logger.debug(
+            "REINVENT4 scoring registry unavailable; component names go "
+            "through unchecked",
+            exc_info=True,
+        )
+        return frozenset()
 
 
 def generate_reinvent_toml(
@@ -205,14 +234,56 @@ def _emit_stage(
     lines.append(f'type = "{scorer_config["type"]}"')
 
     components = scorer_config.get("component", [])
-    # REINVENT4 v4.x requires at least one scoring component.
-    # Fall back to QED when no objectives are defined.
+    # REINVENT4 v4.x requires at least one scoring component, so a config that
+    # mapped to none still has to produce a runnable TOML. Say so in the log
+    # and in the file: a run whose objectives all failed to map is otherwise
+    # indistinguishable from a healthy one for the hours it spends optimising
+    # drug-likeness alone, and the TOML on disk is the only record of which
+    # it was.
     if not components:
+        logger.warning(
+            "No scoring components in the scorer config; falling back to QED "
+            "alone. Nothing this run was meant to optimise is being scored."
+        )
+        lines.append(
+            "# WARNING: no scoring components were mapped; QED alone is scored."
+        )
         components = [{"QED": {"endpoint": [{"name": "QED score", "weight": 1.0}]}}]
 
     for comp_dict in components:
         lines.append("")
         _emit_component(lines, comp_dict)
+
+
+def _check_component_name(name: str) -> None:
+    """Refuse a component REINVENT4 has no class for.
+
+    The name becomes a TOML table name verbatim, so a misspelling used to
+    travel all the way to the GPU node and fail inside REINVENT4 minutes
+    later, where the agent meets it as a dead run in a log file rather than
+    as an answer to the call it just made.
+    """
+
+    known = _known_component_names()
+    if not known:
+        return
+
+    # REINVENT4 keys its registry on ``component.__name__.lower()`` and looks
+    # a TOML table name up the same way, so case carries no meaning to it:
+    # the mapper's ExternalRESTScorer is the registry's externalrestscorer.
+    folded = {candidate.lower(): candidate for candidate in known}
+    if name.lower() in folded:
+        return
+
+    near = [
+        folded[match]
+        for match in get_close_matches(name.lower(), sorted(folded), n=3, cutoff=0.6)
+    ]
+    raise ValueError(
+        f"Unknown scoring component '{name}'."
+        + (f" Closest known: {', '.join(near)}." if near else "")
+        + " Call list_scoring_components for the ones this build has."
+    )
 
 
 def _emit_component(lines: list[str], comp_dict: dict[str, Any]) -> None:
@@ -223,18 +294,28 @@ def _emit_component(lines: list[str], comp_dict: dict[str, Any]) -> None:
     """
 
     for comp_type, comp_body in comp_dict.items():
+        _check_component_name(comp_type)
         endpoints = comp_body.get("endpoint", [])
         lines.append("[[stage.scoring.component]]")
         lines.append(f"[stage.scoring.component.{comp_type}]")
 
         for endpoint in endpoints:
             lines.append(f"[[stage.scoring.component.{comp_type}.endpoint]]")
-            _emit_endpoint_fields(lines, endpoint)
+            _emit_endpoint_fields(lines, endpoint, comp_type)
 
 
-def _emit_endpoint_fields(lines: list[str], endpoint: dict[str, Any]) -> None:
+#: Components whose ``smarts`` is one pattern per endpoint, unlike the
+#: alert filters' list. REINVENT4's ``GroupCount.Parameters.smarts`` is
+#: ``List[str]`` once the endpoints are collected, so a one-item list here
+#: becomes ``[["..."]]`` and fails "Input should be a valid string" at
+#: ``Scorer`` construction, seconds into the job.
+_ONE_SMARTS_PER_ENDPOINT = frozenset({"groupcount"})
+
+
+def _emit_endpoint_fields(lines: list[str], endpoint: dict[str, Any], comp_type: str = "") -> None:
     """Emit key-value pairs for one endpoint, handling nested dicts."""
 
+    one_smarts = comp_type.lower().replace("_", "") in _ONE_SMARTS_PER_ENDPOINT
     for key, val in endpoint.items():
         if key == "transform" and isinstance(val, dict):
             for tkey, tval in val.items():
@@ -260,6 +341,8 @@ def _emit_endpoint_fields(lines: list[str], endpoint: dict[str, Any]) -> None:
                         and len(pval) == 1
                         and not isinstance(pval[0], (list, dict))
                     ):
+                        pval = pval[0]
+                    elif one_smarts and pkey == "smarts" and isinstance(pval, list) and len(pval) == 1:
                         pval = pval[0]
                     lines.append(f"params.{pkey} = {_toml_value(pval)}")
         else:
@@ -448,6 +531,16 @@ def resolve_model_path(model: str) -> str:
 
     if model in prior_registry:
         resolved = str(prior_registry[model])
+        # The registry names every prior REINVENT4 knows, not the ones this
+        # image downloaded. Passed on regardless, a missing one surfaced only
+        # as the run itself dying at start with "model file ... not found",
+        # long after the agent had moved on.
+        if not Path(resolved).is_file():
+            present = sorted(key for key, path in prior_registry.items() if Path(path).is_file())
+            raise ValueError(
+                f"The prior for '{model}' is not installed here ({resolved} is missing). "
+                f"Installed: {', '.join(present) or 'none'}. Pick one of those instead."
+            )
         logger.info("Resolved model key '%s' to '%s'", model, resolved)
         return resolved
 

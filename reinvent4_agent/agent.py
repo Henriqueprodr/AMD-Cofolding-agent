@@ -18,17 +18,77 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 from reinvent4_agent.backends import ChatResult, LLMBackend, ToolResult
 from reinvent4_agent.mcp_client import MCPClient
 
 logger = logging.getLogger(__name__)
 
-MAX_TOOL_ROUNDS = 200
+
+def _env_int(name: str, default: int) -> int:
+    """A positive integer from the environment, or ``default``."""
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+#: Tool calls one turn may make before the agent gives up on it.  High
+#: because a supervisor works a task for hours and a conductor runs a
+#: campaign across a whole budget; what bounds a turn in practice is the
+#: autonomy budget and the context, not this.
+MAX_TOOL_ROUNDS = _env_int("REINVENT4_AGENT_MAX_TOOL_ROUNDS", 2000)
+
+#: Characters of one tool result the model is given.  Results are the
+#: largest thing in a conversation and the easiest to overrun a context
+#: with -- a campaign's files, every result of a run -- and one that does
+#: not fit takes the whole turn down with it.  The head and the tail are
+#: kept, since a table's shape is at the top and its summary at the end.
+MAX_TOOL_RESULT_CHARS = _env_int("REINVENT4_AGENT_MAX_TOOL_RESULT_CHARS", 60_000)
+
+#: Characters of each tool result kept in the transcript, so whoever reads
+#: it later can see what came back -- above all, why a call failed.
+TOOL_EXCERPT_CHARS = 400
+
+#: Identical calls in a row, answered with the same error, after which the
+#: model is told that sending it again will not help, and after which the
+#: turn is ended. A model that resends a failing call unchanged rarely
+#: changes it later, and meanwhile it holds a task's lease and a share of
+#: the LLM every other agent is waiting on.
+REPEAT_WARN = _env_int("REINVENT4_AGENT_REPEAT_WARN", 3)
+REPEAT_LIMIT = _env_int("REINVENT4_AGENT_REPEAT_LIMIT", 6)
+
+
+class RepeatedToolCall(RuntimeError):
+    """The model kept sending the same failing call."""
+
+
+_ERROR_KEYS = frozenset({"error", "hint", "detail", "details"})
+
+
+def _reported_error(text: str) -> str | None:
+    """The error a tool put in its answer instead of failing the call.
+
+    Most tools here catch their own exceptions and answer ``{"error": ...}``,
+    so the call succeeds and only its content says it did not work. An
+    answer that carries an error next to other fields -- a failed run's
+    status -- is information about something else, not a failed call.
+    """
+    if not text.lstrip().startswith("{"):
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    if isinstance(data, dict) and data.get("error") and set(data) <= _ERROR_KEYS:
+        return str(data["error"])
+    return None
 
 
 @runtime_checkable
@@ -93,6 +153,16 @@ class Agent:
         #: whoever owns the agent, and therefore not subject to
         #: ``allowed_tools``, which filters the catalog the agent was handed.
         self.local_tools: dict[str, tuple[dict[str, Any], Any]] = {}
+        #: Tools refused for now, as ``name -> what to do instead``. Unlike
+        #: ``allowed_tools``, which is settled when the agent is built, this
+        #: turns with the conversation: what the agent should do itself
+        #: depends on whether it has sub-agents to do it instead.
+        self.withheld: dict[str, str] = {}
+        #: Messages that arrive while the agent works, as a callable returning
+        #: what has come in since it was last called. Read after each round of
+        #: tool results, the one point in a turn where the conversation can
+        #: take a user message without breaking a tool call's pairing.
+        self.inbox: Callable[[], list[str]] | None = None
         self._transcript_path = _init_transcript(log_dir, name)
         self._turn = 0
         self._events: AgentEventHandler = event_handler or _NullEventHandler()
@@ -103,6 +173,12 @@ class Agent:
         self._seen_alerts: set[tuple[str, str]] = set()
         self.total_input_tokens = 0
         self.total_output_tokens = 0
+        #: Input tokens of the last completion: the size of the conversation
+        #: as the model last saw it.
+        self.context_tokens = 0
+        self._last_call: tuple[str, str, str] | None = None
+        self._repeats = 0
+        self._stuck: str | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -119,6 +195,7 @@ class Agent:
         tools = await self.mcp.list_tools()
         if self._allowed_tools is not None:
             tools = [t for t in tools if t["name"] in self._allowed_tools]
+        tools = [t for t in tools if t["name"] not in self.withheld]
         # Local tools last and by name, so installing one over an MCP tool
         # replaces it in the catalog rather than offering the model two tools
         # with the same name and letting the backend pick.
@@ -127,6 +204,8 @@ class Agent:
 
     def _tool_allowed(self, name: str) -> bool:
         """Whether this agent may execute the canonical tool ``name``."""
+        if name in self.withheld:
+            return False
         return self._allowed_tools is None or name in self._allowed_tools
 
     async def chat(self, user_message: str) -> str:
@@ -141,6 +220,7 @@ class Agent:
 
         self.backend.add_user_message(user_message)
         tools = await self._scoped_tools()
+        self._last_call, self._repeats, self._stuck = None, 0, None
 
         for round_idx in range(MAX_TOOL_ROUNDS):
             t0 = time.monotonic()
@@ -152,6 +232,12 @@ class Agent:
 
             self.total_input_tokens += result.input_tokens
             self.total_output_tokens += result.output_tokens
+            # What the next request would carry, not what this turn cost:
+            # the input of one completion is the whole conversation so far,
+            # which is what tells a caller the context is filling up. Without
+            # it the gateway's compaction never fired and turns kept growing
+            # until the model refused one outright.
+            self.context_tokens = result.input_tokens
 
             logger.info(
                 "Turn %d round %d — LLM responded in %.2fs "
@@ -206,6 +292,12 @@ class Agent:
                             is_error=True,
                         ))
                 self.backend.add_tool_results(tool_results)
+            if self._stuck is not None:
+                logger.warning("Turn %d — stuck: %s", self._turn, self._stuck)
+                self._write_event("stuck", {"content": self._stuck, "round": round_idx})
+                raise RepeatedToolCall(self._stuck)
+            if self.inbox is not None:
+                self.interject(self.inbox())
 
         msg = (
             "I've reached the maximum number of tool-call rounds. "
@@ -214,6 +306,18 @@ class Agent:
         logger.warning("Turn %d — max tool rounds reached", self._turn)
         self._write_event("max_rounds", {"turn": self._turn})
         return msg
+
+    def interject(self, texts: list[str]) -> None:
+        """Add messages to the conversation without starting a turn of their own.
+
+        Marked in the transcript, so a reader can tell a message that came
+        in mid-turn from the one the turn answers.
+        """
+
+        for text in texts:
+            logger.info("Turn %d — interjected: %s", self._turn, text[:200])
+            self._write_event("user_message", {"content": text, "interjected": True})
+            self.backend.add_user_message(text)
 
     async def _call_local(
         self, tc: Any, handler: Any, round_idx: int, t0: float
@@ -239,13 +343,45 @@ class Agent:
         self._write_event("tool_result", {
             "name": tc.name,
             "content_length": len(content),
+            "excerpt": content[:TOOL_EXCERPT_CHARS],
             "elapsed_s": round(elapsed, 3),
             "is_error": is_error,
             "round": round_idx,
             "local": True,
         })
         self._events.on_tool_result(tc.name, content, is_error=is_error)
-        return ToolResult(tool_call_id=tc.id, content=content, is_error=is_error)
+        return ToolResult(
+            tool_call_id=tc.id,
+            content=self._for_the_model(tc.name, content)
+            + self._repeated(tc, content, is_error),
+            is_error=is_error,
+        )
+
+    def _repeated(self, tc: Any, text: str, is_error: bool) -> str:
+        """What to add to a result the model has already had, unchanged.
+
+        Counts calls that match the one before in name, arguments and
+        answer. Only failures count: polling a run returns the same answer
+        many times while it is queued, and that is not a loop.
+        """
+        key = (tc.name, json.dumps(tc.arguments, sort_keys=True, default=str), text)
+        if key == self._last_call:
+            self._repeats += 1
+        else:
+            self._last_call, self._repeats = key, 1
+        if not is_error or self._repeats < REPEAT_WARN:
+            return ""
+        if self._repeats >= REPEAT_LIMIT:
+            self._stuck = (
+                f"{tc.name} was sent {self._repeats} times in a row with the same "
+                f"arguments and failed the same way each time: {text[:TOOL_EXCERPT_CHARS]}"
+            )
+        return (
+            f"\n\n[You have now sent this exact {tc.name} call {self._repeats} "
+            "times in a row and had this same error each time. Sending it "
+            "again will not change the answer: change the arguments to fix "
+            "what the error names, or take another approach.]"
+        )
 
     async def _handle_tool_calls(
         self, result: ChatResult, round_idx: int
@@ -290,9 +426,10 @@ class Agent:
                         t["name"] for t in await self._scoped_tools()
                     )
                     if denied is not None:
+                        instead = self.withheld.get(denied, "")
                         result_text = (
                             f"Tool '{denied}' is not available to this "
-                            f"agent. Available tools: {known}."
+                            f"agent. {instead} Available tools: {known}."
                         )
                     else:
                         result_text = (
@@ -311,6 +448,7 @@ class Agent:
                     self._write_event("tool_result", {
                         "name": tc.name,
                         "content_length": len(result_text),
+                        "excerpt": result_text[:TOOL_EXCERPT_CHARS],
                         "elapsed_s": round(elapsed, 3),
                         "is_error": True,
                         "round": round_idx,
@@ -320,7 +458,7 @@ class Agent:
                     )
                     results.append(ToolResult(
                         tool_call_id=tc.id,
-                        content=result_text,
+                        content=result_text + self._repeated(tc, result_text, True),
                         is_error=True,
                     ))
                     continue
@@ -343,19 +481,27 @@ class Agent:
                     len(result_text),
                     elapsed,
                 )
-                self._write_event("tool_result", {
+                reported = _reported_error(result_text)
+                failed = reported is not None
+                event = {
                     "name": tc.name,
                     "content_length": len(result_text),
+                    "excerpt": result_text[:TOOL_EXCERPT_CHARS],
                     "elapsed_s": round(elapsed, 3),
-                    "is_error": False,
+                    "is_error": failed,
                     "round": round_idx,
-                })
+                }
+                if failed:
+                    event["error"] = reported
+                self._write_event("tool_result", event)
 
-                self._events.on_tool_result(tc.name, result_text, is_error=False)
+                self._events.on_tool_result(tc.name, result_text, is_error=failed)
 
                 results.append(ToolResult(
                     tool_call_id=tc.id,
-                    content=result_text,
+                    content=self._for_the_model(tc.name, result_text)
+                    + self._repeated(tc, result_text, failed),
+                    is_error=failed,
                 ))
             except Exception as exc:
                 elapsed = time.monotonic() - t0
@@ -379,13 +525,42 @@ class Agent:
                 self._events.on_tool_result(tc.name, error_msg, is_error=True)
                 results.append(ToolResult(
                     tool_call_id=tc.id,
-                    content=error_msg,
+                    content=error_msg + self._repeated(tc, error_msg, True),
                     is_error=True,
                 ))
             finally:
                 self._tool_in_flight = False
 
         return results
+
+    def _for_the_model(self, name: str, result: str) -> str:
+        """A tool result as the conversation keeps it.
+
+        The browser and the transcript are given the whole thing; only
+        what the model re-reads on every later round is bounded.
+        """
+        if len(result) <= MAX_TOOL_RESULT_CHARS:
+            return result
+        head = MAX_TOOL_RESULT_CHARS * 2 // 3
+        tail = MAX_TOOL_RESULT_CHARS - head
+        cut = len(result) - MAX_TOOL_RESULT_CHARS
+        logger.warning(
+            "Turn %d — %s returned %d chars; keeping %d for the conversation",
+            self._turn, name, len(result), MAX_TOOL_RESULT_CHARS,
+        )
+        return (
+            result[:head]
+            + f"\n\n[... {cut:,} characters cut from the middle of this "
+            f"{name} result to keep the conversation inside the model's "
+            "context. Ask again for the part you need: a narrower query, "
+            "fewer molecules, or one record at a time.]\n\n"
+            + result[-tail:]
+        )
+
+    @property
+    def context_window(self) -> int | None:
+        """Tokens the endpoint accepts in one request, when it says."""
+        return self.backend.context_window
 
     def reset_history(self) -> None:
         """Clear conversation history to start a fresh session."""

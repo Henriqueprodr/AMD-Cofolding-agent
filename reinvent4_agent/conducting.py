@@ -173,6 +173,7 @@ class ConductingRegistry:
         max_steps: Optional[int] = None,
         tick_seconds: Optional[float] = None,
         proposer: Optional[Any] = None,
+        propose: bool = True,
     ) -> ConductingStatus:
         """Begin conducting, or return the status of the loop already doing it.
 
@@ -191,6 +192,7 @@ class ConductingRegistry:
                 "task_budget_hours": task_budget_hours,
                 "max_steps": max_steps,
                 "tick_seconds": tick_seconds,
+                "propose": propose,
             }
             conductor = CampaignConductor(
                 store or CampaignStoreClient(),
@@ -200,6 +202,7 @@ class ConductingRegistry:
                 # model, which is the point: the campaign is directed by the
                 # same model the human is talking to.
                 proposer=proposer,
+                propose=propose,
                 task_budget_seconds=(
                     task_budget_hours * 3600 if task_budget_hours else None
                 ),
@@ -227,6 +230,29 @@ class ConductingRegistry:
             )
         loop.stop(reason)
         return loop.status()
+
+    def wind_down(
+        self,
+        campaign_id: str,
+        *,
+        store: Optional[CampaignStoreClient] = None,
+        scaler: Optional[PoolScaler] = None,
+    ) -> None:
+        """Stop conducting and end the campaign itself: queued tasks are
+        abandoned, the runs of the claimed ones stopped, the pool sent home.
+
+        Unlike ``stop``, which leaves the campaign open for the conversation
+        to take up again. Works whether or not this process was conducting it,
+        which after a restart it no longer is.
+        """
+
+        self.stop(campaign_id, "stopped by the user")
+        CampaignConductor(
+            store or CampaignStoreClient(),
+            campaign_id,
+            scaler=scaler or make_pool_scaler(),
+            propose=False,
+        ).stop()
 
     def status(self, campaign_id: Optional[str] = None) -> list[ConductingStatus]:
         with self._lock:

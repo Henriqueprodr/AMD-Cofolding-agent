@@ -61,6 +61,9 @@ REVIEWER_READ_ONLY_TOOLS: frozenset[str] = frozenset(
         # Target and compound evidence
         "fetch_target_info",
         "fetch_compound",
+        "fetch_compound_by_cid",
+        "lookup_compound_by_structure",
+        "check_compound_is_known",
         "fetch_uniprot_features",
         "fetch_interpro_annotations",
         "fetch_nucleic_annotation",
@@ -68,6 +71,8 @@ REVIEWER_READ_ONLY_TOOLS: frozenset[str] = frozenset(
         "rcsb_search",
         "rcsb_count",
         "rcsb_get_entries",
+        "rcsb_get_chem_comps",
+        "rcsb_get_pubmed",
         "rcsb_fetch_files",
         # ChEMBL
         "search_chembl_molecules",
@@ -82,6 +87,21 @@ REVIEWER_READ_ONLY_TOOLS: frozenset[str] = frozenset(
         "get_chembl_documents",
         "search_chembl_similarity",
         "search_chembl_substructure",
+        # Series analysis
+        "derive_scaffold_from_series",
+        "decompose_series_r_groups",
+        "find_matched_molecular_pairs",
+        "cluster_molecules_by_similarity",
+        # Pipeline inspection (dry_run only; executing the pipeline is Driver work)
+        "run_ttp_pipeline",
+        # Biology beyond ChEMBL
+        "fetch_target_genetic_evidence",
+        "fetch_target_expression",
+        "fetch_pathway_annotations",
+        "fetch_target_orthology",
+        # Patent / freedom-to-operate
+        "search_patents_by_structure",
+        "search_patents_by_target",
         # Structure and interaction inspection
         "validate_structure",
         "extract_ligand_sdf",

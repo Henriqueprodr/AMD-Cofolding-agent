@@ -90,6 +90,28 @@ def _env_float(name: str, default: float) -> float:
     return value
 
 
+#: ``service=http://host:port`` pairs, comma-separated, that replace the host
+#: of a service's URL from the TOML. Set by a run that brings its own scorer
+#: -- a Slurm run with a private Boltz on its second GPU -- so the TOML written
+#: for the shared service needs no rewriting.
+URL_OVERRIDES_ENV = "SCORER_URL_OVERRIDES"
+
+
+def override_service_url(service: str, url: str) -> str:
+    """`url` with its scheme and host replaced when `service` is overridden."""
+
+    from urllib.parse import urlsplit, urlunsplit
+
+    for pair in (os.getenv(URL_OVERRIDES_ENV) or "").split(","):
+        name, _, base = pair.strip().partition("=")
+        if name.strip() != service or not base.strip():
+            continue
+        target, original = urlsplit(base.strip()), urlsplit(url)
+        return urlunsplit((target.scheme or original.scheme, target.netloc,
+                           original.path, original.query, original.fragment))
+    return url
+
+
 def _log_call(record: dict[str, Any]) -> None:
     """Append a JSON record to the external scoring log file."""
     try:
@@ -149,8 +171,8 @@ class ExternalRESTScorer:
     _artifact_registry: dict[str, dict] = {}
 
     def __init__(self, params: Parameters):
-        self.service_url = params.service_url[0]
         self.service = params.service[0]
+        self.service_url = override_service_url(self.service, params.service_url[0])
 
         timeout_list = getattr(params, "timeout", None)
         configured = (

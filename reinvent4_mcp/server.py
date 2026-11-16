@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from typing import Any, Annotated
+from typing import Any, Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
@@ -264,6 +264,59 @@ def profile_interactions(
 
 
 # ---------------------------------------------------------------------------
+# Tool: ingest_fragment_activities
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def ingest_fragment_activities(
+    path: Annotated[
+        str,
+        Field(
+            description=(
+                "Shared-volume path to a CSV of measured activities, one row "
+                "per compound."
+            ),
+        ),
+    ],
+    smiles_col: Annotated[
+        str,
+        Field(default="std_smiles", description="Column holding the SMILES."),
+    ] = "std_smiles",
+    value_col: Annotated[
+        str,
+        Field(default="activity_value", description="Column holding the numeric value."),
+    ] = "activity_value",
+    unit_col: Annotated[
+        str,
+        Field(default="activity_unit", description="Column holding the unit, e.g. 'nM'."),
+    ] = "activity_unit",
+    type_col: Annotated[
+        str,
+        Field(default="activity_type", description="Column holding the type, e.g. 'IC50'."),
+    ] = "activity_type",
+    id_col: Annotated[
+        str,
+        Field(default="compound_id", description="Column holding the compound id."),
+    ] = "compound_id",
+) -> str:
+    """Read measured activities from a CSV into the shape ``potency`` expects.
+
+    Returns ``{n_loaded, n_no_value, activities}``, where ``activities`` is
+    keyed by canonical SMILES and can be handed straight to
+    ``profile_complex_interaction(potency=...)`` so ligand efficiency is
+    computed against real numbers rather than left empty.
+    """
+
+    from reinvent4_mcp.tools.external import ingest_fragment_activities as _impl
+
+    return json.dumps(
+        _impl(path, smiles_col, value_col, unit_col, type_col, id_col),
+        indent=2,
+        default=_json_default,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool: score_molecules
 # ---------------------------------------------------------------------------
 
@@ -375,6 +428,8 @@ def create_ttp(
                 "  pre_scoring (object, optional): fast drug-likeness descriptors\n"
                 "  target (object, optional): protein info for Boltz scoring\n"
                 "  constraints (list, optional): structural filters\n"
+                "  generation (object, optional): which algorithm builds the\n"
+                "    molecules; omit for a plain de novo run\n"
                 "\n"
                 "IMPORTANT: 'name' must be unique across ALL pre_scoring\n"
                 "components and scoring objectives combined.\n"
@@ -392,10 +447,22 @@ def create_ttp(
                 "  Native objectives require 'component' (REINVENT4 class name).\n"
                 "  Native objectives may include 'params' (dict) for component-\n"
                 "  specific settings (e.g. reference SMILES for TanimotoSimilarity).\n"
-                "  External objectives require 'service' and 'service_url'.\n"
+                "  External objectives require 'service'; 'service_url' only for\n"
+                "  a service not listed by list_external_services.\n"
                 "\n"
                 "constraints structure (list of objects):\n"
                 "  [{type: 'custom_alerts', smarts: ['[pattern]', ...]}, ...]\n"
+                "\n"
+                "generation structure:\n"
+                "  {mode: 'reinvent'|'libinvent'|'linkinvent'|'mol2mol',\n"
+                "   model?, batch_size?, n_steps?, seed?, device?,\n"
+                "   libinvent_input?: {scaffold, decoration_positions?},\n"
+                "   linkinvent_input?: {fragments, min_linker_length?,\n"
+                "                       max_linker_length?},\n"
+                "   mol2mol_input?: {seed_smiles}}\n"
+                "  Each attachment point needs a map number -- [*:1], not [*].\n"
+                "  A libinvent or linkinvent profile is started with\n"
+                "  run_generation_campaign; run_optimization cannot build it.\n"
                 "\n"
                 "transform structure (on any component/objective):\n"
                 "  {type: 'sigmoid'|'reverse_sigmoid'|'double_sigmoid'|'step'|\n"
@@ -1241,14 +1308,224 @@ def fetch_compound(
     NEVER recall a SMILES from memory - hallucinated SMILES are frequently
     invalid (RDKit cannot parse or 3D-embed them) and break cofolding. Returns
     the isomeric ``smiles`` (use it directly for score_molecules /
-    profile_interactions), plus CID, formula, and IUPAC name. On failure it
-    returns an error and does not fabricate a structure - ask the user to paste
-    the SMILES.
+    profile_interactions), plus CID, formula, IUPAC name and InChIKey. On
+    failure it returns an error and does not fabricate a structure - ask the
+    user to paste the SMILES.
+
+    When a name matches several compounds - salts, stereoisomers, mixtures -
+    the result carries ``matches``, ``other_cids`` and ``ambiguous``. The
+    first is returned, so check it is the one meant and call
+    ``fetch_compound_by_cid`` if it is not.
     """
 
     from reinvent4_mcp.tools.pubchem import fetch_compound as _impl
 
     return json.dumps(_impl(name), indent=2, default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# Tool: fetch_compound_by_cid
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def fetch_compound_by_cid(
+    cid: Annotated[
+        int,
+        Field(description="PubChem CID, which names exactly one structure."),
+    ],
+) -> str:
+    """Fetch one PubChem compound by CID.
+
+    This is how to resolve the ambiguity ``fetch_compound`` reports: a name
+    may match a dozen compounds, a CID matches one. Returns the same fields.
+    """
+
+    from reinvent4_mcp.tools.pubchem import fetch_compound_by_cid as _impl
+
+    return json.dumps(_impl(cid), indent=2, default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# Tool: lookup_compound_by_structure
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def lookup_compound_by_structure(
+    smiles: Annotated[
+        str,
+        Field(description="SMILES to look up in PubChem by structure."),
+    ],
+) -> str:
+    """Find out whether PubChem already knows a structure.
+
+    Matches on the structure rather than the string, so a generated SMILES
+    finds the registered compound it is the same molecule as - which is how a
+    design reported as new is caught being a known compound. For a verdict
+    across PubChem *and* ChEMBL at once, use ``check_compound_is_known``.
+    """
+
+    from reinvent4_mcp.tools.pubchem import fetch_compound_by_smiles as _impl
+
+    return json.dumps(_impl(smiles), indent=2, default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# Tool: run_ttp_pipeline
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def run_ttp_pipeline(
+    ttp_id: Annotated[
+        str,
+        Field(description="ID of a TTP that has a 'pipeline' section."),
+    ],
+    dry_run: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "If true, return the resolved execution plan without calling "
+                "any tool. Use to preview what the pipeline would do."
+            ),
+        ),
+    ] = False,
+) -> str:
+    """Execute the preparation pipeline attached to a TTP.
+
+    A pipeline is an ordered list of tool calls stored on the TTP. Each step
+    names an MCP tool, its params, and which earlier steps it depends on.
+    ``run_ttp_pipeline`` walks the topological order, calls each tool, stores
+    its result under the step's ``store_as`` key, and interpolates
+    ``${key}`` / ``${key.field}`` references in later steps' params before
+    calling them.
+
+    When a step returns an error and its ``condition`` is ``if_no_error``
+    (the default), dependent steps are skipped and the error is surfaced. Use
+    ``condition: always`` for cleanup or logging steps that must run
+    regardless.
+
+    Typical use: a structure-based campaign whose TTP pipeline holds the
+    preparation steps (fetch target → prepare structure → characterize site →
+    derive scaffold → ...). Opening the same TTP in a fresh session replays
+    those steps with the same params rather than re-deriving the sequence.
+
+    Call ``get_ttp`` to see the pipeline before running it.
+    Use ``dry_run=true`` to preview the execution order and resolved params.
+    """
+
+    import re as _re  # noqa: PLC0415
+    from reinvent4_mcp.tools.ttp import get_ttp as _get_ttp  # noqa: PLC0415
+
+    raw = _get_ttp(ttp_id)
+    if "error" in raw:
+        return json.dumps(raw, indent=2)
+
+    ttp_data = raw.get("ttp", raw)
+    pipeline = ttp_data.get("pipeline")
+    if not pipeline:
+        return json.dumps({
+            "error": f"TTP '{ttp_id}' has no pipeline section.",
+            "hint": "Add a 'pipeline' field when creating or updating the TTP.",
+        }, indent=2)
+
+    from reinvent4_mcp.ttp.schema import PipelineSection  # noqa: PLC0415
+
+    pipe = PipelineSection(**pipeline)
+    steps = pipe.topological_order()
+
+    if dry_run:
+        return json.dumps({
+            "ttp_id": ttp_id,
+            "dry_run": True,
+            "steps": [
+                {"id": s.id, "tool": s.tool, "depends_on": s.depends_on,
+                 "store_as": s.store_as or s.id, "params": s.params,
+                 "condition": s.condition}
+                for s in steps
+            ],
+        }, indent=2)
+
+    def _interpolate(value: Any, ctx: dict[str, Any]) -> Any:
+        """Replace '${key}' or '${key.field}' in string values."""
+        if isinstance(value, str):
+            # Full-match replacement so a param can be a non-string result.
+            full = _re.fullmatch(r"\$\{([^}]+)\}", value)
+            if full:
+                ref = full.group(1)
+                parts = ref.split(".", 1)
+                base = ctx.get(parts[0])
+                if base is None:
+                    return value
+                if len(parts) == 2 and isinstance(base, dict):
+                    return base.get(parts[1], value)
+                return base
+            # Inline replacement — always a string result.
+            def _sub(m: Any) -> str:
+                ref = m.group(1)
+                parts = ref.split(".", 1)
+                base = ctx.get(parts[0])
+                if base is None:
+                    return m.group(0)
+                if len(parts) == 2 and isinstance(base, dict):
+                    return str(base.get(parts[1], m.group(0)))
+                return str(base)
+            return _re.sub(r"\$\{([^}]+)\}", _sub, value)
+        if isinstance(value, dict):
+            return {k: _interpolate(v, ctx) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_interpolate(v, ctx) for v in value]
+        return value
+
+    from reinvent4_mcp.registry import TOOL_IMPLS  # noqa: PLC0415
+
+    context: dict[str, Any] = {}
+    results: list[dict[str, Any]] = []
+
+    for step in steps:
+        store_key = step.store_as or step.id
+
+        # Skip if any dependency errored and condition requires success.
+        if step.condition == "if_no_error":
+            dep_errors = [d for d in step.depends_on if isinstance(context.get(d), dict) and "error" in context.get(d, {})]
+            if dep_errors:
+                result = {"skipped": True, "reason": f"dependency error in: {dep_errors}"}
+                context[store_key] = result
+                results.append({"step": step.id, "store_as": store_key, "result": result})
+                continue
+
+        resolved_params = _interpolate(step.params, context)
+        step_result: Any = {"error": f"Tool '{step.tool}' is not a tool of this MCP server."}
+
+        # Both halves of the tool surface: the extension tools, which are
+        # closures and so reachable only through the registry that recorded
+        # them, and this module's own, which are module-level functions.
+        # Checked in that order because the extensions are the larger half
+        # and the half a pipeline is most likely to chain.
+        fn = TOOL_IMPLS.get(step.tool) or globals().get(step.tool)
+        if fn is not None and callable(fn):
+            try:
+                raw_result = fn(**resolved_params)
+                # Tools return JSON strings; parse so context values are dicts.
+                if isinstance(raw_result, str):
+                    try:
+                        step_result = json.loads(raw_result)
+                    except json.JSONDecodeError:
+                        step_result = {"text": raw_result}
+                else:
+                    step_result = raw_result
+            except Exception as exc:  # noqa: BLE001
+                step_result = {"error": str(exc)}
+
+        context[store_key] = step_result
+        results.append({"step": step.id, "tool": step.tool, "store_as": store_key, "result": step_result})
+
+    errors = [r for r in results if isinstance(r.get("result"), dict) and "error" in r["result"] and not r["result"].get("skipped")]
+    return json.dumps({
+        "ttp_id": ttp_id,
+        "steps_run": len(results),
+        "errors": len(errors),
+        "results": results,
+    }, indent=2, default=_json_default)
 
 
 # ---------------------------------------------------------------------------
@@ -1280,10 +1557,10 @@ def start_campaign(
         Field(
             default=None,
             description=(
-                "Objective names the Pareto front is computed over. Fixed at "
-                "creation, so the front's dimensions cannot drift later. Use "
-                "the names as they appear in the base TTP. Defaults to that "
-                "TTP's own objectives, and to none when there is no base TTP."
+                "Objective names every result is reported on. Fixed at "
+                "creation, so results stay comparable. Use the names as they "
+                "appear in the base TTP. Defaults to that TTP's own "
+                "objectives, and to none when there is no base TTP."
             ),
         ),
     ] = None,
@@ -1330,8 +1607,8 @@ def get_campaign_state(
     """Everything about a campaign in one call.
 
     Task counts by state, the supervisors currently holding tasks with their
-    weight vectors and lease remaining, the Pareto front, and how long is left
-    in the dispatch and drain windows.
+    weight vectors and lease remaining, how many results are in, and how long
+    is left in the dispatch and drain windows.
 
     ``window.phase`` follows the clock rather than the stored state, so a
     campaign whose conductor missed its own deadline still reports that it
@@ -1387,8 +1664,8 @@ def get_campaign_files(
     ``list_shared_assets`` for those.
 
     Tasks come back newest first and carry no scores, so do not describe the
-    first one as the best: ``get_pareto_front`` is what ranks tasks, and
-    ``get_top_candidates`` ranks molecules within one job.
+    first one as the best: ``get_supervisor_result`` says what one achieved,
+    and ``get_top_candidates`` ranks molecules within one job.
     """
 
     from reinvent4_mcp.tools.campaign import get_campaign_files as _impl
@@ -1406,16 +1683,66 @@ def enqueue_task(
         str,
         Field(description="Campaign to add to; must still be dispatching"),
     ],
-    weight_overrides: Annotated[
-        dict[str, float],
+    intent: Annotated[
+        str,
         Field(
             description=(
-                "Objective name to weight. Names must match the base TTP's "
-                "objectives -- an unknown name fails the task rather than "
-                "running silently with the wrong weights."
+                "What to do, in prose, handed to the sub-agent verbatim. "
+                "This is the task. Say what the work is for and let the "
+                "sub-agent decide how -- it can look a target or compound up "
+                "and pick its own tools. For a design run this is also where "
+                "chemistry the weights cannot express belongs, such as which "
+                "chemotype to hold."
             ),
         ),
     ],
+    kind: Annotated[
+        str,
+        Field(
+            default="design",
+            description=(
+                "design | research | analysis | retrosynthesis | question | lead. "
+                "'design' is a reinforcement-learning run; 'lead' hands a "
+                "whole workstream to a sub-agent that conducts its own "
+                "sub-campaign on this pool and reports one synthesis; every "
+                "other kind is refused the job starters, because nothing "
+                "would watch the run or read its results."
+            ),
+        ),
+    ] = "design",
+    title: Annotated[
+        str,
+        Field(default="", description="A few words naming the task for the "
+                                      "person watching the campaign"),
+    ] = "",
+    context: Annotated[
+        str,
+        Field(
+            default="",
+            description=(
+                "What the sub-agent needs to know but could not find out: "
+                "the series, what has been tried, what another task found. "
+                "It cannot see the conversation or the other sub-agents."
+            ),
+        ),
+    ] = "",
+    deliverable: Annotated[
+        str,
+        Field(default="", description="What to come back with, when the shape "
+                                      "of the answer matters"),
+    ] = "",
+    weight_overrides: Annotated[
+        dict[str, float] | None,
+        Field(
+            default=None,
+            description=(
+                "Design tasks on a campaign with a base TTP: objective name "
+                "to weight. Names must match the base TTP's objectives -- an "
+                "unknown name fails the task rather than running silently "
+                "with the wrong weights."
+            ),
+        ),
+    ] = None,
     fidelity_tier: Annotated[
         str,
         Field(
@@ -1426,42 +1753,367 @@ def enqueue_task(
     ] = "exploration",
     max_steps: Annotated[
         int | None,
-        Field(default=None, gt=0, description="RL steps for this task"),
+        Field(default=None, gt=0, description="RL steps for a design task"),
     ] = None,
-    intent: Annotated[
-        str,
+    derived_from: Annotated[
+        list[str] | None,
         Field(
-            default="",
+            default=None,
             description=(
-                "What this run is for, in prose, handed to the supervisor's "
-                "agent verbatim. Use it for what the weights cannot say -- "
-                "above all which chemistry to stay within, since holding a "
-                "chemotype is a choice of generative prior and the agent can "
-                "look the reference compound up and pick a model itself. "
-                "State the experiment, not the tool calls."
+                "Ids of this campaign's tasks whose reports led to this one. "
+                "The user sees them as the lines from one experiment to the "
+                "next; leave empty only for tasks that build on nothing yet."
             ),
         ),
+    ] = None,
+    workstream: Annotated[
+        str,
+        Field(default="", description="Id of the plan's workstream this task works on"),
     ] = "",
+    priority: Annotated[
+        int,
+        Field(default=0, ge=-10, le=10,
+              description="Higher is claimed first; leave 0 unless it must jump the queue"),
+    ] = 0,
+    concurrency: Annotated[
+        int | None,
+        Field(default=None, ge=1, le=64,
+              description="For a 'lead': how many of the pool's sub-agents its workstream may hold"),
+    ] = None,
 ) -> str:
-    """Queue one weight vector by hand.
+    """Give one task to one sub-agent.
 
-    For following a hunch about a trade-off the automatic proposer has not
-    reached. The conductor loop will not re-propose a vector already in the
-    ledger, so a task added here is not duplicated later.
+    The sub-agent that claims it does the whole job alone and reports back;
+    read the reports with ``get_task_reports``. Tasks queued together run at
+    the same time and cannot see each other, so make them answer different
+    questions rather than near-identical variants of one.
 
-    A task given an ``intent`` will not quietly fall back to a default de novo
-    run if its agent fails to start one -- it is handed back to be retried,
-    because a substituted run would post into the same Pareto front while
-    measuring something else.
+    A design task given an ``intent`` will not quietly fall back to a default
+    de novo run if its agent fails to start one -- it is handed back to be
+    retried, because a substituted run would report a result for an
+    experiment nobody asked for.
     """
 
     from reinvent4_mcp.tools.campaign import enqueue_task as _impl
 
     return json.dumps(
         _impl(
-            campaign_id, weight_overrides, None, fidelity_tier, max_steps,
-            None, intent or None,
+            campaign_id,
+            intent,
+            kind=kind,
+            title=title or None,
+            context=context or None,
+            deliverable=deliverable or None,
+            weight_overrides=weight_overrides or None,
+            fidelity_tier=fidelity_tier,
+            max_steps=max_steps,
+            derived_from=derived_from or None,
+            workstream=workstream or None,
+            priority=priority,
+            concurrency=concurrency,
         ),
+        indent=2, default=_json_default,
+    )
+
+
+@mcp.tool()
+def enqueue_tasks(
+    campaign_id: Annotated[str, Field(description="Campaign to add to; must still be dispatching")],
+    tasks: Annotated[
+        list[dict[str, Any]],
+        Field(
+            min_length=1, max_length=200,
+            description=(
+                "The tasks, each an object with the fields enqueue_task takes: "
+                "intent (required), kind, title, context, deliverable, "
+                "workstream, priority, derived_from, max_steps, "
+                "weight_overrides, fidelity_tier, and concurrency for a lead."
+            ),
+        ),
+    ],
+) -> str:
+    """Queue several tasks in one call, all of them or none.
+
+    The way to keep the team supplied: one call fills every free sub-agent
+    and the ready queue behind them, instead of one task per turn. Make the
+    tasks answer different questions -- they run at the same time and
+    cannot see each other.
+
+    When the batch has design tasks, ``runs`` says how many of them can
+    start a run now. The rest wait for one, so a comparison across them
+    should be read once all their reports are in.
+    """
+
+    from reinvent4_mcp.tools.campaign import enqueue_tasks as _impl
+
+    return json.dumps(_impl(campaign_id, tasks), indent=2, default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_task_reports
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_task_reports(
+    campaign_id: Annotated[str, Field(description="Campaign whose reports to read")],
+    task_id: Annotated[
+        str,
+        Field(default="", description="One task; omit for every task that has reported"),
+    ] = "",
+) -> str:
+    """What the sub-agents reported back.
+
+    Each report is a sub-agent's own account of its task: what it did, what
+    it found, what it could not settle and what it would do next. This is the
+    only thing that crosses from a sub-agent to you -- their tool calls and
+    transcripts are their own -- so read these before deciding what to
+    dispatch next.
+
+    Molecules are not included. ``get_supervisor_result`` has the candidates
+    and scores for one task.
+    """
+
+    from reinvent4_mcp.tools.campaign import get_task_reports as _impl
+
+    return json.dumps(
+        _impl(campaign_id, task_id or None), indent=2, default=_json_default
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tools: the plan
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def set_campaign_plan(
+    campaign_id: Annotated[str, Field(description="Campaign to plan")],
+    workstreams: Annotated[
+        list[dict[str, Any]],
+        Field(
+            min_length=1, max_length=40,
+            description=(
+                "The workstreams, each {id, name, question}: id a short handle "
+                "tasks name it by, question what it has to settle for the goal. "
+                "Optional share (rough fraction of the team, 0-1) and status "
+                "(open, settled, dropped). Send all of them: this replaces the plan."
+            ),
+        ),
+    ],
+) -> str:
+    """Split the goal into the workstreams a drug-discovery team would.
+
+    Target biology and structure, known actives and SAR, design, selectivity,
+    ADMET, synthesis -- whatever this goal needs. Tasks name their workstream,
+    so get_campaign_coverage can show where the team is and where nobody is.
+    """
+
+    from reinvent4_mcp.tools.campaign import set_campaign_plan as _impl
+
+    return json.dumps(_impl(campaign_id, workstreams), indent=2, default=_json_default)
+
+
+@mcp.tool()
+def get_campaign_coverage(
+    campaign_id: Annotated[str, Field(description="Campaign whose coverage to read")],
+) -> str:
+    """How the work spreads over the plan: per workstream, what is queued,
+    running and done, its latest finding and its waiting proposals, and the
+    open workstreams nobody is working on."""
+
+    from reinvent4_mcp.tools.campaign import get_campaign_coverage as _impl
+
+    return json.dumps(_impl(campaign_id), indent=2, default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# Tools: proposals
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def list_proposals(
+    campaign_id: Annotated[str, Field(description="Campaign whose open proposals to read")],
+) -> str:
+    """The next tasks sub-agents proposed at the end of their reports, still open.
+
+    A sub-agent sees only its own task, so these are candidates: rank them
+    against the campaign, take the ones worth a sub-agent with
+    ``take_proposals`` and drop the rest with ``drop_proposals``.
+    """
+
+    from reinvent4_mcp.tools.campaign import list_proposals as _impl
+
+    return json.dumps(_impl(campaign_id), indent=2, default=_json_default)
+
+
+@mcp.tool()
+def take_proposals(
+    campaign_id: Annotated[str, Field(description="Campaign the proposals belong to")],
+    proposal_ids: Annotated[list[str], Field(description="Proposals to queue as tasks")],
+    priority: Annotated[
+        int,
+        Field(default=0, ge=-10, le=10,
+              description="Higher is claimed first; leave 0 unless these must jump the queue"),
+    ] = 0,
+) -> str:
+    """Queue proposals as tasks, each derived from the task that proposed it."""
+
+    from reinvent4_mcp.tools.campaign import take_proposals as _impl
+
+    return json.dumps(_impl(campaign_id, proposal_ids, priority), indent=2, default=_json_default)
+
+
+@mcp.tool()
+def drop_proposals(
+    campaign_id: Annotated[str, Field(description="Campaign the proposals belong to")],
+    proposal_ids: Annotated[list[str], Field(description="Proposals to set aside")],
+) -> str:
+    """Set proposals aside, so they are not offered again."""
+
+    from reinvent4_mcp.tools.campaign import drop_proposals as _impl
+
+    return json.dumps(_impl(campaign_id, proposal_ids), indent=2, default=_json_default)
+
+
+# ---------------------------------------------------------------------------
+# Tools: the atlas, what the campaign knows
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def atlas_overview(
+    campaign_id: Annotated[str, Field(description="Campaign whose atlas to read")],
+) -> str:
+    """The map of what this campaign knows, branch by branch.
+
+    Per branch: how many findings stand, how many are disputed, the latest
+    claim and the tags to search by. Branches from the plan appear even when
+    empty, and an empty branch is the part of the goal nobody has settled
+    anything about. A page, where the reports behind it are a chapter.
+    """
+
+    from reinvent4_mcp.tools.campaign import atlas_overview as _impl
+
+    return json.dumps(_impl(campaign_id), indent=2, default=_json_default)
+
+
+@mcp.tool()
+def atlas_branch(
+    campaign_id: Annotated[str, Field(description="Campaign to read")],
+    branch: Annotated[str, Field(description="Workstream id, as atlas_overview lists it")],
+    limit: Annotated[int, Field(default=50, ge=1, le=200, description="Most findings to return")] = 50,
+) -> str:
+    """Everything one branch of the atlas holds, newest first.
+
+    Each finding comes with the notes hung off it, so a claim another agent
+    disputed arrives disputed rather than looking settled. Superseded
+    findings are left out: this is what the campaign currently believes.
+    """
+
+    from reinvent4_mcp.tools.campaign import atlas_branch as _impl
+
+    return json.dumps(_impl(campaign_id, branch, limit), indent=2, default=_json_default)
+
+
+@mcp.tool()
+def atlas_search(
+    campaign_id: Annotated[str, Field(description="Campaign to search")],
+    query: Annotated[
+        str,
+        Field(default="", description="Words that must all appear; empty returns the latest"),
+    ] = "",
+    tag: Annotated[str, Field(default="", description="Exact tag to require")] = "",
+    limit: Annotated[int, Field(default=25, ge=1, le=200, description="Most findings to return")] = 25,
+) -> str:
+    """Findings matching words or a tag, across every branch.
+
+    Use this before starting work somebody may already have done: a search
+    that returns nothing costs a second and is worth a sub-agent's hour.
+    """
+
+    from reinvent4_mcp.tools.campaign import atlas_search as _impl
+
+    return json.dumps(
+        _impl(campaign_id, query, tag or None, limit), indent=2, default=_json_default
+    )
+
+
+@mcp.tool()
+def atlas_finding(
+    campaign_id: Annotated[str, Field(description="Campaign this belongs to")],
+    branch: Annotated[
+        str,
+        Field(description="Workstream id to file it under. Findings are read a "
+                          "branch at a time, so one filed in the wrong branch "
+                          "is one nobody will see."),
+    ],
+    claim: Annotated[
+        str,
+        Field(description="The finding in one sentence, stated so it could be "
+                          "disagreed with: what is true, not what you did"),
+    ],
+    detail: Annotated[
+        str, Field(default="", description="Numbers, conditions and caveats behind it"),
+    ] = "",
+    evidence: Annotated[
+        list[str] | None,
+        Field(default=None,
+              description="Where it came from: DOIs, ChEMBL ids, job ids, PDB codes"),
+    ] = None,
+    confidence: Annotated[
+        Literal["high", "medium", "low"],
+        Field(default="medium", description="Say low rather than say nothing"),
+    ] = "medium",
+    tags: Annotated[
+        list[str] | None,
+        Field(default=None,
+              description="Handles to find it by later: a gene, a scaffold, an assay"),
+    ] = None,
+    task_id: Annotated[str, Field(default="", description="The task you are working")] = "",
+    supersedes: Annotated[
+        str, Field(default="", description="Id of the finding this corrects"),
+    ] = "",
+) -> str:
+    """Record something the campaign now knows.
+
+    Record what is true, not what you did. One claim per call, with the
+    evidence that would let the next agent check it. Nothing is ever
+    deleted: a finding that turns out wrong is corrected by recording the
+    right one with ``supersedes`` set to the old id.
+    """
+
+    from reinvent4_mcp.tools.campaign import atlas_finding as _impl
+
+    return json.dumps(
+        _impl(
+            campaign_id, branch, claim, detail or None, evidence, confidence,
+            tags, task_id or None, supersedes or None,
+        ),
+        indent=2, default=_json_default,
+    )
+
+
+@mcp.tool()
+def atlas_note(
+    campaign_id: Annotated[str, Field(description="Campaign the finding belongs to")],
+    finding_id: Annotated[str, Field(description="Finding to annotate")],
+    body: Annotated[str, Field(description="What you have to say, with your own evidence")],
+    stance: Annotated[
+        Literal["supports", "disputes", "extends"],
+        Field(default="extends", description="What your note does to the finding"),
+    ] = "extends",
+    task_id: Annotated[str, Field(default="", description="The task you are working")] = "",
+) -> str:
+    """Hang a second opinion off a finding somebody else recorded.
+
+    Use this rather than recording a near-duplicate: an independent
+    confirmation is worth more attached to the claim it confirms, and a
+    dispute is worth most of all -- it is how the next agent learns the
+    number it was about to build on is contested.
+    """
+
+    from reinvent4_mcp.tools.campaign import atlas_note as _impl
+
+    return json.dumps(
+        _impl(campaign_id, finding_id, body, stance, task_id or None),
         indent=2, default=_json_default,
     )
 
@@ -1515,27 +2167,6 @@ def get_supervisor_result(
     from reinvent4_mcp.tools.campaign import get_supervisor_result as _impl
 
     return json.dumps(_impl(campaign_id, task_id), indent=2, default=_json_default)
-
-
-# ---------------------------------------------------------------------------
-# Tool: get_pareto_front
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def get_pareto_front(
-    campaign_id: Annotated[str, Field(description="Campaign to inspect")],
-) -> str:
-    """The non-dominated results: the trade-offs nothing else beats.
-
-    Also returns ``ineligible`` -- results left off the front for not
-    reporting every objective. That usually means a scorer failed, and is
-    worth looking at: those runs are not bad trade-offs, they are incomplete
-    measurements.
-    """
-
-    from reinvent4_mcp.tools.campaign import get_pareto_front as _impl
-
-    return json.dumps(_impl(campaign_id), indent=2, default=_json_default)
 
 
 # ---------------------------------------------------------------------------
@@ -1603,11 +2234,15 @@ def get_pool_capacity(
     claim, and Boltz must have queue room to score what it starts. Either
     number alone misleads -- an idle supervisor handed work while the scorer
     is saturated only moves the wait, and a quiet scorer is no use with
-    nothing alive to dispatch to.
+    nothing alive to dispatch to. A design task also needs a run, and
+    ``runs`` is the run window: how many REINVENT runs may hold a slot now,
+    which closes while the cluster is slow to start them.
 
-    ``can_dispatch`` is yes/no/unknown and ``binding_limit`` names whichever
-    one said no. A ``None`` queue_pressure means the gateway did not answer,
-    which is not the same as idle.
+    ``can_dispatch`` is yes/no/unknown, or "not design" when only the run
+    window is full -- research and question tasks need no run and can still
+    go. ``binding_limit`` names whichever one said no. A ``None``
+    queue_pressure means the gateway did not answer, which is not the same
+    as idle.
 
     ``ceiling`` carries what max_supervisors() reports, so one call answers
     both "is there room now" and "how large could this pool ever be".
@@ -1665,18 +2300,32 @@ def conduct_campaign(
     concurrency: Annotated[
         int,
         Field(default=0, ge=0,
-              description="Supervisors to hold in flight; 0 keeps what the "
+              description="Sub-agents to hold in flight; 0 keeps what the "
                           "campaign was opened with. Check max_supervisors "
                           "first"),
     ] = 0,
+    propose: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "Let the loop fill idle slots with tasks of its own. Off by "
+                "default: you dispatch with enqueue_task, because you are "
+                "holding the conversation that knows what the work is for. "
+                "Turn it on to leave a campaign running unattended."
+            ),
+        ),
+    ] = False,
 ) -> str:
-    """Start conducting a campaign: dispatch work and hold the pool at size.
+    """Keep the sub-agent pool at size for a campaign you are directing.
 
-    Opening a campaign does not run it. This is the loop that makes it move --
-    proposing the next weight vector from the Pareto front, enqueueing it for
-    a supervisor to claim, and scaling the pool on every pass. It runs in the
-    background, so say that it has started and carry on; use
-    conducting_status to report progress later.
+    Opening a campaign does not run it. This starts the loop that holds the
+    pool at the campaign's concurrency, closes the queue when the dispatch
+    window ends, and finalizes at the hard stop. It returns at once, so say
+    that it has started and carry on; use conducting_status later.
+
+    It dispatches nothing unless ``propose`` is set: give out the work with
+    enqueue_task and read it back with get_task_reports.
 
     Idempotent: asking twice does not start a second loop.
     """
@@ -1689,6 +2338,7 @@ def conduct_campaign(
             task_budget_hours=task_budget_hours or None,
             max_steps=max_steps or None,
             concurrency=concurrency or None,
+            propose=propose,
         ),
         indent=2, default=_json_default,
     )

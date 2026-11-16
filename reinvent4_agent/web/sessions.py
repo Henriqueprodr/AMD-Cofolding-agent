@@ -37,6 +37,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 from reinvent4_agent.web import campaign as campaign_log
+from reinvent4_agent.web.artifacts import extract_panels
+from reinvent4_agent.web.events import WebSocketEventHandler
+from reinvent4_agent.web.plaintext import plain
+
+logger = logging.getLogger(__name__)
 
 #: A campaign id as the ledger writes it: eight hex characters.
 _CAMPAIGN_ID = re.compile(r'"campaign_id"\s*:\s*"([0-9a-f]{4,32})"')
@@ -52,11 +57,6 @@ def _campaign_id_in(result: str) -> Optional[str]:
 
     found = _CAMPAIGN_ID.search(result or "")
     return found.group(1) if found else None
-from reinvent4_agent.web.artifacts import extract_panels
-from reinvent4_agent.web.events import WebSocketEventHandler
-from reinvent4_agent.web.plaintext import plain
-
-logger = logging.getLogger(__name__)
 
 #: Session ids are generated here and also arrive from the browser, where they
 #: end up in a file path, so they are held to this shape.
@@ -69,12 +69,18 @@ _TITLE_CHARS = 80
 _HEADING_PATTERN = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
 
 
+#: Headings that name no subject, so never a title.
+_EMPTY_HEADINGS = frozenset({"answer", "final answer", "the answer"})
+
+
 def first_heading(markdown: str) -> str | None:
     """The first markdown heading of an answer, without its emphasis marks."""
     match = _HEADING_PATTERN.search(markdown or "")
     if match is None:
         return None
     text = re.sub(r"[*_`]", "", match.group(1)).strip()
+    if text.rstrip(":").strip().lower() in _EMPTY_HEADINGS:
+        return None
     return text or None
 
 #: Idle sessions kept in memory.  Older ones are reloaded from disk on demand.
@@ -83,9 +89,19 @@ MAX_LIVE_SESSIONS = 20
 #: Longest autonomy budget a browser may ask for, in minutes.
 MAX_AUTONOMY_MINUTES = 480
 
-#: Automatic turns in a row before the loop gives up, whatever the budget
-#: says.  A campaign that needs more than this needs the user.
-MAX_AUTO_TURNS = 50
+#: Pause before looking again once the agent has said twice that it has
+#: nothing left to do.  Long, because what is most likely to change is a run
+#: or a sub-agent finishing, and the watcher wakes the loop the moment one
+#: does.  It keeps looking rather than handing back: auto mode is the user
+#: saying "carry on without me", so only they and the budget end it.
+AUTO_IDLE_DELAY_S = 5 * 60.0
+
+#: Pause before picking up a turn that failed, doubling to the second.  What
+#: fails a turn is almost always a service or the endpoint, and those come
+#: back; handing the campaign back instead would end the budget over a
+#: minute's outage.
+AUTO_RETRY_DELAY_S = 30.0
+AUTO_RETRY_MAX_S = 10 * 60.0
 
 #: Pause before carrying on when the agent is not waiting for any run: it is
 #: in the middle of something, and the pause only keeps it from spinning.
@@ -101,9 +117,55 @@ WATCH_INTERVAL_S = 30.0
 #: enough that the time a run takes is spent on something.
 AUTO_BACKSTOP_S = 15 * 60.0
 
-#: Context, in input tokens, above which an automatic turn starts from a
-#: brief and the campaign log instead of re-reading the whole conversation.
+#: Context, in input tokens, above which a turn starts from a brief and the
+#: campaign log instead of re-reading the whole conversation.  Used only for
+#: an endpoint that does not report its window.
 COMPACT_ABOVE_TOKENS = 100_000
+
+#: Share of a reported window a conversation may fill before the same
+#: happens.  The rest is for the turn itself: a long tool result, the
+#: model's reasoning and its answer all land on top of the history.
+COMPACT_FRACTION = 0.7
+
+#: Opening a campaign, dispatching to it and holding its pool.  Withheld
+#: below two sub-agents, where a campaign would be a queue nobody can take
+#: work from: sub-agent mode exists only when the user has switched it on.
+FLEET_TOOLS = frozenset({
+    "start_campaign",
+    "enqueue_task",
+    "enqueue_tasks",
+    "set_campaign_plan",
+    "conduct_campaign",
+    "stop_conducting",
+    "set_concurrency",
+    "cancel_supervisor",
+    "close_campaign",
+    "finalize_campaign",
+    "take_proposals",
+    "drop_proposals",
+})
+
+#: What the conductor gives up once it has sub-agents.  Starting a run *is*
+#: the task, and at two or more the tasks are theirs.  Left the choice, a
+#: conductor whose campaign tool fails quietly runs the tracks itself and
+#: reports them as the campaign's.
+RUN_STARTERS = frozenset({
+    "run_optimization",
+    "run_transfer_learning",
+    "run_generation_campaign",
+    "create_generation_campaign",
+})
+
+#: Said to the model in place of each tool it may not call.
+_DELEGATE_INSTEAD = (
+    "The user allowed sub-agents, so runs are theirs: describe this one to "
+    "enqueue_task and a sub-agent will start it."
+)
+_WORK_ALONE_INSTEAD = (
+    "This conversation has no sub-agents, so there is nobody to dispatch "
+    "to. Do the work yourself, or ask the user to allow sub-agents beside "
+    "the message box."
+)
 
 #: Run states, as job metadata spells them.
 ACTIVE_RUN_STATES = frozenset({"running", "queued"})
@@ -124,7 +186,10 @@ AUTO_POLICY = (
     "compete with it -- score, cofold, profile or counter-screen the current "
     "best, or prepare the next TTP -- and start a second run only to test "
     "something different (other seeds, another chemotype, other weights). Treat "
-    "a problem with a run as the [MONITOR] section describes. Record what you "
+    "a problem with a run as the [MONITOR] section describes. If you are "
+    "conducting a campaign, no sub-agent should be sitting idle while the "
+    "budget runs: read the reports that came in, and give every free "
+    "sub-agent its next task. Record what you "
     "learned and the next step, with the result behind it, in campaign_log. "
     "Keep the reply to a few lines. End with AUTONOMY DONE only when you cannot "
     "name a result that justifies another step, or the next step needs something "
@@ -135,7 +200,14 @@ AUTO_POLICY = (
 
 #: Why an automatic turn was taken, as the turn is told.
 _WAKE_REASONS = {
-    "start": "The user has just left the campaign with you.",
+    "start": (
+        "The user has just left the campaign with you. Plan the whole campaign "
+        "now, before you have results to react to: open it, set a plan with "
+        "set_campaign_plan, and queue tasks for every sub-agent at once. The "
+        "number you may hold is in the system note below. Queue a task per "
+        "sub-agent in the first enqueue_tasks call -- do not queue only one "
+        "and wait: a sub-agent not working is budget spent with nothing back."
+    ),
     "continue": "Carry on from your last turn.",
     "confirm": (
         "You were about to hand the campaign back. Check that first: if any next "
@@ -146,6 +218,19 @@ _WAKE_REASONS = {
         "if every remaining step needs something only the user can give: a target "
         "they have not named, data you cannot fetch, or a choice between their own "
         "goals."
+    ),
+    "idle": (
+        "You have said twice that you have nothing left to do, and the budget is "
+        "still running, so look again rather than wait. Read the campaign log, "
+        "check every run and every sub-agent, and start the most useful thing you "
+        "can do without the user -- a counter-screen, a profile, another seed, a "
+        "task for a sub-agent that is free. Say so plainly if there is genuinely "
+        "nothing; you will be asked again."
+    ),
+    "retry": (
+        "Your last turn failed before it finished. Find out what state the work is "
+        "actually in before redoing any of it -- a run you started may well be "
+        "going -- then carry on."
     ),
 }
 
@@ -360,8 +445,12 @@ class LiveSession:
     auto_task: asyncio.Task[None] | None = None
     #: Automatic turns taken since the last user message.
     auto_turns: int = 0
+    #: Turns that have failed in a row, which is how long the retry waits.
+    auto_failures: int = 0
     #: Pause before a continuation; read per session so tests can shorten it.
     auto_delay: float = field(default_factory=lambda: AUTO_TURN_DELAY_S)
+    #: The longer pause once it has twice found nothing left to do.
+    auto_idle_delay: float = field(default_factory=lambda: AUTO_IDLE_DELAY_S)
     #: Asks the gateway what this conversation's runs are doing.  None where
     #: nothing watches runs (the tests, the CLI), and then the agent is simply
     #: never waiting for one.
@@ -372,6 +461,13 @@ class LiveSession:
     alerts_seen: set[tuple[str, str]] = field(default_factory=set)
     #: What happened since the agent last looked, for its next turn to say.
     pending: list[str] = field(default_factory=list)
+    #: Messages the user sent while a turn ran: read after its current step,
+    #: or answered by the next turn if it ends first.
+    waiting: list[str] = field(default_factory=list)
+    #: Campaigns whose ready queue was under target at the last look.
+    queue_low: set[str] = field(default_factory=set)
+    #: Campaigns left with idle sub-agents and nothing queued, already told.
+    stalled_told: set[str] = field(default_factory=set)
     #: When the agent last finished a turn, on the monotonic clock: the start
     #: of the quiet spell a long wait is measured from.
     last_turn: float = field(default_factory=time.monotonic)
@@ -380,6 +476,13 @@ class LiveSession:
     done_once: bool = False
     #: The agent's campaign log.
     campaign: dict[str, Any] = field(default_factory=campaign_log.empty)
+    #: Fleet campaigns this conversation owns, and the last ledger event read
+    #: of each.  A sub-agent reports into the ledger, not into this
+    #: conversation, so without reading it the conductor would never hear
+    #: back from the work it dispatched.
+    campaigns_seen: dict[str, int] = field(default_factory=dict)
+    #: Those of them the ledger last said were still open.
+    campaigns_open: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.campaign = self.store.load_campaign(self.id)
@@ -405,6 +508,11 @@ class LiveSession:
         self.agent.local_tools[campaign_log.TOOL_NAME] = (
             campaign_log.TOOL_DEFINITION, self._campaign_tool,
         )
+        self.agent.inbox = self._take_waiting
+        # What the agent may do itself is part of this conversation too, and
+        # an agent attached after the user moved the slider would otherwise
+        # start with the catalog of a conversation working alone.
+        self.apply_allowance()
 
     #: Tools whose answer names a campaign this conversation now owns.
     #: conduct_campaign as well as start_campaign, because a conversation
@@ -425,6 +533,8 @@ class LiveSession:
             return
         campaign_id = _campaign_id_in(result)
         if campaign_id:
+            self.campaigns_seen.setdefault(campaign_id, 0)
+            self.campaigns_open.add(campaign_id)
             self._claim_campaign(campaign_id)
 
     def _claim_campaign(self, campaign_id: str) -> None:
@@ -490,31 +600,53 @@ class LiveSession:
         self.subscribers.discard(queue)
 
     def start_turn(self, content: str, effort: str | None = None) -> bool:
-        """Start a turn.  False when one is already running.
+        """Start a turn, or hand *content* to the one already running.
 
         *effort* sets the reasoning effort of this turn and the ones after
         it, on backends that have one.
         """
+        backend = getattr(self.agent, "backend", None)
+        if effort and hasattr(backend, "reasoning_effort"):
+            backend.reasoning_effort = effort
+        effort_field = {"effort": effort} if effort else {}
         if self.busy:
-            return False
+            # Refusing it lost the message: the browser has cleared its box by
+            # the time the refusal arrives, and with sub-agents reporting in,
+            # the conductor is mid-turn most of the time.
+            self.waiting.append(content)
+            self.publish({"type": "user_message", "content": content, "interjected": True, **effort_field})
+            return True
+        sent = self._lead(content)
+        if not self.meta.get("title"):
+            first_line = content.strip().splitlines()[0] if content.strip() else ""
+            self.meta["title"] = first_line[:_TITLE_CHARS]
+            self.meta["auto_title"] = True
+        self.publish({"type": "user_message", "content": content, **effort_field})
+        self._begin(sent)
+        return True
+
+    def _lead(self, content: str) -> str:
+        """What the agent is sent for the user's *content*, the user now leading."""
         # The allowance rides with the turn rather than the system prompt: the
         # user can move the slider between turns, and the agent has to be told
         # the number in force for this one.  Published without it, so the
         # user's own message reads back as they typed it.
         sent = self._with_allowance(content)
+        # A conversation the user drives can outgrow the context as surely as
+        # one the agent drives, and it is the user's next question that would
+        # be refused.
+        brief = self._condense()
+        if brief:
+            sent = f"{brief}\n\n{sent}"
         # The user leads: whatever the agent was about to do on its own is dropped.
         self.cancel_continuation()
-        self.auto_turns = 0
-        backend = getattr(self.agent, "backend", None)
-        if effort and hasattr(backend, "reasoning_effort"):
-            backend.reasoning_effort = effort
-        if not self.meta.get("title"):
-            first_line = content.strip().splitlines()[0] if content.strip() else ""
-            self.meta["title"] = first_line[:_TITLE_CHARS]
-            self.meta["auto_title"] = True
-        self.publish({"type": "user_message", "content": content, **({"effort": effort} if effort else {})})
-        self._begin(sent)
-        return True
+        self.auto_turns = self.auto_failures = 0
+        return sent
+
+    def _take_waiting(self) -> list[str]:
+        """The agent's inbox: what the user sent since it last looked."""
+        taken, self.waiting = self.waiting, []
+        return taken
 
     def cancel(self) -> bool:
         """Stop the running turn and any continuation.  False when none runs.
@@ -534,15 +666,32 @@ class LiveSession:
     def set_agents(self, count: int) -> int:
         """Allow this conversation up to *count* sub-agents at once.
 
-        Nothing is started here.  The number is what the agent is told it may
-        spend, and it decides whether a campaign is the right shape for what
-        was asked; one means it works alone.  Published so every tab watching
-        the conversation shows the same setting.
+        Nothing is started here.  One means the agent works alone and the
+        fleet tools are withheld; two or more makes the conversation a
+        campaign and takes the run starters away instead.  Published so
+        every tab watching the conversation shows the same setting.
         """
 
         self.agents_allowed = max(1, int(count))
+        self.apply_allowance()
         self.publish({"type": "agents", "count": self.agents_allowed})
         return self.agents_allowed
+
+    def apply_allowance(self) -> None:
+        """Withhold the tools this allowance does not permit.
+
+        Said to the model as well, on every turn, but saying it is not
+        enough: told it may spend sub-agents, it reliably decides the work
+        is linear and keeps it.  Withholding is what makes delegation the
+        default rather than a preference.
+        """
+
+        if self.agent is None:
+            return
+        if self.agents_allowed > 1:
+            self.agent.withheld = {name: _DELEGATE_INSTEAD for name in RUN_STARTERS}
+        else:
+            self.agent.withheld = {name: _WORK_ALONE_INSTEAD for name in FLEET_TOOLS}
 
     def _with_allowance(self, content: str) -> str:
         """*content* with the sub-agent allowance appended, when there is one.
@@ -554,12 +703,28 @@ class LiveSession:
 
         if self.agents_allowed <= 1 or not content.strip():
             return content
+        n = self.agents_allowed
+        # half as many again, rounded up, is the target queue depth
+        target_q = (n * 3 + 1) // 2
         return (
             f"{content}\n\n"
-            f"[The user allows up to {self.agents_allowed} sub-agents at once "
-            "for this conversation. Run a campaign if the work divides into "
-            "experiments worth running side by side; if it does not, say so "
-            "and do it yourself.]"
+            f"[Team size: {n} sub-agent{'s' if n > 1 else ''} at once. "
+            "Open a campaign with start_campaign, split its goal into "
+            "workstreams with set_campaign_plan, hold the pool with "
+            "conduct_campaign. First turn: queue a task for every "
+            f"sub-agent in one enqueue_tasks call ({n} tasks), immediately — "
+            "do not queue one and wait for it to finish. Keep the queue at "
+            f"about {target_q} tasks ({n} working + backlog) so a sub-agent "
+            "that finishes starts the next task at once. Use get_campaign_coverage "
+            "to find workstreams nobody is working on, and atlas_overview to "
+            "see what each one has settled -- the sub-agents write their "
+            "findings there, and it is still there after your own context "
+            "has been compacted past the report. Where a hypothesis is "
+            "open give the alternatives to different sub-agents. With more "
+            "workstreams than you can follow, use a 'lead' task with its own "
+            "concurrency. Anything that takes minutes or longer is theirs "
+            "(a design run, a deep search, a screen); run starters are "
+            "withheld from you. If a campaign tool fails, stop and say so.]"
         )
 
     # -- working on its own ------------------------------------------------
@@ -578,7 +743,7 @@ class LiveSession:
         if minutes > 0:
             starting = not self.auto_on
             self.auto_until = datetime.now(timezone.utc) + timedelta(minutes=min(float(minutes), float(MAX_AUTONOMY_MINUTES)))
-            self.auto_turns = 0
+            self.auto_turns = self.auto_failures = 0
             if starting:
                 # What happened while nobody was watching is not news: the
                 # first look sets what counts as unchanged.
@@ -606,9 +771,9 @@ class LiveSession:
         """Give the budget back once the loop stops taking turns.
 
         The browser counts the budget down from the deadline, so a loop that
-        has stopped -- the agent said it was done, the turn failed, the user
-        hit stop, the turn cap ran out -- must say so, or the chip keeps
-        promising work that nobody is doing.
+        has stopped -- the user hit stop, or the budget ran out -- must say
+        so, or the chip keeps promising work that nobody is doing.  Those
+        are the only two ways it stops: see ``_run_turn``.
         """
         running = self.auto_until is not None
         self.auto_until = None
@@ -622,9 +787,10 @@ class LiveSession:
     def _schedule_continuation(self, delay: float, reason: str = "continue") -> None:
         """Queue the next automatic turn.  The task checks again before it starts."""
         if not self.auto_on:
-            return
-        if self.auto_turns >= MAX_AUTO_TURNS:
-            self.end_autonomy()
+            # Only here does a budget that simply ran out become visible; the
+            # browser would otherwise count down to zero and keep the chip.
+            if self.auto_until is not None:
+                self.end_autonomy()
             return
         self.cancel_continuation()
         self.auto_task = asyncio.create_task(self._continue_after(delay, reason))
@@ -646,7 +812,7 @@ class LiveSession:
         self.auto_task = None
         if self.busy or not self.auto_on:
             return
-        if reason not in ("start", "confirm") and self.running_runs and not self.pending:
+        if reason not in ("start", "confirm", "retry") and self.running_runs and not self.pending:
             return
         self._wake(reason)
 
@@ -665,6 +831,93 @@ class LiveSession:
                 self.pending.append(f"Run {job_id} {state}.")
             self.runs_seen[job_id] = state
 
+    def note_campaign(self, campaign_id: str, news: dict[str, Any]) -> None:
+        """Take what a campaign's sub-agents have done since the last look.
+
+        A report is news the conductor has to act on: it is the only thing a
+        sub-agent sends back, and the slot that sub-agent was holding is now
+        free. The two ways a campaign quietly stalls are news as well, since
+        the budget runs either way: a pool with nothing left to do, and work
+        with no pool to do it.
+        """
+
+        for event in news.get("events") or []:
+            kind = event.get("kind")
+            payload = event.get("payload") or {}
+            what = payload.get("title") or payload.get("task_kind") or "task"
+            if kind == "task_done":
+                summary = str(payload.get("summary") or "").strip()
+                proposed = payload.get("n_follow_ups") or 0
+                self.pending.append(
+                    f"Sub-agent reported on {what} (task {event.get('task_id')})"
+                    + (f": {_clip(summary, 300)}" if summary else "")
+                    + ". Read it with get_task_reports, and give the sub-agent it "
+                    "freed its next task."
+                    + (
+                        f" It proposed {proposed} next task(s): see list_proposals, "
+                        "and take_proposals the ones worth running."
+                        if proposed else ""
+                    )
+                )
+            elif kind in ("task_failed", "task_abandoned"):
+                reason = str(payload.get("error") or kind).strip()
+                self.pending.append(
+                    f"Task {event.get('task_id')} ({what}) did not finish: "
+                    f"{_clip(reason, 200)}"
+                )
+
+        idle = news.get("idle")
+        queued = news.get("queued")
+        # Explicitly none alive, rather than a reader that did not say: a
+        # missing count must not be reported as an empty pool.
+        if queued and news.get("alive") == 0:
+            # Tasks nobody can pick up. The pool rests at zero and is scaled
+            # up for a campaign, so this is what a scale-up that did not
+            # happen looks like from here -- silent, with the budget running.
+            self.pending.append(
+                f"{queued} task(s) are queued on campaign {campaign_id} and no "
+                "sub-agent is running to take them. Check the campaign with "
+                "get_campaign_status before queueing more."
+            )
+        # Told once while it lasts, like the backlog below: the conductor that
+        # leaves a sub-agent idle is usually waiting on another one, and on
+        # every look this woke it every half minute to say so again. The
+        # quiet backstop still brings it back to a campaign that stays stalled.
+        stalled = bool(idle) and not queued and not news.get("events")
+        if stalled and campaign_id not in self.stalled_told:
+            self.pending.append(
+                f"{idle} sub-agent(s) are idle on campaign {campaign_id} with "
+                "nothing queued. Give them work or close the campaign."
+            )
+        if stalled:
+            self.stalled_told.add(campaign_id)
+        else:
+            self.stalled_told.discard(campaign_id)
+
+        # Told once as it runs low rather than on every look, or a queue kept
+        # just under target would wake the conductor every half minute.
+        backlog = news.get("backlog")
+        low = (
+            isinstance(backlog, int) and isinstance(queued, int)
+            and queued < backlog and news.get("open") is not False
+        )
+        if low and campaign_id not in self.queue_low and not idle:
+            self.pending.append(
+                f"Only {queued} task(s) are queued on campaign {campaign_id}, "
+                f"under the {backlog} to keep ready. Queue the next ones with "
+                "enqueue_tasks, so no sub-agent waits when it finishes."
+            )
+        if low:
+            self.queue_low.add(campaign_id)
+        else:
+            self.queue_low.discard(campaign_id)
+
+        last = news.get("last_event_id")
+        if isinstance(last, int):
+            self.campaigns_seen[campaign_id] = last
+        if news.get("open") is False:
+            self.campaigns_open.discard(campaign_id)
+
     def note_alerts(self, alerts: list[dict[str, Any]]) -> None:
         """Take the problems reported for running jobs; each is news once."""
         running = set(self.running_runs)
@@ -677,19 +930,45 @@ class LiveSession:
             message = str(alert.get("message") or kind).strip()
             self.pending.append(f"Run {job_id} ({alert.get('severity') or 'medium'}): {message}")
 
+    @property
+    def conducting(self) -> bool:
+        """Whether a campaign this conversation opened is still open."""
+        return bool(self.campaigns_open)
+
     def wake_if_due(self) -> None:
-        """Take a turn if something happened, or if the runs have been quiet too long."""
-        if self.busy or not self.auto_on or self.auto_task is not None:
+        """Take a turn if something happened, or if the runs have been quiet too long.
+
+        Without autonomy, only while a campaign of this conversation is open
+        and only on news: a sub-agent that has reported is idle until the
+        conductor reads it, and nobody else will give it its next task. The
+        turn is one; with autonomy off nothing follows it.
+
+        News cuts a pause short: after an answer that said there was nothing
+        left to do the next look is minutes away, and a sub-agent that
+        reports meanwhile would sit idle for all of them.
+        """
+        if self.busy:
+            return
+        if self.auto_task is not None:
+            if not self.pending:
+                return
+            self.cancel_continuation()
+        if not self.auto_on:
+            if self.conducting and self.pending:
+                self._wake("events")
             return
         if self.pending:
             self._wake("events")
         elif self.running_runs and time.monotonic() - self.last_turn >= AUTO_BACKSTOP_S:
             self._wake("quiet")
+        elif self.campaigns_seen and time.monotonic() - self.last_turn >= AUTO_BACKSTOP_S:
+            # A campaign whose sub-agents are all mid-task launches no runs of
+            # the conversation's own, so `running_runs` is empty and the
+            # backstop above never fires -- the conductor would sit out the
+            # whole campaign without looking at it once.
+            self._wake("quiet")
 
     def _wake(self, reason: str) -> None:
-        if self.auto_turns >= MAX_AUTO_TURNS:
-            self.end_autonomy()
-            return
         self.auto_turns += 1
         events, self.pending = self.pending, []
         brief = self._condense()
@@ -716,6 +995,15 @@ class LiveSession:
         parts.append(AUTO_POLICY)
         return "\n\n".join(parts)
 
+    def _compact_above(self) -> int:
+        """Context, in tokens, past which the next turn starts from a brief.
+
+        Sized to what the endpoint actually serves, which differs by an
+        order of magnitude between deployments of the same model.
+        """
+        window = getattr(self.agent, "context_window", None)
+        return int(window * COMPACT_FRACTION) if window else COMPACT_ABOVE_TOKENS
+
     def _condense(self) -> str:
         """Start the agent afresh from a brief once its context has grown too long.
 
@@ -725,7 +1013,10 @@ class LiveSession:
         """
         tokens = getattr(self.agent, "context_tokens", 0) or 0
         reset = getattr(self.agent, "reset_history", None)
-        if tokens <= COMPACT_ABOVE_TOKENS or not callable(reset):
+        # Asked in this order because reading the window can cost a call to
+        # the endpoint, and a conversation that has not had a completion yet
+        # is under any threshold there could be.
+        if not tokens or not callable(reset) or tokens <= self._compact_above():
             return ""
         requests = [e.get("content", "") for e in self.events if e.get("type") == "user_message"]
         answers = [e.get("content", "") for e in self.events if e.get("type") == "assistant_message"]
@@ -742,7 +1033,7 @@ class LiveSession:
             lines.append("Your last answer:\n" + _clip(answers[-1], _BRIEF_ANSWER_CHARS))
         reset()
         self.agent.context_tokens = 0
-        logger.info("Session %s: condensed a %d-token history before an automatic turn", self.id, tokens)
+        logger.info("Session %s: condensed a %d-token history before the next turn", self.id, tokens)
         return "\n".join(lines)
 
     def _begin(self, content: str, auto: bool = False) -> None:
@@ -754,7 +1045,7 @@ class LiveSession:
         self.running = asyncio.create_task(self._run_turn(content))
 
     async def _run_turn(self, content: str) -> None:
-        unfinished = done = False
+        unfinished = done = failed = False
         try:
             answer = await self.agent.chat(content)
             spoken = spoken_answer(answer)
@@ -772,21 +1063,40 @@ class LiveSession:
         except asyncio.CancelledError:
             self.publish({"type": "cancelled"})
         except Exception as exc:
+            failed = True
             logger.exception("Agent turn failed in session %s", self.id)
             self.publish({"type": "error", "message": str(exc)})
         finally:
             self.last_turn = time.monotonic()
             self.publish({"type": "status", "state": "idle"})
             self.save()
-            # Never after a cancel or an error: both need the user.
-            if unfinished:
+            # Auto mode ends two ways and no others: the user stops it, or
+            # the budget they set runs out. Nothing here hands it back -- not
+            # a failed turn, and not the agent saying it is finished, which
+            # it says while runs it started are still going.
+            if self.waiting:
+                # Sent after the agent's last look, so this turn never read
+                # it. Answered after a Stop too: Stop ends the work in hand,
+                # not what the user asked for next.
+                self._begin(self._lead("\n\n".join(self._take_waiting())))
+            elif failed:
+                self.auto_failures += 1
+                self._schedule_continuation(self._retry_delay(), reason="retry")
+            elif unfinished:
+                self.auto_failures = 0
                 self.done_once = False
                 self._schedule_continuation(self.auto_delay)
-            elif done and self.auto_on and not self.done_once:
-                self.done_once = True
-                self._schedule_continuation(self.auto_delay, reason="confirm")
-            else:
-                self.end_autonomy()
+            elif done:
+                self.auto_failures = 0
+                checked, self.done_once = self.done_once, True
+                self._schedule_continuation(
+                    self.auto_idle_delay if checked else self.auto_delay,
+                    reason="idle" if checked else "confirm",
+                )
+
+    def _retry_delay(self) -> float:
+        """Wait before picking a failed turn up, longer each time it fails."""
+        return min(AUTO_RETRY_DELAY_S * 2 ** (self.auto_failures - 1), AUTO_RETRY_MAX_S)
 
     def save(self) -> None:
         """Write the metadata and the LLM history."""
@@ -828,6 +1138,11 @@ RunStates = Callable[[list[str]], Awaitable[dict[str, dict[str, str]]]]
 #: The problems the job manager currently reports, one dict per alert.
 JobAlerts = Callable[[], Awaitable[list[dict[str, Any]]]]
 
+#: Takes ``{campaign id: last event id seen}`` and answers with what has
+#: happened in each since: ``{campaign id: {"events": [...],
+#: "last_event_id": int, "idle": int, "queued": int}}``.
+CampaignNews = Callable[[dict[str, int]], Awaitable[dict[str, dict[str, Any]]]]
+
 
 class SessionManager:
     """Creates, loads and forgets live sessions, and watches the runs of busy ones."""
@@ -838,6 +1153,7 @@ class SessionManager:
         self._live: dict[str, LiveSession] = {}
         self._run_states: RunStates | None = None
         self._job_alerts: JobAlerts | None = None
+        self._campaign_news: CampaignNews | None = None
         self._watcher: asyncio.Task[None] | None = None
         self.watch_interval = WATCH_INTERVAL_S
 
@@ -856,14 +1172,22 @@ class SessionManager:
 
     # -- watching runs ---------------------------------------------------------
 
-    def watch(self, run_states: RunStates, job_alerts: JobAlerts) -> None:
+    def watch(
+        self,
+        run_states: RunStates,
+        job_alerts: JobAlerts,
+        campaign_news: CampaignNews | None = None,
+    ) -> None:
         """Follow the runs of conversations working on their own, without the model.
 
         Every few seconds the state of their runs is read; a run that ended,
-        or a new problem with one, wakes the agent with the news.
+        a new problem with one, or a sub-agent's report wakes the agent with
+        the news. Reading all of this costs nothing -- the model is what
+        costs, so it is woken only when something changed.
         """
         self._run_states = run_states
         self._job_alerts = job_alerts
+        self._campaign_news = campaign_news
         for live in self._live.values():
             live.observe = self._observe
         if self._watcher is None:
@@ -883,11 +1207,30 @@ class SessionManager:
             alerts = await self._job_alerts()
             for live in sessions:
                 live.note_alerts(alerts)
+        await self._look_at_campaigns(sessions)
+
+    async def _look_at_campaigns(self, sessions: list[LiveSession]) -> None:
+        """Read the ledger for the campaigns these conversations own."""
+        if self._campaign_news is None:
+            return
+        since: dict[str, int] = {}
+        for live in sessions:
+            for campaign_id, seen in live.campaigns_seen.items():
+                # One read per campaign even when two conversations own it:
+                # each is told the same news and keeps its own cursor.
+                since[campaign_id] = min(since.get(campaign_id, seen), seen)
+        if not since:
+            return
+        news = await self._campaign_news(since)
+        for live in sessions:
+            for campaign_id in list(live.campaigns_seen):
+                if campaign_id in news:
+                    live.note_campaign(campaign_id, news[campaign_id])
 
     async def _watch_loop(self) -> None:
         while True:
             await asyncio.sleep(self.watch_interval)
-            working = [live for live in self._live.values() if live.auto_on and not live.busy]
+            working = [live for live in self._live.values() if (live.auto_on or live.conducting) and not live.busy]
             try:
                 await self._look(working)
             except Exception:

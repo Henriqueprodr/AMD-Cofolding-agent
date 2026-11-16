@@ -28,6 +28,7 @@ from typing import Any, Optional
 import numpy as np
 
 from reinvent4_mcp.config import ProcessConfig, get_config
+from reinvent4_mcp.jobs.admission import RunWindow
 from reinvent4_mcp.jobs.toml_generator import (
     generate_reinvent_toml,
     generate_tl_toml,
@@ -84,6 +85,55 @@ def worker_alive(pid: Optional[int], job_dir: Any) -> bool:
     except OSError:
         return False
     return True
+
+
+def _seconds_since(stamp: Optional[str]) -> Optional[float]:
+    """Seconds from an ISO timestamp to now, or None when it cannot be read."""
+    if not stamp:
+        return None
+    try:
+        then = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - then).total_seconds())
+
+
+#: Directory shared with a host-side relay that submits each run as its own
+#: Slurm job. Set where the runner sits in a container that cannot reach
+#: Slurm itself; unset, runs are subprocesses of the runner as before.
+RUN_RELAY_ENV = "REINVENT_RUN_RELAY"
+#: How often a relayed run's state file is reread.
+RELAY_POLL_SECONDS = 10.0
+#: The relay's state file, written into the job's own directory.
+SLURM_STATE_FILE = "slurm.json"
+
+_SLURM_WAITING = {"PENDING", "CONFIGURING", "REQUEUED", "RESIZING", "SUSPENDED"}
+_SLURM_RUNNING = {"RUNNING", "COMPLETING"}
+
+
+def run_relay() -> Optional[Path]:
+    raw = os.getenv(RUN_RELAY_ENV, "").strip()
+    return Path(raw) if raw else None
+
+
+def _worker_script(argv: list[str], cwd: str, env: dict[str, str]) -> str:
+    """The worker's command as a script the Slurm job runs in the same image.
+
+    Only what the runner adds to its own environment is written out: the rest
+    is the image's, and the job's container starts from the same image.
+    """
+
+    import shlex
+
+    lines = ["#!/bin/bash", "set -e", f"cd {shlex.quote(cwd)}"]
+    for name in ("REINVENT4_ROOT", "DD_MCP_PLUGINS_DIR", "PYTHONPATH"):
+        if env.get(name):
+            lines.append(f"export {name}={shlex.quote(env[name])}")
+    lines.append("exec " + " ".join(shlex.quote(part) for part in argv))
+    return "\n".join(lines) + "\n"
+
 
 # The aggregated score, by the names it can appear under. REINVENT writes
 # "Score"; "total_score" is kept first because older CSVs and the TL output
@@ -183,6 +233,12 @@ class JobInfo:
     chkpt_file: str = "stage.chkpt"
     job_type: JobType = JobType.OPTIMIZATION
 
+    #: Display tag for job listings, kept apart from ``ttp_id``. Generation runs
+    #: used to put their tag in ``ttp_id`` itself, which made ``job_for_ttp``
+    #: miss them and reported every scaffold/linker task as having started
+    #: nothing.
+    label: Optional[str] = None
+
     state: JobState = JobState.QUEUED
     pid: Optional[int] = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -193,8 +249,27 @@ class JobInfo:
     num_epochs: int = 0
     exit_code: Optional[int] = None
     output_model_file: Optional[str] = None
+    #: "local" for a subprocess of this runner, "slurm" for a relayed job.
+    launcher: str = "local"
+    slurm_job_id: Optional[str] = None
 
     _process: Optional[subprocess.Popen] = field(default=None, repr=False)
+    _stop_requested: bool = field(default=False, repr=False)
+    _uses_boltz: Optional[bool] = field(default=None, repr=False)
+
+    @property
+    def uses_boltz(self) -> Optional[bool]:
+        """Whether the run scores with Boltz; None while its TOML cannot be read.
+
+        The same test the Slurm relay makes to give a run its second GPU, so
+        the two never disagree. Read once: a run's TOML does not change.
+        """
+        if self._uses_boltz is None:
+            try:
+                self._uses_boltz = 'service = "boltz"' in Path(self.toml_path).read_text()
+            except OSError:
+                pass
+        return self._uses_boltz
 
     @property
     def csv_path(self) -> Path:
@@ -226,7 +301,12 @@ class JobInfo:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "exit_code": self.exit_code,
+            "launcher": self.launcher,
         }
+        if self.label:
+            d["label"] = self.label
+        if self.slurm_job_id:
+            d["slurm_job_id"] = self.slurm_job_id
         if self.error is not None:
             d["error"] = self.error
         if self.job_type == JobType.OPTIMIZATION:
@@ -234,6 +314,8 @@ class JobInfo:
             d["csv_path"] = str(self.csv_path)
             d["checkpoint_path"] = str(self.checkpoint_path)
             d["has_checkpoint"] = self.checkpoint_path.exists()
+            if self.uses_boltz is not None:
+                d["uses_boltz"] = self.uses_boltz
         else:
             d["num_epochs"] = self.num_epochs
             if self.output_model_file:
@@ -260,6 +342,7 @@ class JobManager:
         self._config = config or get_config()
         self._jobs: dict[str, JobInfo] = {}
         self._lock = threading.Lock()
+        self._window = RunWindow(self._config.jobs.max_concurrent_jobs)
 
         self._working_root = Path(self._config.jobs.working_dir)
         self._working_root.mkdir(parents=True, exist_ok=True)
@@ -332,26 +415,34 @@ class JobManager:
             else:
                 return {"error": f"Checkpoint not found: {resume_path}"}
 
-        toml_str = generate_reinvent_toml(
-            scorer_config=scorer_config,
-            prior_file=model_path,
-            agent_file=agent_file,
-            device=rc.device,
-            batch_size=batch_size or rc.batch_size,
-            sigma=sigma or rc.sigma,
-            learning_rate=learning_rate or rc.learning_rate,
-            unique_sequences=rc.unique_sequences,
-            randomize_smiles=rc.randomize_smiles,
-            max_steps=max_steps,
-            use_checkpoint=use_checkpoint,
-            chkpt_file=chkpt_file,
-            tb_logdir="tb_logs",
-            diversity_filter_type=rc.diversity_filter.type,
-            diversity_filter_bucket_size=rc.diversity_filter.bucket_size,
-            diversity_filter_minscore=rc.diversity_filter.minscore,
-            termination=termination,
-            smiles_file=smiles_file_path,
-        )
+        # A rejected component name arrives here as an exception. Answer the
+        # caller with it rather than a traceback: the job directory is already
+        # made, so an unhandled error leaves a slot claimed for a run that
+        # never started.
+        try:
+            toml_str = generate_reinvent_toml(
+                scorer_config=scorer_config,
+                prior_file=model_path,
+                agent_file=agent_file,
+                device=rc.device,
+                batch_size=batch_size or rc.batch_size,
+                sigma=sigma or rc.sigma,
+                learning_rate=learning_rate or rc.learning_rate,
+                unique_sequences=rc.unique_sequences,
+                randomize_smiles=rc.randomize_smiles,
+                max_steps=max_steps,
+                use_checkpoint=use_checkpoint,
+                chkpt_file=chkpt_file,
+                tb_logdir="tb_logs",
+                diversity_filter_type=rc.diversity_filter.type,
+                diversity_filter_bucket_size=rc.diversity_filter.bucket_size,
+                diversity_filter_minscore=rc.diversity_filter.minscore,
+                termination=termination,
+                smiles_file=smiles_file_path,
+            )
+        except ValueError as exc:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            return {"error": str(exc)}
 
         toml_path = job_dir / "config.toml"
         toml_path.write_text(toml_str)
@@ -502,6 +593,7 @@ class JobManager:
         extra_files: dict[str, str] | None = None,
         max_steps: int = 0,
         model: str = "generation",
+        ttp_id: str | None = None,
     ) -> dict[str, Any]:
         """Write *toml_str* to a new job directory and launch the worker subprocess.
 
@@ -515,6 +607,11 @@ class JobManager:
             Optional dict of ``{filename: content}`` for auxiliary files that the
             TOML references (e.g. ``{"warheads.smi": "[*:1]c1cc...|[*:2]CC..."}``
             for LinkInvent fragment pairs).
+        ttp_id:
+            The TTP this run belongs to, which is what ``job_for_ttp`` matches a
+            task's run on. Falls back to *job_name* so callers that predate the
+            split keep their behaviour; pass it whenever a real TTP exists, or
+            the run cannot be harvested and the task is reported as failed.
 
         Returns the same lifecycle/path metadata shape as ``create_and_start``.
         """
@@ -572,7 +669,8 @@ class JobManager:
 
         job = JobInfo(
             job_id=job_id,
-            ttp_id=job_name,
+            ttp_id=ttp_id or job_name,
+            label=job_name,
             ttp_version=1,
             model=model,
             job_type=JobType.OPTIMIZATION,
@@ -685,7 +783,8 @@ class JobManager:
         if isinstance(job, dict):
             return job
 
-        if job.state != JobState.RUNNING:
+        stoppable = ACTIVE_JOB_STATES if job.launcher == "slurm" else {JobState.RUNNING}
+        if job.state not in stoppable:
             return {
                 "error": f"Job {job_id} is not running (state: {job.state.value})",
                 "job": job.to_dict(),
@@ -693,7 +792,11 @@ class JobManager:
 
         checkpoint_on_stop = self._config.jobs.checkpoint_on_stop
 
-        if job._process and job._process.poll() is None:
+        if job.launcher == "slurm":
+            logger.info("Asking Slurm run %s (job %s) to checkpoint and stop",
+                        job_id, job.slurm_job_id)
+            self._stop_relayed(job)
+        elif job._process and job._process.poll() is None:
             if checkpoint_on_stop:
                 grace = self._config.jobs.stop_grace_seconds
                 logger.info(
@@ -877,8 +980,10 @@ class JobManager:
     def list_jobs(self) -> list[dict[str, Any]]:
         """Return summary info for all tracked jobs."""
         with self._lock:
+            # A Slurm run is not polled here: its monitor keeps it current,
+            # and applying its state takes this lock.
             for job in self._jobs.values():
-                if job.state == JobState.RUNNING:
+                if job.state == JobState.RUNNING and job.launcher != "slurm":
                     self._poll_process(job)
             return [j.to_dict() for j in self._jobs.values()]
 
@@ -916,6 +1021,11 @@ class JobManager:
 
         log_path = str(job.log_path)
 
+        relay = run_relay()
+        if relay is not None:
+            self._submit_to_relay(job, relay, [sys.executable, worker_script, job.toml_path, log_path], env)
+            return
+
         try:
             proc = subprocess.Popen(
                 [sys.executable, worker_script, job.toml_path, log_path],
@@ -945,6 +1055,120 @@ class JobManager:
         monitor.start()
 
         logger.info("Started job %s (pid %d) in %s", job.job_id, proc.pid, job.working_dir)
+
+    def _submit_to_relay(
+        self, job: JobInfo, relay: Path, argv: list[str], env: dict[str, str],
+    ) -> None:
+        """Hand the run to the host relay, which submits it as a Slurm job.
+
+        The job stays QUEUED, holding its slot, until the relay reports the
+        Slurm job running: a run waiting in the partition's queue is not yet
+        a run, and a supervisor told it was would watch a log that never moves.
+        """
+
+        try:
+            script = Path(job.working_dir) / "worker.sh"
+            script.write_text(_worker_script(argv, job.working_dir, env))
+            script.chmod(0o755)
+            (relay / "submit").mkdir(parents=True, exist_ok=True)
+            (relay / "submit" / job.job_id).write_text(job.working_dir + "\n")
+        except OSError as exc:
+            job.state = JobState.FAILED
+            job.error = f"Failed to hand the run to the Slurm relay at {relay}: {exc}"
+            self._save_metadata(job)
+            logger.exception("Failed to submit job %s", job.job_id)
+            return
+
+        job.launcher = "slurm"
+        self._save_metadata(job)
+        threading.Thread(target=self._monitor_slurm, args=(job,), daemon=True).start()
+        logger.info("Handed job %s to the Slurm relay in %s", job.job_id, relay)
+
+    def _read_slurm_state(self, job: JobInfo) -> Optional[dict[str, Any]]:
+        try:
+            return json.loads((Path(job.working_dir) / SLURM_STATE_FILE).read_text())
+        except (OSError, ValueError):
+            return None
+
+    def _apply_slurm_state(self, job: JobInfo) -> None:
+        """Bring a relayed job up to what the relay last saw of it."""
+
+        seen = self._read_slurm_state(job)
+        if not seen:
+            return
+        state = str(seen.get("state") or "").upper()
+        with self._lock:
+            if job.state not in ACTIVE_JOB_STATES:
+                return
+            job.slurm_job_id = seen.get("slurm_id") or job.slurm_job_id
+            if state in _SLURM_WAITING:
+                return
+            if state in _SLURM_RUNNING:
+                if job.state != JobState.RUNNING:
+                    job.state = JobState.RUNNING
+                    job.started_at = datetime.now(timezone.utc).isoformat()
+                    waited = _seconds_since(job.created_at)
+                    if waited is not None:
+                        self._window.started(waited)
+                    self._save_metadata(job)
+                return
+
+            job.finished_at = datetime.now(timezone.utc).isoformat()
+            job.exit_code = seen.get("exit_code")
+            if job._stop_requested and state in {"COMPLETED", "CANCELLED"}:
+                job.state = JobState.STOPPED
+            elif state == "COMPLETED" and not job.exit_code:
+                job.state = JobState.COMPLETED
+            else:
+                job.state = JobState.FAILED
+                job.error = (
+                    seen.get("error")
+                    or f"Slurm job {job.slurm_job_id} ended {state or 'without a state'}"
+                )
+                tail = self._slurm_log_tail(job)
+                if tail:
+                    job.error += f". Last output: {tail}"
+            self._save_metadata(job)
+
+    def _slurm_log_tail(self, job: JobInfo) -> str:
+        if not job.slurm_job_id:
+            return ""
+        try:
+            text = (Path(job.working_dir) / f"slurm-{job.slurm_job_id}.out").read_text(errors="replace")
+        except OSError:
+            return ""
+        return text[-2000:]
+
+    def _monitor_slurm(self, job: JobInfo) -> None:
+        """Background thread: follow a relayed job until it ends."""
+
+        while job.state in ACTIVE_JOB_STATES:
+            self._apply_slurm_state(job)
+            if job.state not in ACTIVE_JOB_STATES:
+                break
+            threading.Event().wait(RELAY_POLL_SECONDS)
+        logger.info("Job %s (Slurm %s) finished: state=%s",
+                    job.job_id, job.slurm_job_id, job.state.value)
+
+    def _stop_relayed(self, job: JobInfo) -> None:
+        """Ask the relay to stop a Slurm run, then wait for it to say it has.
+
+        The relay signals the job's batch script with USR1, which hands it to
+        REINVENT for the same checkpointing stop a local run gets.
+        """
+
+        relay = run_relay()
+        job._stop_requested = True
+        if relay is None:
+            return
+        (relay / "stop").mkdir(parents=True, exist_ok=True)
+        (relay / "stop" / job.job_id).write_text("")
+        deadline = self._config.jobs.stop_grace_seconds + 60.0
+        waited = 0.0
+        while job.state in ACTIVE_JOB_STATES and waited < deadline:
+            threading.Event().wait(RELAY_POLL_SECONDS)
+            waited += RELAY_POLL_SECONDS
+            self._apply_slurm_state(job)
 
     def _monitor_process(self, job: JobInfo) -> None:
         """Background thread: wait for the subprocess to finish and update state."""
@@ -990,6 +1214,9 @@ class JobManager:
     def _poll_process(self, job: JobInfo) -> None:
         """Check if a running job's subprocess is still alive."""
 
+        if job.launcher == "slurm":
+            self._apply_slurm_state(job)
+            return
         if job.state != JobState.RUNNING or job._process is None:
             return
 
@@ -1273,6 +1500,7 @@ class JobManager:
                 job = JobInfo(
                     job_id=job_id,
                     ttp_id=data.get("ttp_id", "unknown"),
+                    label=data.get("label"),
                     ttp_version=data.get("ttp_version", 1),
                     model=data.get("model", "unknown"),
                     working_dir=str(job_dir),
@@ -1288,7 +1516,16 @@ class JobManager:
                     num_epochs=data.get("num_epochs", 0),
                     exit_code=data.get("exit_code"),
                     output_model_file=data.get("output_model_file"),
+                    launcher=data.get("launcher", "local"),
+                    slurm_job_id=data.get("slurm_job_id"),
                 )
+                if job.launcher == "slurm" and job.state in ACTIVE_JOB_STATES:
+                    # The run is a Slurm job, not a child of this process, so a
+                    # runner restart leaves it running; follow it again.
+                    self._jobs[job_id] = job
+                    threading.Thread(target=self._monitor_slurm, args=(job,), daemon=True).start()
+                    logger.info("Adopting Slurm run %s (job %s)", job_id, job.slurm_job_id)
+                    continue
                 # A job that held a slot is usually dead with the process that
                 # ran it -- but not always, because the worker is a separate
                 # process whose pid is recorded right here. Any second process
@@ -1335,9 +1572,50 @@ class JobManager:
             j.job_id for j in self._jobs.values() if j.state in ACTIVE_JOB_STATES
         ]
 
+    def _queue_wait(self) -> tuple[int, Optional[float]]:
+        """Runs Slurm has not started yet, and the longest any has waited.
+        Caller holds the lock.
+
+        Only relayed runs count: a local run is QUEUED for the moment its
+        subprocess takes to report back, which says nothing about contention.
+        """
+        waits = [
+            wait
+            for j in self._jobs.values()
+            if j.state == JobState.QUEUED and j.launcher == "slurm"
+            if (wait := _seconds_since(j.created_at)) is not None
+        ]
+        return len(waits), max(waits, default=None)
+
+    def _admit_limit(self) -> int:
+        """The run window's limit after looking at the queue. Caller holds the lock."""
+        self._window.observe(self._queue_wait()[1])
+        return self._window.limit
+
+    def run_window(self) -> dict[str, Any]:
+        """How many runs may hold a slot now, and why, for ``/health`` and
+        the campaign tools that size work to it."""
+        with self._lock:
+            self._admit_limit()
+            waiting, oldest = self._queue_wait()
+            return self._window.view(len(self._active_job_ids()), waiting, oldest)
+
     def _capacity_error(self) -> dict[str, Any]:
         """Why the job was refused, and what to stop. Caller holds the lock."""
         active = self._active_job_ids()
+        if self._window.limit < self._window.ceiling:
+            # Raising the configured ceiling would not help here, and stopping
+            # a run only hands its slot to another that will wait just as long.
+            return {
+                "error": (
+                    f"The cluster is slow to start runs: {self._window.reason}. "
+                    f"{len(active)} runs are already active or waiting "
+                    f"({', '.join(active)}). Try again once one of them has "
+                    "started or finished; the window reopens as runs start promptly."
+                ),
+                "active_jobs": active,
+                "run_window": self._window.limit,
+            }
         return {
             "error": (
                 f"Maximum concurrent jobs ({self._config.jobs.max_concurrent_jobs}) "
@@ -1350,7 +1628,7 @@ class JobManager:
     def _refuse_if_full(self) -> Optional[dict[str, Any]]:
         """Pre-check, so a job that cannot start does no filesystem work."""
         with self._lock:
-            if len(self._active_job_ids()) >= self._config.jobs.max_concurrent_jobs:
+            if len(self._active_job_ids()) >= self._admit_limit():
                 return self._capacity_error()
         return None
 
@@ -1363,7 +1641,7 @@ class JobManager:
         the slot was lost, or None once the job is registered.
         """
         with self._lock:
-            if len(self._active_job_ids()) >= self._config.jobs.max_concurrent_jobs:
+            if len(self._active_job_ids()) >= self._admit_limit():
                 return self._capacity_error()
             self._jobs[job.job_id] = job
         return None
@@ -2071,6 +2349,12 @@ def get_job_manager():
     if _manager is None:
         _manager = JobManager()
     return _manager
+
+
+def local_run_window() -> Optional[dict[str, Any]]:
+    """This process's run window, or None when it has started no manager --
+    and so no runs, which leaves the configured limit as the whole answer."""
+    return None if _manager is None else _manager.run_window()
 
 
 def reset_job_manager() -> None:

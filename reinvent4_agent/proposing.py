@@ -1,7 +1,7 @@
 """What the campaign should try next, decided by the conductor's own model.
 
 This used to be a fixed sweep: seed one weight vector per objective, then
-perturb whichever of them landed on the Pareto front, forever. It had the
+perturb whichever of them scored best, forever. It had the
 virtue of being deterministic and the defect of being unable to have an idea.
 Every task was a reweighting of the same objectives, so the only experiment
 the campaign could run was "the same thing, but caring more about X" -- it
@@ -75,14 +75,15 @@ Reply with JSON only, no prose around it, in this shape:
 
 {"tasks": [{"intent": "...", "derived_from": ["task_id", ...],
             "weight_overrides": {"ObjectiveName": 2.0},
-            "rationale": "..."}]}
+            "workstream": "workstream_id", "rationale": "..."}]}
 
 `intent` is required and is handed to the agent verbatim; write it to be read \
 by the agent, not by me. `derived_from` lists the task ids whose results led \
 you here, and is empty when nothing did. `weight_overrides` is optional, uses \
 only the campaign's own objective names, and is for when you want the \
 objective weights changed from the campaign default -- omit it when the \
-intent says everything. `rationale` is one line for the human watching, \
+intent says everything. `workstream` names the plan's workstream the task \
+serves, and is omitted when the campaign has no plan. `rationale` is one line for the human watching, \
 explaining why this task and not another.
 
 Propose at most the number asked for. Propose fewer, or none at all, if the \
@@ -99,11 +100,14 @@ class TaskProposal:
     derived_from: tuple[str, ...] = ()
     weight_overrides: dict[str, float] = field(default_factory=dict)
     rationale: Optional[str] = None
+    workstream: Optional[str] = None
 
     def as_spec(self) -> dict[str, Any]:
         """The task spec the ledger stores, without the empty fields."""
 
         spec: dict[str, Any] = {"intent": self.intent}
+        if self.workstream:
+            spec["workstream"] = self.workstream
         if self.derived_from:
             spec["derived_from"] = list(self.derived_from)
         if self.weight_overrides:
@@ -125,11 +129,16 @@ class CampaignContext:
     objectives: list[str]
     tasks: list[dict[str, Any]]
     results: list[dict[str, Any]]
-    front: list[dict[str, Any]] = field(default_factory=list)
+    #: The campaign's plan, ``{"workstreams": [...]}``, when it has one.
+    plan: Optional[dict[str, Any]] = None
 
     @property
     def task_ids(self) -> set[str]:
         return {str(task["task_id"]) for task in self.tasks if task.get("task_id")}
+
+    @property
+    def workstreams(self) -> list[dict[str, Any]]:
+        return list((self.plan or {}).get("workstreams") or [])
 
 
 @runtime_checkable
@@ -159,6 +168,42 @@ def _clip(text: Any, limit: int = SUMMARY_CHARS) -> str:
     return body if len(body) <= limit else body[: limit - 1] + "…"
 
 
+def _render_plan(context: CampaignContext) -> list[str]:
+    """The workstreams with how much each has had, so gaps are visible.
+
+    Counted from the tasks rather than read from the store's coverage view,
+    so the proposer and the ledger read it from the same snapshot.
+    """
+
+    counts: dict[str, dict[str, int]] = {}
+    for task in context.tasks:
+        stream = (task.get("spec") or {}).get("workstream")
+        if stream:
+            by_state = counts.setdefault(str(stream), {})
+            state = str(task.get("state", "unknown"))
+            by_state[state] = by_state.get(state, 0) + 1
+
+    lines = ["The goal is split into these workstreams:"]
+    for stream in context.workstreams:
+        stream_id = str(stream.get("id"))
+        status = stream.get("status") or "open"
+        share = stream.get("share")
+        seen = counts.get(stream_id, {})
+        tally = ", ".join(f"{n} {state}" for state, n in sorted(seen.items())) or "no tasks yet"
+        head = f"- {stream_id}: {stream.get('name') or stream_id} [{status}"
+        head += f", share {share}]" if share is not None else "]"
+        lines.append(f"{head} -- {tally}")
+        if stream.get("question"):
+            lines.append(f"    question: {_clip(stream['question'], 300)}")
+    lines += [
+        "Tag every task with the workstream it serves, and favour open "
+        "workstreams that have had the least. A settled or dropped workstream "
+        "gets no new tasks.",
+        "",
+    ]
+    return lines
+
+
 def render_context(context: CampaignContext) -> str:
     """The campaign as the model reads it.
 
@@ -182,6 +227,9 @@ def render_context(context: CampaignContext) -> str:
             "",
         ]
 
+    if context.workstreams:
+        lines += _render_plan(context)
+
     if not context.tasks:
         lines.append(
             "Nothing has been dispatched yet. These are the campaign's first "
@@ -191,16 +239,12 @@ def render_context(context: CampaignContext) -> str:
         )
         return "\n".join(lines)
 
-    on_front = {str(member.get("task_id")) for member in context.front}
     lines.append("What has been tried:")
     for task in context.tasks:
         task_id = str(task.get("task_id"))
         spec = task.get("spec") or {}
         state = task.get("state", "unknown")
-        head = f"- {task_id} [{state}]"
-        if task_id in on_front:
-            head += " [on the Pareto front]"
-        lines.append(head)
+        lines.append(f"- {task_id} [{state}]")
         if spec.get("intent"):
             lines.append(f"    asked: {_clip(spec['intent'], 300)}")
         if spec.get("weight_overrides"):
@@ -301,6 +345,7 @@ def parse_proposals(
 
     known_tasks = context.task_ids
     known_objectives = set(context.objectives)
+    known_streams = {str(stream.get("id")) for stream in context.workstreams}
 
     proposals: list[TaskProposal] = []
     for entry in raw:
@@ -348,6 +393,13 @@ def parse_proposals(
             except (TypeError, ValueError):
                 logger.warning("dropping weight for '%s': %r is not a number", name, value)
 
+        stream = str(entry.get("workstream") or "").strip() or None
+        if stream and stream not in known_streams:
+            logger.warning(
+                "dropping workstream '%s': not a workstream of this campaign", stream
+            )
+            stream = None
+
         rationale = str(entry.get("rationale") or "").strip() or None
         proposals.append(
             TaskProposal(
@@ -355,6 +407,7 @@ def parse_proposals(
                 derived_from=tuple(derived),
                 weight_overrides=weights,
                 rationale=rationale,
+                workstream=stream,
             )
         )
 

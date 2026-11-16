@@ -95,6 +95,48 @@ _TEMPLATE_CONCAT_RE = re.compile(
     r'can only concatenate str \(not "(?:dict|list|int|float|bool)"\) to str'
 )
 
+#: How the endpoints we meet say "this request does not fit".  vLLM also
+#: reaches the second form by subtracting the prompt from ``max-model-len``
+#: and finding nothing left, which reads as a nonsensical token cap rather
+#: than as the overflow it is.
+_CONTEXT_OVERFLOW_RE = re.compile(
+    r"maximum context length|context[ _]length[ _]exceeded"
+    r"|reduce the length of the messages"
+    r"|max_tokens must be at least 1"
+    r"|longer than the maximum model length",
+    re.IGNORECASE,
+)
+
+#: Tokens left for the reply once the prompt is counted against the
+#: window.  Below this the request is not worth sending: the model would
+#: have room for a sentence and no tool call.
+_MIN_REPLY_TOKENS = 1024
+
+#: What is left of a tool result the model has already answered, once one
+#: turn has outgrown the window.
+_READ_RESULT_CHARS = 2000
+_DROPPED_NOTE = (
+    "dropped to keep the conversation inside the model's context window; "
+    "call the tool again if you need them ...]"
+)
+
+_OVERFLOW_HINTS = (
+    "The conversation is longer than the model's context window, even "
+    "after shortening it; start a new conversation.",
+    "A single tool result that large is clipped by "
+    "REINVENT4_AGENT_MAX_TOOL_RESULT_CHARS; lower it if one tool keeps "
+    "filling the window.",
+)
+
+#: Wait for the model listing that reports the served context length.
+_WINDOW_TIMEOUT = 5.0
+
+#: Attempts one ``complete`` makes while the endpoint keeps rejecting the
+#: request.  Each one gives up something -- the token cap, then the oldest
+#: exchanges -- so a few are enough and an endpoint that rejects for a
+#: reason we cannot fix still fails quickly.
+_MAX_ADAPTATIONS = 4
+
 
 class OpenAIBackend(LLMBackend):
     """OpenAI Chat Completions API backend.
@@ -202,6 +244,11 @@ class OpenAIBackend(LLMBackend):
         # Set once an endpoint rejects a history that holds a tool call --
         # see _TEMPLATE_CONCAT_RE.
         self._quote_tool_arguments = False
+        # The served window, from the environment or from the endpoint the
+        # first time anyone asks.  0 means "asked, and it did not say".
+        self._window = _env_int("REINVENT4_AGENT_CONTEXT_TOKENS")
+        #: Prompt tokens of the last completion, to leave the reply room.
+        self._last_prompt_tokens = 0
 
     # ------------------------------------------------------------------
     # LLMBackend interface
@@ -232,27 +279,7 @@ class OpenAIBackend(LLMBackend):
             # tool_choice=required only when the caller sets force_tool_use.
             kwargs["tool_choice"] = "required" if force_tool_use else "auto"
 
-        try:
-            response = self._request(kwargs)
-        except openai.BadRequestError as exc:
-            if not self._adapt_to_rejection(exc, kwargs):
-                raise EndpointError(
-                    rejected_request_report(
-                        exc,
-                        self._endpoint_label(),
-                        hints=self._route_hints(),
-                    )
-                ) from exc
-            try:
-                response = self._request(kwargs)
-            except openai.BadRequestError as retry_exc:
-                raise EndpointError(
-                    rejected_request_report(
-                        retry_exc,
-                        self._endpoint_label(),
-                        hints=self._route_hints(),
-                    )
-                ) from retry_exc
+        response = self._request_adapting(kwargs)
 
         choice = response.choices[0]
         message = choice.message
@@ -293,6 +320,7 @@ class OpenAIBackend(LLMBackend):
         usage = getattr(response, "usage", None)
         output_tokens = getattr(usage, "completion_tokens", 0) or 0
         reasoning_tokens = _reasoning_tokens(usage)
+        self._last_prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
 
         # An empty turn would otherwise read as "the model is done", and
         # the agent loop would end the turn with nothing to show.  Leave
@@ -360,10 +388,74 @@ class OpenAIBackend(LLMBackend):
         self._messages = [
             {"role": "system", "content": system_prompt},
         ]
+        self._last_prompt_tokens = 0
+
+    def export_history(self) -> list[dict[str, Any]]:
+        return [dict(message) for message in self._messages[self._body_at():]]
+
+    def import_history(self, messages: list[dict[str, Any]]) -> None:
+        self._messages[self._body_at():] = [dict(m) for m in messages]
+        self._last_prompt_tokens = 0
+
+    @property
+    def context_window(self) -> int | None:
+        """What the endpoint says it will accept, asked once.
+
+        ``max_model_len`` on the model listing is what the server was
+        started with, which is the only number that matters: a deployment
+        commonly serves far less than the weights allow, and sometimes --
+        with RoPE scaling -- more.
+        """
+        if self._window is None:
+            self._window = self._ask_window() or 0
+        return self._window or None
+
+    def forget_oldest(self) -> int:
+        """Drop the first exchange, keeping the system prompt.
+
+        Cuts at the next user message so a tool call is never separated
+        from its result, which would make every later request invalid.
+        """
+        start = self._body_at()
+        nxt = next(
+            (
+                i
+                for i in range(start + 1, len(self._messages))
+                if self._messages[i].get("role") == "user"
+            ),
+            None,
+        )
+        if nxt is None:
+            return 0
+        del self._messages[start:nxt]
+        return nxt - start
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _ask_window(self) -> int | None:
+        """The served context length, or ``None`` if the endpoint is quiet.
+
+        Runs on a path where nothing may fail: an endpoint that does not
+        list its models, or lists them without the field, simply leaves
+        the caller to find the limit the hard way.
+        """
+        try:
+            # Short: the answer is a nicety, and this runs where a turn is
+            # waiting on it.
+            for model in self.client.with_options(timeout=_WINDOW_TIMEOUT).models.list().data:
+                if model.id != self.model:
+                    continue
+                length = getattr(model, "max_model_len", None)
+                if length is None:
+                    length = (getattr(model, "model_extra", None) or {}).get("max_model_len")
+                if isinstance(length, int) and length > 0:
+                    logger.info("%s serves %s with a %d-token context", self._endpoint_label(), self.model, length)
+                    return length
+        except Exception:
+            logger.debug("could not read the context window from %s", self._endpoint_label(), exc_info=True)
+        return None
 
     def _endpoint_label(self) -> str:
         return self.base_url or "https://api.openai.com"
@@ -393,6 +485,11 @@ class OpenAIBackend(LLMBackend):
             "REINVENT4_AGENT_BASE_URL.",
         ]
 
+    def _body_at(self) -> int:
+        """Where the conversation starts, after the system prompt if there is one."""
+        first = self._messages[0] if self._messages else None
+        return 1 if first and first.get("role") == "system" else 0
+
     def _history_messages(self) -> list[dict[str, Any]]:
         """The conversation in the shape this endpoint has accepted so far."""
         return [
@@ -400,12 +497,38 @@ class OpenAIBackend(LLMBackend):
             for m in self._messages
         ]
 
+    def _request_adapting(self, kwargs: dict[str, Any]) -> Any:
+        """Send the request, giving something up each time it comes back rejected."""
+        attempts = 0
+        while True:
+            try:
+                return self._request(kwargs)
+            except openai.BadRequestError as exc:
+                attempts += 1
+                if attempts >= _MAX_ADAPTATIONS or not self._adapt_to_rejection(exc, kwargs):
+                    hints = (
+                        _OVERFLOW_HINTS
+                        if _CONTEXT_OVERFLOW_RE.search(str(exc))
+                        else self._route_hints()
+                    )
+                    raise EndpointError(
+                        rejected_request_report(
+                            exc, self._endpoint_label(), hints=hints
+                        )
+                    ) from exc
+
     def _adapt_to_rejection(
         self,
         exc: openai.BadRequestError,
         kwargs: dict[str, Any],
     ) -> bool:
         """Rewrite ``kwargs`` for a retry, or report that nothing applies."""
+
+        if _CONTEXT_OVERFLOW_RE.search(str(exc)):
+            # Ahead of the token-parameter swap: vLLM reports an overflow as
+            # a negative cap on "max_tokens", which otherwise reads as the
+            # endpoint asking for the other parameter name.
+            return self._make_room(kwargs)
 
         swapped = self._swap_token_param(exc)
         if swapped is not None:
@@ -425,6 +548,71 @@ class OpenAIBackend(LLMBackend):
         self._quote_tool_arguments = True
         kwargs["messages"] = self._history_messages()
         return True
+
+    def _make_room(self, kwargs: dict[str, Any]) -> bool:
+        """Shrink the request until it fits: the reply first, then the history.
+
+        The reply goes first because it costs nothing but length, and a
+        conversation that has filled its window usually asked for a cap
+        that no longer fits beside it.  Only then is history given up,
+        which loses something the model knew.
+        """
+        cap = kwargs.get(self._token_param)
+        if isinstance(cap, int) and cap > _MIN_REPLY_TOKENS:
+            logger.info(
+                "%s has no room for a %d-token reply; asking for %d instead.",
+                self._endpoint_label(),
+                cap,
+                _MIN_REPLY_TOKENS,
+            )
+            kwargs[self._token_param] = _MIN_REPLY_TOKENS
+            return True
+
+        dropped = self.forget_oldest()
+        if dropped:
+            logger.warning(
+                "The conversation no longer fits %s; dropped the oldest %d "
+                "message(s) and retried.",
+                self._endpoint_label(),
+                dropped,
+            )
+        else:
+            # One long turn has no older exchange to give up; what fills it
+            # is the results the model has already read and acted on.
+            dropped = self._shorten_read_results()
+            if not dropped:
+                return False
+            logger.warning(
+                "One turn no longer fits %s; shortened %d earlier tool "
+                "result(s) and retried.",
+                self._endpoint_label(),
+                dropped,
+            )
+        kwargs["messages"] = self._history_messages()
+        return True
+
+    def _shorten_read_results(self) -> int:
+        """Cut every tool result but the latest down to its opening lines.
+
+        The latest is kept whole because the model has not answered it yet.
+        """
+        tools = [m for m in self._messages if m.get("role") == "tool"]
+        shortened = 0
+        for message in tools[:-1]:
+            content = message.get("content")
+            if (
+                not isinstance(content, str)
+                or len(content) <= _READ_RESULT_CHARS
+                or content.endswith(_DROPPED_NOTE)
+            ):
+                continue
+            message["content"] = (
+                content[:_READ_RESULT_CHARS]
+                + f"\n[... {len(content) - _READ_RESULT_CHARS} characters "
+                + _DROPPED_NOTE
+            )
+            shortened += 1
+        return shortened
 
     def _request(self, kwargs: dict[str, Any]) -> Any:
         """Send one request, translating transport errors into hints."""
@@ -476,10 +664,8 @@ class OpenAIBackend(LLMBackend):
         entirely on reasoning — the turn then comes back empty, and the
         longer the conversation grows the more reliably it does.
         """
-        if self._token_param != "max_completion_tokens":
-            return max_tokens
-        if max_tokens >= MIN_REASONING_TOKEN_CAP:
-            return max_tokens
+        if self._token_param != "max_completion_tokens" or max_tokens >= MIN_REASONING_TOKEN_CAP:
+            return self._within_window(max_tokens)
         logger.info(
             "Raising the token cap from %d to %d for %s: the cap also has "
             "to cover the model's hidden reasoning tokens.",
@@ -487,7 +673,25 @@ class OpenAIBackend(LLMBackend):
             MIN_REASONING_TOKEN_CAP,
             self.model,
         )
-        return MIN_REASONING_TOKEN_CAP
+        return self._within_window(MIN_REASONING_TOKEN_CAP)
+
+    def _within_window(self, cap: int) -> int:
+        """``cap``, lowered to what the window has left beside the prompt.
+
+        vLLM derives the room for a reply by subtracting the prompt from
+        ``max-model-len``, so a cap sized for an empty conversation starts
+        failing once the conversation is long.  The prompt has grown since
+        it was last measured -- by this round's tool results -- which only
+        the rejection path can know about, so this keeps the request legal
+        in the common case and :meth:`_make_room` covers the rest.
+        """
+        window = self.context_window
+        if not window or not self._last_prompt_tokens:
+            return cap
+        room = window - self._last_prompt_tokens
+        if room >= cap:
+            return cap
+        return max(room, _MIN_REPLY_TOKENS)
 
     def _empty_response_report(
         self,
@@ -832,6 +1036,15 @@ def _message_to_dict(message: ChatCompletionMessage) -> dict[str, Any]:
             for tc in message.tool_calls
         ]
     return d
+
+
+def _env_int(name: str) -> int | None:
+    """A positive integer from the environment, or ``None`` if unusable."""
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def _get_username() -> str:

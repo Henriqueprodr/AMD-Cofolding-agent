@@ -2,7 +2,7 @@
 
 One module so there is a single definition of the ledger's wire format. The
 two sides use disjoint halves of it -- supervisors claim and report, the
-conductor opens campaigns, enqueues work and reads the front -- but they have
+conductor opens campaigns, enqueues work and reads the results -- but they have
 to agree on what a task looks like, and a second copy would drift.
 
 The error types matter as much as the calls. ``LeaseLost`` and
@@ -17,6 +17,7 @@ import os
 import socket
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -52,10 +53,16 @@ class LeaseLost(Exception):
 class TaskOutcome:
     """What a finished task reports back to the ledger."""
 
-    objective_profile: dict[str, float]
+    objective_profile: dict[str, float] = field(default_factory=dict)
     candidates: list[dict[str, Any]] = field(default_factory=list)
     job_id: Optional[str] = None
     summary: Optional[str] = None
+    #: The sub-agent's account of the task, for the conductor.
+    report: Optional[str] = None
+    #: Every run the task started; ``job_id`` is the one its molecules came from.
+    job_ids: list[str] = field(default_factory=list)
+    #: Next tasks the sub-agent would run: ``{"intent", "title", "kind", "rationale"}``.
+    follow_ups: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _detail(response: requests.Response) -> str:
@@ -127,14 +134,42 @@ class CampaignStoreClient:
         self._call("POST", f"/tasks/{task_id}/heartbeat", **body)
 
     def post_result(self, task_id: str, outcome: TaskOutcome) -> dict[str, Any]:
-        return self._call(
-            "POST", f"/tasks/{task_id}/result",
-            owner=self.owner,
-            objective_profile=outcome.objective_profile,
-            candidates=outcome.candidates,
-            job_id=outcome.job_id,
-            summary=outcome.summary,
-        )
+        body: dict[str, Any] = {
+            "owner": self.owner,
+            "objective_profile": outcome.objective_profile,
+            "candidates": outcome.candidates,
+            "job_id": outcome.job_id,
+            "summary": outcome.summary,
+        }
+        if outcome.report:
+            body["report"] = outcome.report
+        if outcome.job_ids:
+            body["job_ids"] = outcome.job_ids
+        if outcome.follow_ups:
+            body["follow_ups"] = outcome.follow_ups
+        try:
+            return self._call("POST", f"/tasks/{task_id}/result", **body)
+        except StoreUnavailable as exc:
+            if "422" not in str(exc) or not ({"report", "job_ids", "follow_ups"} & set(body)):
+                raise
+            if "follow_ups" in body:
+                # Proposals are worth less than the result they would cost.
+                logger.warning("the ledger does not take follow-ups yet; posting %s without them", task_id)
+                body.pop("follow_ups")
+                try:
+                    return self._call("POST", f"/tasks/{task_id}/result", **body)
+                except StoreUnavailable as again:
+                    if "422" not in str(again):
+                        raise
+        # A ledger older than reports refuses the fields it does not know,
+        # and the task would be lost over a column. The supervisors and the
+        # ledger restart separately, so the two are out of step for a while
+        # on every upgrade; the report survives inside the summary instead.
+        logger.warning("the ledger does not take reports yet; posting %s without one", task_id)
+        legacy = {k: v for k, v in body.items() if k not in ("report", "job_ids")}
+        if outcome.report:
+            legacy["summary"] = "\n\n".join(filter(None, [outcome.summary, outcome.report]))
+        return self._call("POST", f"/tasks/{task_id}/result", **legacy)
 
     def fail(self, task_id: str, error: str, requeue: bool = True) -> dict[str, Any]:
         return self._call(
@@ -180,16 +215,94 @@ class CampaignStoreClient:
         concurrency: int = 1,
         dispatch_seconds: Optional[float] = None,
         grace_seconds: float = 0.0,
+        parent_campaign_id: Optional[str] = None,
+        parent_task_id: Optional[str] = None,
     ) -> dict[str, Any]:
+        lineage = {
+            key: value for key, value in (
+                ("parent_campaign_id", parent_campaign_id),
+                ("parent_task_id", parent_task_id),
+            ) if value
+        }
         return self._call(
             "POST", "/campaigns",
             goal=goal, base_ttp_id=base_ttp_id, objectives=objectives or [],
             concurrency=concurrency, dispatch_seconds=dispatch_seconds,
-            grace_seconds=grace_seconds,
+            grace_seconds=grace_seconds, **lineage,
         )
 
     def enqueue_task(self, campaign_id: str, **spec: Any) -> dict[str, Any]:
         return self._call("POST", f"/campaigns/{campaign_id}/tasks", **spec)
+
+    def enqueue_tasks(self, campaign_id: str, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Queue several tasks in one transaction: all of them or none."""
+        return self._call("POST", f"/campaigns/{campaign_id}/tasks/batch", tasks=tasks)
+
+    def set_plan(self, campaign_id: str, workstreams: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._call("PUT", f"/campaigns/{campaign_id}/plan", workstreams=workstreams)
+
+    def coverage(self, campaign_id: str) -> dict[str, Any]:
+        return self._get(f"/campaigns/{campaign_id}/coverage")
+
+    def metrics(self, campaign_id: str) -> dict[str, Any]:
+        return self._get(f"/campaigns/{campaign_id}/metrics")
+
+    def proposals(self, campaign_id: str, state: Optional[str] = "open") -> list[dict[str, Any]]:
+        query = f"?state={state}" if state else ""
+        return self._get(f"/campaigns/{campaign_id}/proposals{query}")
+
+    def take_proposals(
+        self, campaign_id: str, proposal_ids: list[str], priority: int = 0,
+    ) -> list[dict[str, Any]]:
+        return self._call(
+            "POST", f"/campaigns/{campaign_id}/proposals/take",
+            proposal_ids=proposal_ids, priority=priority,
+        )
+
+    def drop_proposals(self, campaign_id: str, proposal_ids: list[str]) -> dict[str, Any]:
+        return self._call(
+            "POST", f"/campaigns/{campaign_id}/proposals/drop", proposal_ids=proposal_ids,
+        )
+
+    def record_finding(
+        self, campaign_id: str, author: str, branch: str, claim: str, **fields: Any
+    ) -> dict[str, Any]:
+        """Add to what the campaign knows."""
+
+        return self._call(
+            "POST", f"/campaigns/{campaign_id}/findings",
+            author=author, branch=branch, claim=claim, **fields,
+        )
+
+    def note_finding(
+        self, campaign_id: str, finding_id: str, author: str, body: str, **fields: Any
+    ) -> dict[str, Any]:
+        return self._call(
+            "POST", f"/campaigns/{campaign_id}/findings/{finding_id}/notes",
+            author=author, body=body, **fields,
+        )
+
+    def findings(
+        self,
+        campaign_id: str,
+        branch: Optional[str] = None,
+        q: Optional[str] = None,
+        tag: Optional[str] = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        query = {"limit": str(limit)}
+        if branch:
+            query["branch"] = branch
+        if q:
+            query["q"] = q
+        if tag:
+            query["tag"] = tag
+        return self._get(f"/campaigns/{campaign_id}/findings?{urlencode(query)}")
+
+    def atlas(self, campaign_id: str) -> dict[str, Any]:
+        """The map of what each branch of the campaign knows."""
+
+        return self._get(f"/campaigns/{campaign_id}/atlas")
 
     def campaign(self, campaign_id: str) -> dict[str, Any]:
         return self._get(f"/campaigns/{campaign_id}")
@@ -213,9 +326,6 @@ class CampaignStoreClient:
 
     def status(self, campaign_id: str) -> dict[str, Any]:
         return self._get(f"/campaigns/{campaign_id}/status")
-
-    def pareto(self, campaign_id: str) -> dict[str, Any]:
-        return self._get(f"/campaigns/{campaign_id}/pareto")
 
     def results(
         self, campaign_id: str, full: bool = False
@@ -246,6 +356,10 @@ class CampaignStoreClient:
 
     def close_campaign(self, campaign_id: str) -> dict[str, Any]:
         return self._call("POST", f"/campaigns/{campaign_id}/close")
+
+    def conducted(self, campaign_id: str) -> dict[str, Any]:
+        """Say this conductor holds the campaign, which keeps its tasks claimable."""
+        return self._call("POST", f"/campaigns/{campaign_id}/conducted")
 
     def finalize_campaign(self, campaign_id: str) -> dict[str, Any]:
         return self._call("POST", f"/campaigns/{campaign_id}/finalize")

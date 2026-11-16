@@ -67,10 +67,28 @@ from reinvent4_agent.proposing import (
     make_proposer,
 )
 from reinvent4_agent.service_registry import apply_registry
+from reinvent4_mcp.jobs.admission import AimdWindow
 
 logger = logging.getLogger(__name__)
 
 TICK_SECONDS = float(os.getenv("CONDUCTOR_TICK_SECONDS", "30"))
+
+#: How long a slot may stay free while an agent conducts before the loop
+#: fills it itself. Long enough for a conductor that was woken by the report
+#: to read it and dispatch; short enough that a conductor that will not costs
+#: a minute or two of a sub-agent rather than the rest of the campaign.
+FLOOR_SECONDS = float(os.getenv("CONDUCTOR_FLOOR_SECONDS", "90"))
+
+#: Priority of what the floor queues. Under the default 0, so the
+#: conductor's own tasks are claimed first whenever both are waiting.
+FLOOR_PRIORITY = -1
+
+#: Dispatch window given to a campaign opened without one, and the drain
+#: window after it. Long enough to outlast any session a person watches,
+#: short enough that an abandoned campaign closes itself.
+DEFAULT_CAMPAIGN_HOURS = float(os.getenv("CAMPAIGN_DEFAULT_HOURS", "12"))
+DEFAULT_GRACE_HOURS = float(os.getenv("CAMPAIGN_DEFAULT_GRACE_HOURS", "2"))
+
 GATEWAY_STATS_URL = os.getenv(
     "BOLTZ_GATEWAY_STATS_URL", "http://dd-agentic-boltz-gateway:8091/stats"
 )
@@ -141,6 +159,8 @@ class TickReport:
     held_back: Optional[str] = None
     closed: bool = False
     finalized: bool = False
+    #: Whether this pass filled slots the conducting agent had left free.
+    floor: bool = False
 
 
 class CampaignConductor:
@@ -153,21 +173,44 @@ class CampaignConductor:
         *,
         scaler: Optional[PoolScaler] = None,
         proposer: Optional[Proposer] = None,
+        propose: bool = True,
         task_budget_seconds: Optional[float] = None,
         max_steps: Optional[int] = None,
         max_queue_pressure: float = 2.0,
         tick_seconds: float = TICK_SECONDS,
         stats_url: str = GATEWAY_STATS_URL,
+        floor_seconds: Optional[float] = FLOOR_SECONDS,
+        clock: Any = time.monotonic,
     ) -> None:
         self.store = store
         self.campaign_id = campaign_id
         self.scaler = scaler
         self.proposer = proposer
+        #: Whether an idle slot is filled by asking a model what to run next.
+        #: Off when an agent is conducting the campaign itself: it dispatches
+        #: with enqueue_task from the conversation, and a loop proposing
+        #: alongside it would spend the pool on work nobody asked for and
+        #: hide the user's own tasks behind a queue.
+        self.propose = propose
         self.task_budget_seconds = task_budget_seconds
         self.max_steps = max_steps
         self.max_queue_pressure = max_queue_pressure
         self.tick_seconds = tick_seconds
         self.stats_url = stats_url
+        #: With an agent conducting, how long a slot may stay free before
+        #: the loop fills it; None or 0 leaves every slot to the agent.
+        self.floor_seconds = floor_seconds
+        self._clock = clock
+        #: When the team was first seen short of work, for the floor. In
+        #: memory on purpose: a restarted loop only gives the agent its full
+        #: grace again, it cannot dispatch twice.
+        self._short_since: Optional[float] = None
+        #: How many of the team's tasks may be open while Boltz is the
+        #: bottleneck. Its ceiling is the campaign's concurrency; in memory
+        #: for the same reason, as a restarted loop only starts it open again.
+        self._window = AimdWindow(
+            1, floor=1, cooldown=max(60.0, 2 * tick_seconds), clock=clock,
+        )
 
     # -- deadlines ---------------------------------------------------------
 
@@ -200,6 +243,7 @@ class CampaignConductor:
         changes nothing and a restarted conductor needs no recovery path.
         """
 
+        self.store.conducted(self.campaign_id)
         status = self.store.status(self.campaign_id)
         campaign = status["campaign"]
         counts = status["task_counts"]
@@ -227,57 +271,152 @@ class CampaignConductor:
                 report.closed = True
             return report
 
+        if campaign["state"] == "draining" and not (in_flight or queued):
+            # Closed by hand rather than by the clock, and now empty. Without
+            # this the pool sits at concurrency doing nothing until the hard
+            # stop, which for a campaign opened with no deadline is forever.
+            logger.info(
+                "campaign %s was closed and has nothing left in it; finalizing",
+                self.campaign_id,
+            )
+            self._finalize()
+            report.finalized = True
+            return report
+
         # Dispatch window.
         target = campaign.get("concurrency") or 1
         if self.scaler:
             self.scaler.scale(target)
 
-        shortfall = target - (in_flight + queued)
+        # The leads' campaigns draw on this pool, so their tasks hold slots too.
+        team = status.get("team_counts") or counts
+        open_tasks = team.get("claimed", 0) + team.get("queued", 0)
+        shortfall = target - open_tasks
         if shortfall <= 0:
+            self._short_since = None
             return report
 
-        pressure = queue_pressure(self.stats_url)
-        if pressure is not None and pressure > self.max_queue_pressure:
-            # Another task would only deepen a queue that is already the
-            # bottleneck; the supervisors are not what is limiting throughput.
-            report.held_back = (
-                f"boltz queue at {pressure:.1f} batches per replica, "
-                f"over the {self.max_queue_pressure:.1f} limit"
-            )
+        if not self.propose:
+            # An agent is conducting this campaign, and an idle slot is its
+            # to fill: it holds the conversation that knows what the slot is
+            # for. Only once it has let one sit past the grace does the loop
+            # fill it, below the agent's priority.
+            return self._floor(campaign, status, target, open_tasks, report)
+
+        shortfall = self._admit(target, open_tasks, report)
+        if shortfall <= 0:
             logger.info("holding dispatch: %s", report.held_back)
             return report
 
         report.dispatched = self._dispatch(campaign, status, shortfall)
         return report
 
-    def _context(self, campaign: dict[str, Any]) -> CampaignContext:
-        """The campaign as the proposer will see it, from one read.
+    def _admit(self, target: int, open_tasks: int, report: TickReport) -> int:
+        """How many tasks Boltz has room for, through the dispatch window.
 
-        The Pareto front is included as a hint about which results held up,
-        not as the thing being refined: it is a cheap, honest summary of
-        "these were not beaten", and the proposer is free to ignore it and
-        build on a task that is nowhere near it.
+        The window closes by half when the scorer's queue is over the limit
+        and opens by one a pass while it is back under half of it; in
+        between, it holds. That band is the hysteresis: a queue hovering at
+        the limit would otherwise open and close the fleet every pass, which
+        is what the fixed threshold did. An unread queue moves it neither
+        way, so a gateway that is down or not deployed never closes it.
         """
 
-        tasks = self.store.tasks(self.campaign_id)
-        try:
-            front = self.store.pareto(self.campaign_id)["front"]
-        except (StoreUnavailable, KeyError, TypeError):
-            # A front is a convenience here, not a premise. Losing it should
-            # cost the proposer a hint, not cost the campaign a tick.
-            logger.warning("no pareto front available; proposing without it")
-            front = []
+        window = self._window
+        window.set_ceiling(target)
+        pressure = queue_pressure(self.stats_url)
+        if pressure is not None:
+            if pressure > self.max_queue_pressure:
+                window.cut(
+                    f"boltz queue at {pressure:.1f} batches per replica, "
+                    f"over the {self.max_queue_pressure:.1f} limit"
+                )
+            elif pressure <= self.max_queue_pressure / 2:
+                window.grow(1)
+
+        room = window.limit - open_tasks
+        if room <= 0:
+            where = "unread" if pressure is None else f"{pressure:.1f} batches per replica"
+            report.held_back = (
+                f"boltz queue at {where}: the dispatch window is at {window.limit} "
+                f"of {target} and {open_tasks} tasks are open"
+            )
+        return room
+
+    def _floor(
+        self,
+        campaign: dict[str, Any],
+        status: dict[str, Any],
+        target: int,
+        open_tasks: int,
+        report: TickReport,
+    ) -> TickReport:
+        """Fill free slots the conducting agent has left free too long.
+
+        From what the sub-agents proposed first -- each one was written by
+        an agent that had just done the work it follows from -- and from the
+        proposer only for what that does not cover.
+        """
+
+        if not self.floor_seconds or self.floor_seconds <= 0:
+            return report
+        now = self._clock()
+        if self._short_since is None:
+            self._short_since = now
+            return report
+        if now - self._short_since < self.floor_seconds:
+            return report
+
+        shortfall = self._admit(target, open_tasks, report)
+        if shortfall <= 0:
+            return report
+
+        filled = 0
+        if status.get("open_proposals"):
+            try:
+                proposals = self.store.proposals(self.campaign_id)[:shortfall]
+                if proposals:
+                    taken = self.store.take_proposals(
+                        self.campaign_id,
+                        [p["proposal_id"] for p in proposals],
+                        priority=FLOOR_PRIORITY,
+                    )
+                    filled = len(taken)
+            except StoreUnavailable as exc:
+                logger.warning("could not take proposals on campaign %s: %s", self.campaign_id, exc)
+
+        if filled < shortfall:
+            filled += self._dispatch(
+                campaign, status, shortfall - filled, priority=FLOOR_PRIORITY,
+            )
+
+        if filled:
+            logger.info(
+                "a slot stayed free %.0fs on campaign %s; filled %d of %d",
+                now - self._short_since, self.campaign_id, filled, shortfall,
+            )
+            self._short_since = None
+        report.dispatched = filled
+        report.floor = filled > 0
+        return report
+
+    def _context(self, campaign: dict[str, Any]) -> CampaignContext:
+        """The campaign as the proposer will see it, from one read."""
 
         return CampaignContext(
             goal=campaign.get("goal") or "",
             objectives=list(campaign.get("objectives") or []),
-            tasks=tasks,
+            tasks=self.store.tasks(self.campaign_id),
             results=self.store.results(self.campaign_id),
-            front=front,
+            plan=campaign.get("plan"),
         )
 
     def _dispatch(
-        self, campaign: dict[str, Any], status: dict[str, Any], count: int
+        self,
+        campaign: dict[str, Any],
+        status: dict[str, Any],
+        count: int,
+        priority: int = 0,
     ) -> int:
         """Enqueue up to `count` tasks the proposer has decided on."""
 
@@ -307,6 +446,12 @@ class CampaignConductor:
                 spec["deadline"] = deadline
             if self.max_steps:
                 spec["max_steps"] = self.max_steps
+            if priority:
+                spec["priority"] = priority
+                spec["rationale"] = (
+                    "Filled a sub-agent the conductor had left without work. "
+                    + (spec.get("rationale") or "")
+                ).strip()
             try:
                 task = self.store.enqueue_task(self.campaign_id, **spec)
             except StoreUnavailable as exc:
@@ -319,7 +464,13 @@ class CampaignConductor:
 
         return dispatched
 
-    def _finalize(self) -> None:
+    def stop(self) -> None:
+        """End the campaign now, for a person who stopped it: what is
+        queued is abandoned, what is running is stopped, the pool goes home."""
+
+        self._finalize("stopped by the user")
+
+    def _finalize(self, why: str = "hard stop reached") -> None:
         """Close the ledger, stop the orphaned jobs, and send the pool home.
 
         In the normal case every in-flight task has already stopped itself at
@@ -335,7 +486,7 @@ class CampaignConductor:
         fires before this and stops the job *with* a checkpoint.
         """
 
-        logger.info("hard stop reached; finalizing campaign %s", self.campaign_id)
+        logger.info("%s; finalizing campaign %s", why, self.campaign_id)
 
         campaign = self.store.campaign(self.campaign_id)
         # Read the open tasks before the store abandons them.
@@ -439,23 +590,31 @@ def start_campaign(
     is the common case: each task then writes the TTP its own experiment
     needs. Give a base TTP to sweep a profile that already exists, in which
     case the objectives default to the ones it declares.
+
+    A campaign asked for with no window gets :data:`DEFAULT_CAMPAIGN_HOURS`
+    rather than none. Without a deadline the store's phase stays
+    ``dispatching`` whatever happens, so nothing ever closes the campaign:
+    an agent that opens one and moves on leaves it in the ledger forever,
+    holding its pool and crowding every later campaign out of the list.
     """
 
     if base_ttp_id and not objectives:
         objectives = objectives_of(base_ttp_id)
 
+    window = hours if hours else DEFAULT_CAMPAIGN_HOURS
+    grace = grace_hours if grace_hours else DEFAULT_GRACE_HOURS
     campaign = store.create_campaign(
         goal=goal,
         base_ttp_id=base_ttp_id,
         objectives=objectives or [],
         concurrency=concurrency,
-        dispatch_seconds=hours * 3600 if hours else None,
-        grace_seconds=grace_hours * 3600,
+        dispatch_seconds=window * 3600,
+        grace_seconds=grace * 3600,
     )
     logger.info(
-        "campaign %s open: %d supervisors over %s",
-        campaign["campaign_id"], concurrency,
-        f"{hours}h" if hours else "no deadline",
+        "campaign %s open: %d supervisors over %sh%s",
+        campaign["campaign_id"], concurrency, window,
+        "" if hours else " (the default window)",
     )
     return campaign
 
@@ -578,23 +737,7 @@ def format_status(
     else:
         lines.append("  in flight: none")
 
-    if status["front"]:
-        lines.append(f"  pareto front ({len(status['front'])} of "
-                     f"{status['n_results']} results):")
-        for member in status["front"]:
-            scores = ", ".join(
-                f"{k}={v:.3f}" for k, v in sorted(member["objective_profile"].items())
-            )
-            lines.append(f"    {member['task_id']}  {scores}")
-    else:
-        lines.append(f"  pareto front: none yet ({status['n_results']} results)")
-
-    if status.get("n_ineligible"):
-        lines.append(
-            f"  {status['n_ineligible']} result(s) off the front for missing "
-            "an objective -- check for a failed scorer"
-        )
-
+    lines.append(f"  results: {status['n_results']}")
     return "\n".join(lines)
 
 
@@ -643,7 +786,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     opening.add_argument(
         "--objectives", nargs="*", default=None,
-        help="objective names the Pareto front is over "
+        help="objective names each result is reported on "
              "(default: every objective the base TTP declares)",
     )
     opening.add_argument(

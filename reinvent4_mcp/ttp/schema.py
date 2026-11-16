@@ -12,8 +12,8 @@ Validation rules
 * TTP ``id`` must be a lowercase alphanumeric slug.
 * Pre-scoring components must reference known fast RDKit descriptors.
 * Scoring objectives must be either ``native`` (REINVENT4 built-in) or
-  ``external`` (REST service).  External objectives require ``service``
-  and ``service_url``.
+  ``external`` (REST service).  External objectives require ``service``,
+  and ``service_url`` unless the service is one configured here.
 * ``depends_on`` references are checked against sibling objective names.
 * Transform ``type`` is normalised and validated against REINVENT4's
   transform registry.
@@ -64,7 +64,17 @@ VALID_PRESCORING_COMPONENTS = frozenset(
 # for anything not listed here), so an unknown service is permitted rather than
 # rejected. Keep this in sync with config.ScoringConfig when adding a service.
 KNOWN_EXTERNAL_SERVICES = frozenset(
-    {"boltz", "posebusters", "admet", "retrodmta", "interaction_profiler"}
+    {
+        "boltz",
+        "posebusters",
+        "admet",
+        "retrodmta",
+        "interaction_profiler",
+        # AiZynthFinder. Its /score returns a [0,1] route-quality score per
+        # molecule, so it is an RL objective like the others and not only the
+        # job-based planner that plan_synthesis drives.
+        "synthesis_planner",
+    }
 )
 
 _VALID_AMINO_ACIDS = frozenset("ACDEFGHIKLMNPQRSTVWY")
@@ -82,13 +92,18 @@ class TransformConfig(BaseModel):
     The ``type`` field selects the transform function.  Additional fields
     are type-specific parameters forwarded to REINVENT4 at runtime.
 
-    Available types::
+    Available types and their parameters (all besides ``type`` are optional
+    unless marked required)::
 
-        sigmoid / reverse_sigmoid  ->  low, high, k
-        double_sigmoid             ->  low, high, coef_div, coef_si, coef_se
+        sigmoid / reverse_sigmoid  ->  low (req), high (req), k
+        double_sigmoid             ->  low (req), high (req), coef_div, coef_si, coef_se
         right_step / left_step / step  ->  low, high
-        value_mapping              ->  mapping (dict)
-        exponential_decay          ->  k
+        value_mapping              ->  mapping (req, dict)
+        exponential_decay          ->  k (req)
+
+    ``step`` uses ``low`` and ``high``, not ``value``; ``value`` is not a
+    parameter of any REINVENT4 transform and is rejected on creation so it
+    does not waste a GPU slot.
     """
 
     model_config = {"extra": "allow"}
@@ -161,6 +176,21 @@ class TransformConfig(BaseModel):
         for name, value in spec.defaults.items():
             if extra.get(name) is None:
                 extra[name] = value
+
+        # Unknown parameters pass silently through ``extra="allow"`` and
+        # reach REINVENT4, which uses strict dataclasses and rejects them
+        # with an unhelpful TypeError mid-job. Catching them here turns a
+        # wasted GPU slot into an immediate, named validation error at TTP
+        # creation time. Observed: ``transform.value = 0.7`` on a ``step``
+        # transform (correct: ``low`` or ``high``).
+        known = set(spec.parameters) | {"type"}
+        unknown = sorted(k for k in extra if k not in known and extra[k] is not None)
+        if unknown:
+            takes = ", ".join(spec.parameters) or "(none besides type)"
+            raise ValueError(
+                f"transform '{self.type}' got unknown parameter(s): "
+                f"{', '.join(unknown)}. It takes: {takes}."
+            )
         return self
 
 
@@ -370,8 +400,8 @@ class ScoringObjective(BaseModel):
             "'http://posebusters:8080/score' for posebusters, "
             "'http://admet-predictor:8084/score' for admet, "
             "'http://retrodmta-predictor:8085/score' for retrodmta. "
-            "Note the service name is 'boltz' (not 'boltz2'). For known "
-            "services this is overridden by the configured URL if it differs."
+            "Note the service name is 'boltz' (not 'boltz2'). Optional for "
+            "the services configured here, which always use the configured URL."
         ),
     )
     service_params: Optional[dict[str, Any]] = Field(
@@ -431,10 +461,24 @@ class ScoringObjective(BaseModel):
                     f"External objective '{self.name}' requires a 'service' field"
                 )
             if not self.service_url:
+                self.service_url = _configured_url(self.service)
+            if not self.service_url:
                 raise ValueError(
-                    f"External objective '{self.name}' requires a 'service_url' field"
+                    f"External objective '{self.name}' requires a 'service_url' field: "
+                    f"'{self.service}' is not a service configured here"
                 )
         return self
+
+
+def _configured_url(service: str) -> Optional[str]:
+    """Where this deployment scores ``service``, when it is one it runs.
+
+    The mapper uses this URL whatever the TTP says, so asking for it only
+    gives a TTP one more way to fail validation.
+    """
+    from reinvent4_mcp.config import get_config
+
+    return get_config().enabled_external_services.get(service)
 
 
 class ScoringSection(BaseModel):
@@ -604,6 +648,15 @@ class TTP(BaseModel):
         description=(
             "Generation campaign configuration (mode, model, batch size, etc.). "
             "None = use existing run_optimization defaults (backward compat)."
+        ),
+    )
+    pipeline: Optional["PipelineSection"] = Field(
+        default=None,
+        description=(
+            "Optional preparation pipeline. Steps are tool calls the agent runs "
+            "in dependency order before starting the RL loop. Turning a TTP into "
+            "a full workflow spec: the same TTP in a fresh session runs the same "
+            "preparation, with params locked and each step's result stored."
         ),
     )
 
@@ -1060,3 +1113,196 @@ class GenerationSection(BaseModel):
                     "(one or more seed SMILES)."
                 )
         return self
+
+
+# ===========================================================================
+# Pipeline contract — chaining extension
+# ---------------------------------------------------------------------------
+# A TTP that holds a PipelineSection is a full reproducible workflow spec.
+# The agent runs the steps in dependency order: each step calls one MCP tool,
+# the result is stored in the campaign context under ``store_as``, and later
+# steps read from the context via ``${step_id}`` interpolation in params.
+#
+# Scoring objectives still use depends_on; the pipeline is for the outer
+# orchestration that *prepares* the campaign before the RL loop starts.
+# ===========================================================================
+
+
+class PipelineStep(BaseModel):
+    """One step in a TTP pipeline.
+
+    A step calls a single MCP tool with its params. The result is stored in
+    the campaign context under ``store_as`` and can be referenced by later
+    steps as ``${store_as.field}`` in their params values.
+
+    Example:
+        A structure-based campaign needs six preparation steps before the RL
+        loop can start. Without a pipeline contract the agent re-derives this
+        sequence from the TTP contents every session, without a record and
+        without a way to restart from a checkpoint. With the pipeline the
+        sequence is committed to the TTP, params are locked, and a failed step
+        names exactly what failed.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    id: str = Field(
+        description=(
+            "Step identifier — unique within this pipeline, used for dependency "
+            "references and context key defaults. Slug: lowercase, hyphens, digits."
+        ),
+    )
+    tool: str = Field(
+        description=(
+            "MCP tool name to call, exactly as it appears in the tool registry "
+            "(e.g. 'prepare_structure', 'derive_scaffold_from_series', "
+            "'fetch_all_activities', 'plan_synthesis')."
+        ),
+    )
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Parameters forwarded to the tool. String values may reference the "
+            "stored output of a previous step as '${step_id}' (whole result) or "
+            "'${step_id.field}' (one field). The agent resolves references "
+            "before the call."
+        ),
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description=(
+            "IDs of steps that must complete before this one runs. The agent "
+            "topologically sorts the pipeline and runs independent steps first. "
+            "An empty list means this step has no prerequisites."
+        ),
+    )
+    store_as: Optional[str] = Field(
+        default=None,
+        description=(
+            "Key under which the tool result is stored in the campaign context. "
+            "Defaults to the step id. Later steps reference this as '${store_as}'."
+        ),
+    )
+    condition: Literal["if_no_error", "always"] = Field(
+        default="if_no_error",
+        description=(
+            "'if_no_error' (default): skip this step if any dependency returned "
+            "an error. 'always': run unconditionally (use for cleanup or logging "
+            "steps that must run even after a failure)."
+        ),
+    )
+    comment: Optional[str] = Field(
+        default=None,
+        description="Human-readable note — why this step is here, what to watch for.",
+    )
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not _ID_PATTERN.match(v):
+            raise ValueError(
+                f"Pipeline step id '{v}' must be a lowercase slug "
+                "(letters, digits, hyphens, underscores)."
+            )
+        return v
+
+
+class PipelineSection(BaseModel):
+    """Ordered preparation workflow attached to a TTP.
+
+    The agent executes the steps in dependency order before starting the RL
+    loop. This turns a TTP into a complete reproducible spec: the same TTP
+    opened in a fresh session runs the same preparation rather than asking
+    the agent to re-derive it.
+
+    Every step name in ``depends_on`` must reference another step in this
+    pipeline, and there must be no cycles. Independent steps run first;
+    their order among themselves is not specified and the agent may run them
+    in any order (including in parallel if the tool supports it).
+    """
+
+    model_config = {"extra": "forbid"}
+
+    comment: Optional[str] = Field(
+        default=None,
+        description="Human-readable description of this workflow.",
+    )
+    steps: list[PipelineStep] = Field(
+        min_length=1,
+        description="The steps of the pipeline, in any declared order.",
+    )
+
+    @field_validator("steps")
+    @classmethod
+    def _unique_step_ids(cls, v: list[PipelineStep]) -> list[PipelineStep]:
+        seen: set[str] = set()
+        dupes: set[str] = set()
+        for s in v:
+            (dupes if s.id in seen else seen).add(s.id)
+        if dupes:
+            raise ValueError(
+                f"Duplicate pipeline step ids: {', '.join(sorted(dupes))}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_depends_on(self) -> "PipelineSection":
+        ids = {s.id for s in self.steps}
+        for step in self.steps:
+            unknown = [d for d in step.depends_on if d not in ids]
+            if unknown:
+                raise ValueError(
+                    f"Step '{step.id}' depends_on unknown ids: "
+                    f"{', '.join(unknown)}. Known: {', '.join(sorted(ids))}"
+                )
+            if step.id in step.depends_on:
+                raise ValueError(f"Step '{step.id}' cannot depend on itself.")
+        # Cycle detection: each step has multiple possible predecessors, so
+        # traverse the full reachability set rather than a single chain.
+        for start in self.steps:
+            visited: set[str] = set()
+            queue = list(start.depends_on)
+            while queue:
+                node = queue.pop()
+                if node == start.id:
+                    raise ValueError(
+                        f"Circular dependency detected involving step '{start.id}'."
+                    )
+                if node in visited:
+                    continue
+                visited.add(node)
+                parent = next((s for s in self.steps if s.id == node), None)
+                if parent:
+                    queue.extend(parent.depends_on)
+        return self
+
+    def topological_order(self) -> list[PipelineStep]:
+        """Steps in a valid execution order (dependencies before dependents).
+
+        Uses Kahn's algorithm. Independent steps are returned in declaration
+        order relative to each other.
+        """
+        from collections import deque  # noqa: PLC0415
+
+        in_degree: dict[str, int] = {s.id: 0 for s in self.steps}
+        dependents: dict[str, list[str]] = {s.id: [] for s in self.steps}
+        for step in self.steps:
+            for dep in step.depends_on:
+                in_degree[step.id] += 1
+                dependents[dep].append(step.id)
+
+        by_id = {s.id: s for s in self.steps}
+        queue: deque[str] = deque(
+            s.id for s in self.steps if in_degree[s.id] == 0
+        )
+        result: list[PipelineStep] = []
+        while queue:
+            sid = queue.popleft()
+            result.append(by_id[sid])
+            for dep_id in dependents[sid]:
+                in_degree[dep_id] -= 1
+                if in_degree[dep_id] == 0:
+                    queue.append(dep_id)
+        return result
+
+

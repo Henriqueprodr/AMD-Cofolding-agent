@@ -52,6 +52,14 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
 
+    # The conductor and the supervisor both do this before reading any URL,
+    # and the gateway runs the same tools against the same services -- without
+    # it they reach for the in-cluster Service name, which resolves nowhere
+    # under Slurm.  A no-op on Kubernetes, where the environment is complete.
+    from reinvent4_agent.service_registry import apply_registry
+
+    apply_registry()
+
     try:
         import uvicorn
         from reinvent4_agent.web.server import create_app
