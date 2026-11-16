@@ -553,12 +553,12 @@ function AnswerLink({ href, children }: AnchorHTMLAttributes<HTMLAnchorElement>)
       </a>
     );
   }
-  const { path, ref, near } = structureFromHref(href);
+  const { path, ref, near, alternatives } = structureFromHref(href);
   return (
     <button
       type="button"
       className="residue-link"
-      onClick={() => sendToViewer({ path, ref, near, action: { kind: "residues", residues: [residue], mode: "focus" }, source: "answer" })}
+      onClick={() => sendToViewer({ path, ref, near, alternatives, action: { kind: "residues", residues: [residue], mode: "focus" }, source: "answer" })}
     >
       {children}
     </button>

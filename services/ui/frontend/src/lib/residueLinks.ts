@@ -112,23 +112,37 @@ interface Target {
   structure: string | null;
   /** The turn's prediction, for a Boltz molecule that is its sibling. */
   near?: string;
+  /** The turn's other structures, to try when the residue is not in *structure*. */
+  alternatives?: string[];
 }
 
 /**
  * The structure a residue after the mentions *named* belongs to: the turn's
  * structure the last mention names, else the mention itself (resolved later
  * among the conversation's structures), else the turn's only structure.
+ *
+ * The turn's other structures come with it. Which structure a residue
+ * belongs to is not something prose reliably says -- a report that names a
+ * template and then describes the pose predicted from it mentions the
+ * template last before every residue -- so the rest are offered as
+ * fallbacks rather than guessed between.
  */
 function structureFor(named: string | null, paths: readonly string[]): Target {
+  // Newest first: a turn's own prediction is listed after the inputs it was
+  // given, and is more often what the answer is describing.
+  const others = (chosen: string | null) =>
+    [...new Set(paths)].reverse().filter((path) => path !== chosen);
+
   if (named) {
     const path = matchStructure(named, paths);
-    if (path) return { structure: path };
-    if (!/^mol_\d+$/.test(named)) return { structure: named };
+    if (path) return { structure: path, alternatives: others(path) };
+    if (!/^mol_\d+$/.test(named)) return { structure: named, alternatives: others(null) };
     const near = [...paths].reverse().find((p) => BOLTZ_MODEL.test(p));
-    if (near) return { structure: named, near };
+    if (near) return { structure: named, near, alternatives: others(null) };
   }
   const distinct = [...new Set(paths)];
-  return { structure: distinct.length === 1 ? distinct[0] : null };
+  const only = distinct.length === 1 ? distinct[0] : null;
+  return { structure: only, alternatives: others(only) };
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +151,12 @@ function structureFor(named: string | null, paths: readonly string[]): Target {
 const HREF_PREFIX = "#residue?";
 
 /** "#residue?n=ASN&r=140&c=A&s=…"; the name tells the viewer which numbering the answer used. */
-export function residueHref(residue: Residue, structure?: string | null, near?: string | null): string {
+export function residueHref(
+  residue: Residue,
+  structure?: string | null,
+  near?: string | null,
+  alternatives?: readonly string[],
+): string {
   const params = new URLSearchParams();
   if (residue.resname) params.set("n", residue.resname);
   params.set("r", String(residue.resnum));
@@ -145,6 +164,8 @@ export function residueHref(residue: Residue, structure?: string | null, near?: 
   if (residue.chain) params.set("c", residue.chain);
   if (structure) params.set("s", structure);
   if (structure && near) params.set("w", near);
+  // Tab separated: a shared path may hold a comma, and none hold a tab.
+  if (alternatives?.length) params.set("a", alternatives.join("\t"));
   return `${HREF_PREFIX}${params.toString()}`;
 }
 
@@ -165,11 +186,19 @@ export function residueFromHref(href: string | undefined): Residue | null {
  * The structure a residue link points at: a file path, or a name ("3MXF") to
  * look up, with the prediction it was said near; null for the one on screen.
  */
-export function structureFromHref(href: string | undefined): { path: string | null; ref: string | null; near: string | null } {
+export function structureFromHref(href: string | undefined): {
+  path: string | null;
+  ref: string | null;
+  near: string | null;
+  alternatives: string[];
+} {
   const params = href?.startsWith(HREF_PREFIX) ? new URLSearchParams(href.slice(HREF_PREFIX.length)) : null;
+  const alternatives = params?.get("a")?.split("\t").filter(Boolean) ?? [];
   const value = params?.get("s");
-  if (!value) return { path: null, ref: null, near: null };
-  return isStructurePath(value) ? { path: value, ref: null, near: null } : { path: null, ref: value, near: params?.get("w") || null };
+  if (!value) return { path: null, ref: null, near: null, alternatives };
+  return isStructurePath(value)
+    ? { path: value, ref: null, near: null, alternatives }
+    : { path: null, ref: value, near: params?.get("w") || null, alternatives };
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +233,7 @@ export function remarkResidueLinks(options: ResidueLinkOptions = {}) {
                 const target = structureFor(named, paths);
                 const link: Link = {
                   type: "link",
-                  url: residueHref(segment.residue, target.structure, target.near),
+                  url: residueHref(segment.residue, target.structure, target.near, target.alternatives),
                   title: "Show in the 3D viewer",
                   children: [{ type: "text", value: segment.text }],
                 };

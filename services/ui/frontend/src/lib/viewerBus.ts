@@ -19,6 +19,17 @@ export interface ViewerRequest {
   ref?: string | null;
   /** The prediction *ref* was said near, so a Boltz molecule ("mol_3") is looked up in its run. */
   near?: string | null;
+  /**
+   * The turn's other structures, to try in order when the residue asked for
+   * is not in the one named.
+   *
+   * An answer names the structures it used, but prose does not say which one
+   * each residue belongs to: a report that cites a template and then
+   * describes the pose it produced sent every residue to the template, where
+   * "PRO72 is not in 1IQK" was the end of it. Trying the turn's other
+   * structures finds the one the residue is actually in.
+   */
+  alternatives?: readonly string[];
   /** Then run this, if anything. */
   action?: ViewerAction;
   /** What asked, for the viewer's message line. */

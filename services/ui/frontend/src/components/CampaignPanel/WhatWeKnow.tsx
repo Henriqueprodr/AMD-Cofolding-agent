@@ -6,6 +6,7 @@ import { useCampaignAtlas } from "../../hooks/useCampaignAtlas";
 import {
   branchViews,
   evidenceRun,
+  evidenceSource,
   stances,
   type BranchView,
 } from "../../lib/atlas";
@@ -300,16 +301,33 @@ function FindingItem({
           <span className="text-faint">Evidence:</span>
           {finding.evidence.map((item) => {
             const run = evidenceRun(item, runs);
-            return run ? (
-              <button
+            if (run) {
+              return (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => onOpenRun(run)}
+                  className="text-muted hover:text-body cursor-pointer rounded px-1 underline"
+                  title="Open the run"
+                >
+                  {item}
+                </button>
+              );
+            }
+            // A public id the reader can follow, rather than one to retype
+            // into a search box.
+            const source = evidenceSource(item);
+            return source ? (
+              <a
                 key={item}
-                type="button"
-                onClick={() => onOpenRun(run)}
-                className="text-muted hover:text-body cursor-pointer rounded px-1 underline"
-                title="Open the run"
+                href={source.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="text-muted hover:text-body rounded px-1 underline"
+                title={`Open the ${source.kind}`}
               >
                 {item}
-              </button>
+              </a>
             ) : (
               <span key={item} className="text-muted px-1">
                 {item}

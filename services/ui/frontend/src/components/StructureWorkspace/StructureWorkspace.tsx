@@ -22,7 +22,7 @@ import {
 } from "../../lib/molstar";
 import { basketColour, basketEntries, toggleShown, type BasketEntry } from "../../lib/basket";
 import { VIEWER_HELP, type ViewerAction } from "../../lib/viewerCommands";
-import { onViewerRequest } from "../../lib/viewerBus";
+import { onViewerRequest, sendToViewer } from "../../lib/viewerBus";
 import { contactColor, contactLabel, contactLines, matchesTypes, residuesOf, sortedTypes, toggleType } from "../../lib/contacts";
 import { STRUCTURE_KINDS, structureKind, structureOption } from "../../lib/poses";
 import { buildNumbering, displayNumber, rememberNumbering, residueLabel, type FileResidue, type Numbering } from "../../lib/numbering";
@@ -99,6 +99,8 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<StructureView | null>(null);
   const pendingRef = useRef<ViewerAction | null>(null);
+  /** Structures still to try for the residue request in flight. */
+  const alternativesRef = useRef<readonly string[]>([]);
 
   const [viewReady, setViewReady] = useState(false);
   const [loadedPath, setLoadedPath] = useState<string | null>(null);
@@ -474,6 +476,15 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
         const residues = located.flatMap((at) => at ?? []);
         const asked = (r: Residue) => (r.resname ? residueLabel(null, r.resname, null, r.resnum).label : String(r.resnum)) + (r.insCode ?? "");
         if (!residues.length || !focusOn(view, residues, action.mode)) {
+          // The answer named a structure, but prose does not say which
+          // structure each residue belongs to. Rather than stop at "not in
+          // this one", try the turn's others before giving up.
+          const next = alternativesRef.current.filter((path) => !sameFile(path, active.path));
+          if (next.length) {
+            alternativesRef.current = next.slice(1);
+            sendToViewer({ path: next[0], alternatives: next.slice(1), action, source: "answer" });
+            break;
+          }
           say(`${action.residues.map(asked).join(", ")} is not in ${title}.`, "bad");
           break;
         }
@@ -578,6 +589,7 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
     () =>
       onViewerRequest((request) => {
         if (!request.action) return;
+        alternativesRef.current = request.alternatives ?? [];
         const target = request.path ?? (request.ref ? (matchStructure(request.ref, structures.map(({ item }) => item.path), request.near) ?? request.near ?? null) : null);
         if (target && !sameFile(target, pathRef.current)) {
           const known = structures.find(({ item }) => sameFile(item.path, target));

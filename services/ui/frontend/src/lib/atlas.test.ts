@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { AtlasBranch, Finding, FleetEvent } from "../types/api";
-import { branchViews, evidenceRun, learnt, stances } from "./atlas";
+import { branchViews, evidenceRun, evidenceSource, learnt, stances } from "./atlas";
 
 const event = (kind: string): FleetEvent => ({
   event_id: 1,
@@ -130,5 +130,41 @@ describe("evidenceRun", () => {
     expect(evidenceRun("deadbeef", runs)).toBeNull();
     expect(evidenceRun("CHEMBL1957266", runs)).toBeNull();
     expect(evidenceRun("10.1021/jm901137j", runs)).toBeNull();
+  });
+});
+
+describe("evidenceSource", () => {
+  const url = (item: string) => evidenceSource(item)?.url ?? null;
+
+  it("sends a public id to the record it names", () => {
+    expect(url("1IQK")).toBe("https://www.rcsb.org/structure/1IQK");
+    expect(url("CHEMBL1957266")).toBe("https://www.ebi.ac.uk/chembl/explore/compound/CHEMBL1957266");
+    expect(url("O60885")).toBe("https://www.uniprot.org/uniprotkb/O60885");
+    expect(url("10.1021/jm901137j")).toBe("https://doi.org/10.1021/jm901137j");
+    expect(url("PMID:20871596")).toBe("https://pubmed.ncbi.nlm.nih.gov/20871596/");
+  });
+
+  it("reads the id however the agent prefixed it", () => {
+    expect(url("pdb 1IQK")).toBe("https://www.rcsb.org/structure/1IQK");
+    expect(url("uniprot:O60885")).toBe("https://www.uniprot.org/uniprotkb/O60885");
+    expect(url("doi:10.1021/jm901137j")).toBe("https://doi.org/10.1021/jm901137j");
+    expect(url("chembl1957266")).toBe("https://www.ebi.ac.uk/chembl/explore/compound/CHEMBL1957266");
+  });
+
+  it("passes an address the agent already wrote out straight through", () => {
+    expect(url("https://www.rcsb.org/structure/3MXF")).toBe("https://www.rcsb.org/structure/3MXF");
+  });
+
+  it("leaves anything it cannot place as plain text", () => {
+    // Sending these somewhere would invent a citation rather than follow one.
+    expect(evidenceSource("the 2024 review")).toBeNull();
+    expect(evidenceSource("2024")).toBeNull();
+    expect(evidenceSource("deadbeef")).toBeNull();
+    expect(evidenceSource("")).toBeNull();
+  });
+
+  it("names the kind of record, for the tooltip", () => {
+    expect(evidenceSource("1IQK")?.kind).toBe("PDB entry");
+    expect(evidenceSource("CHEMBL25")?.kind).toBe("ChEMBL record");
   });
 });

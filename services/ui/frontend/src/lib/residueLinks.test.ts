@@ -65,9 +65,18 @@ describe("residue hrefs", () => {
 
   it("carries the structure, as a path or a name to look up", () => {
     const path = "uploads/kinases/3MXF_A.cif";
-    expect(structureFromHref(residueHref({ chain: null, resnum: 81 }, path))).toEqual({ path, ref: null, near: null });
-    expect(structureFromHref(residueHref({ chain: null, resnum: 81 }, "3MXF"))).toEqual({ path: null, ref: "3MXF", near: null });
-    expect(structureFromHref(residueHref({ chain: null, resnum: 81 }))).toEqual({ path: null, ref: null, near: null });
+    expect(structureFromHref(residueHref({ chain: null, resnum: 81 }, path))).toEqual({ path, ref: null, near: null, alternatives: [] });
+    expect(structureFromHref(residueHref({ chain: null, resnum: 81 }, "3MXF"))).toEqual({ path: null, ref: "3MXF", near: null, alternatives: [] });
+    expect(structureFromHref(residueHref({ chain: null, resnum: 81 }))).toEqual({ path: null, ref: null, near: null, alternatives: [] });
+  });
+
+  it("carries the fallback structures through the href unharmed", () => {
+    // Shared paths hold commas and spaces, so the separator must be one
+    // nothing in a path can be.
+    const others = ["predictions/out a,b/mol_0/mol_0_model_0.pdb", "rcsb/1iqk.cif"];
+    const href = residueHref({ chain: null, resnum: 72 }, "rcsb/3mxf.cif", null, others);
+
+    expect(structureFromHref(href).alternatives).toEqual(others);
   });
 });
 
@@ -132,7 +141,7 @@ describe("remarkResidueLinks", () => {
   it("keeps a name it cannot match, and uses the only structure when none is named", () => {
     const named = paragraph("2J5E binds ASP86.");
     remarkResidueLinks({ structures: PATHS })(named);
-    expect(structureFromHref(links(named)[0].url)).toEqual({ path: null, ref: "2J5E", near: null });
+    expect(structureFromHref(links(named)[0].url)).toMatchObject({ path: null, ref: "2J5E", near: null });
 
     const single = paragraph("The pocket around LYS33.");
     remarkResidueLinks({ structures: [PATHS[0]] })(single);
@@ -140,12 +149,33 @@ describe("remarkResidueLinks", () => {
 
     const none = paragraph("The pocket around LYS33.");
     remarkResidueLinks({ structures: PATHS })(none);
-    expect(structureFromHref(links(none)[0].url)).toEqual({ path: null, ref: null, near: null });
+    expect(structureFromHref(links(none)[0].url)).toMatchObject({ path: null, ref: null, near: null });
   });
 
   it("sends a residue of another molecule of the run there", () => {
     const tree = paragraph("Unlike mol_9, mol_7 holds LEU149.");
     remarkResidueLinks({ structures: [PATHS[2]] })(tree);
-    expect(structureFromHref(links(tree)[0].url)).toEqual({ path: null, ref: "mol_7", near: PATHS[2] });
+    expect(structureFromHref(links(tree)[0].url)).toMatchObject({ path: null, ref: "mol_7", near: PATHS[2] });
+  });
+
+  it("carries the turn's other structures, so a residue not in the named one is still found", () => {
+    // A report that cites a template and then describes the pose predicted
+    // from it names the template last before every residue, which sent them
+    // all somewhere they do not exist ("PRO72 is not in 1IQK").
+    const tree = paragraph("Using 4ZC9 as a template, the pose places PRO72 in the shelf.");
+    remarkResidueLinks({ structures: PATHS })(tree);
+    const target = structureFromHref(links(tree)[0].url);
+
+    expect(target.path).toBe(PATHS[0]);
+    expect(target.alternatives).not.toContain(PATHS[0]);
+    // Newest first: a turn's prediction is listed after the inputs it was given.
+    expect(target.alternatives).toContain(PATHS[2]);
+  });
+
+  it("offers no alternatives when the turn had only the one structure", () => {
+    const tree = paragraph("The pocket around LYS33.");
+    remarkResidueLinks({ structures: [PATHS[0]] })(tree);
+
+    expect(structureFromHref(links(tree)[0].url).alternatives).toEqual([]);
   });
 });

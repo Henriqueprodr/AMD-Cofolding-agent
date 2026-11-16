@@ -90,3 +90,74 @@ export function evidenceRun(
   // A run of hex digits could be anything; only a run the gateway has is a run.
   return id && known.has(id) ? id : null;
 }
+
+/** Where a piece of evidence can be read, outside this app. */
+export interface EvidenceSource {
+  /** What kind of record it is, for the tooltip. */
+  kind: string;
+  url: string;
+}
+
+/**
+ * Evidence that names a public record, resolved to where it can be read.
+ *
+ * A finding's evidence is its whole justification, and an id the reader
+ * cannot follow is an assertion rather than a citation: "CHEMBL3137841"
+ * meant retyping it into a search box. Only unambiguous, well-formed ids
+ * are linked -- a bare number or a word is left as text rather than sent
+ * somewhere it probably does not exist.
+ */
+const SOURCES: { kind: string; pattern: RegExp; url: (id: string) => string }[] = [
+  {
+    kind: "PDB entry",
+    // A digit then three alphanumerics, of which not all three may be
+    // digits: without that a year such as "2024" reads as an entry and the
+    // reader is sent to a structure that does not exist.
+    pattern: /^(?:pdb[:\s]*)?([1-9](?![0-9]{3}$)[a-z0-9]{3})$/i,
+    url: (id) => `https://www.rcsb.org/structure/${id.toUpperCase()}`,
+  },
+  {
+    kind: "ChEMBL record",
+    pattern: /^(chembl\d+)$/i,
+    url: (id) => `https://www.ebi.ac.uk/chembl/explore/compound/${id.toUpperCase()}`,
+  },
+  {
+    kind: "UniProt entry",
+    pattern: /^(?:uniprot[:\s]*)?([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})$/i,
+    url: (id) => `https://www.uniprot.org/uniprotkb/${id.toUpperCase()}`,
+  },
+  {
+    kind: "DOI",
+    pattern: /^(?:doi[:\s]*)?(10\.\d{4,9}\/\S+)$/i,
+    url: (id) => `https://doi.org/${id}`,
+  },
+  {
+    kind: "PubMed article",
+    pattern: /^(?:pmid[:\s]*)(\d{1,8})$/i,
+    url: (id) => `https://pubmed.ncbi.nlm.nih.gov/${id}/`,
+  },
+  {
+    kind: "PubChem compound",
+    pattern: /^(?:cid[:\s]*)(\d{1,9})$/i,
+    url: (id) => `https://pubchem.ncbi.nlm.nih.gov/compound/${id}`,
+  },
+  {
+    kind: "gene",
+    pattern: /^(?:hgnc[:\s]*)([A-Z][A-Z0-9-]{1,9})$/,
+    url: (id) => `https://www.genenames.org/tools/search/#!/?query=${encodeURIComponent(id)}`,
+  },
+];
+
+export function evidenceSource(item: string): EvidenceSource | null {
+  const text = item.trim();
+  // An address the agent wrote out is already the citation.
+  if (/^https?:\/\/\S+$/i.test(text)) return { kind: "source", url: text };
+  for (const source of SOURCES) {
+    const id = source.pattern.exec(text)?.[1];
+    // A PDB id and a UniProt accession can both be four or six characters;
+    // the first pattern that matches in this order wins, which puts the
+    // stricter shapes first.
+    if (id) return { kind: source.kind, url: source.url(id) };
+  }
+  return null;
+}
