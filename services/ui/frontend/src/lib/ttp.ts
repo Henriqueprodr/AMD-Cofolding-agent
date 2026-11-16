@@ -1450,6 +1450,8 @@ export interface TargetFacts {
   pocket: PocketResidue[];
   /** Number of complexes the pocket was profiled on. */
   profiledComplexes: number;
+  /** Paths of those complexes, which is what ties a molecule to this target. */
+  complexes: string[];
   /** Tools the facts came from, in the order first seen. */
   sources: string[];
 }
@@ -1475,6 +1477,7 @@ export const emptyTargetFacts = (): TargetFacts => ({
   ttpId: null,
   pocket: [],
   profiledComplexes: 0,
+  complexes: [],
   sources: [],
 });
 
@@ -1660,7 +1663,7 @@ export function mergeTtpTarget(facts: TargetFacts, ttp: Ttp, tool: string): Targ
 const residueKey = (c: Pick<Contact, "chain" | "resname" | "resnum">) => `${c.chain ?? ""}:${c.resname}:${c.resnum ?? ""}`;
 
 /** Facts from one interaction profile: the residues its ligand contacted, most contacted first. */
-export function mergeContacts(facts: TargetFacts, contacts: Contact[], tool: string): TargetFacts {
+export function mergeContacts(facts: TargetFacts, contacts: Contact[], tool: string, structurePath: string | null = null): TargetFacts {
   if (contacts.length === 0) return facts;
   const pocket = new Map(facts.pocket.map((r) => [residueKey(r), { ...r, types: [...r.types] }]));
   const chains = new Set(facts.chains);
@@ -1687,6 +1690,7 @@ export function mergeContacts(facts: TargetFacts, contacts: Contact[], tool: str
       chains: [...chains].sort(),
       pocket: [...pocket.values()].sort((a, b) => b.contacts - a.contacts || (a.chain ?? "").localeCompare(b.chain ?? "") || (a.resnum ?? 0) - (b.resnum ?? 0)),
       profiledComplexes: facts.profiledComplexes + 1,
+      complexes: structurePath && !facts.complexes.includes(structurePath) ? [...facts.complexes, structurePath] : facts.complexes,
     },
     tool,
   );
@@ -1726,7 +1730,7 @@ export function extractTargetFacts(events: ToolEvent[]): TargetFacts {
     }
 
     for (const panel of event.panels ?? []) {
-      if (panel.kind === "interactions") facts = mergeContacts(facts, panel.contacts, event.name);
+      if (panel.kind === "interactions") facts = mergeContacts(facts, panel.contacts, event.name, panel.structurePath);
     }
   }
   return facts;

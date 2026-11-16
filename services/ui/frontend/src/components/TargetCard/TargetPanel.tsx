@@ -6,11 +6,16 @@ import { callTool } from "../../lib/api";
 import { loadTtp } from "../../lib/scoreWhy";
 import { extractTargets, orderTargets, scopedTarget, targetKey, targetName, withLookup, type TargetEntry } from "../../lib/targets";
 import { emptyTargetFacts, latestTtp, mergeUniprot, payloadError, type ToolEvent, type Ttp } from "../../lib/ttp";
+import { bestForTarget, dossierFor, extractDossiers, hasDossier } from "../../lib/dossier";
+import type { Candidate } from "../../lib/candidates";
 import { TargetCard } from "./TargetCard";
+import { TargetDossierCard } from "./TargetDossier";
 
 interface Props {
   /** The session's tool calls, from `toolEvents(artifacts.steps)`. */
   events: ToolEvent[];
+  /** The conversation's molecules, for the best one each target has. */
+  candidates?: readonly Candidate[];
   /** Put a prompt in the composer. */
   onAsk?: (text: string) => void;
 }
@@ -22,7 +27,7 @@ type Lookup = { state: "idle" } | { state: "busy" } | { state: "error"; message:
  * time. A lookup here uses the same fetch_target_info call as the agent, so
  * it brings the same names, function and PDB cross-references.
  */
-export function TargetPanel({ events, onAsk }: Props) {
+export function TargetPanel({ events, candidates = [], onAsk }: Props) {
   const session = useMemo(() => extractTargets(events), [events]);
   const [found, setFound] = useState<unknown[]>([]);
   const [picked, setPicked] = useState<string | null>(null);
@@ -51,6 +56,12 @@ export function TargetPanel({ events, onAsk }: Props) {
 
   const current = scopedTarget(entries, picked, ttpId);
   const ordered = orderTargets(entries);
+  const dossiers = useMemo(() => extractDossiers(events), [events]);
+  const dossier = useMemo(() => (current ? dossierFor(dossiers, current.facts) : null), [dossiers, current]);
+  const best = useMemo(
+    () => (current ? bestForTarget(current.facts, candidates, entries.length === 1) : null),
+    [current, candidates, entries.length],
+  );
 
   const runLookup = async (query: string) => {
     setLookup({ state: "busy" });
@@ -96,6 +107,10 @@ export function TargetPanel({ events, onAsk }: Props) {
       <TargetCard facts={current?.facts ?? emptyTargetFacts()} onAsk={onAsk}>
         <LookupField busy={lookup.state === "busy"} known={current?.facts.uniprot ?? null} onRun={(query) => void runLookup(query)} />
       </TargetCard>
+
+      {current && dossier && (hasDossier(dossier) || best) && (
+        <TargetDossierCard facts={current.facts} dossier={dossier} best={best} onAsk={onAsk} />
+      )}
 
       {lookup.state === "error" && (
         <p className="px-1 text-[11px]" style={{ color: "var(--color-accent)" }}>

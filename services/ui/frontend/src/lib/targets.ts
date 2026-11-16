@@ -106,7 +106,7 @@ export function extractTargets(events: ToolEvent[]): TargetEntry[] {
     for (const panel of event.panels ?? []) {
       if (panel.kind !== "interactions" || panel.contacts.length === 0) continue;
       if (current < 0) current = found.push(entry(emptyTargetFacts(), at, true)) - 1;
-      found[current] = entry(mergeContacts(found[current].facts, panel.contacts, event.name), at, found[current].inSession);
+      found[current] = entry(mergeContacts(found[current].facts, panel.contacts, event.name, panel.structurePath), at, found[current].inSession);
     }
   });
 

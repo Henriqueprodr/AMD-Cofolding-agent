@@ -276,11 +276,12 @@ export const Workbench = memo(function Workbench(props: Props) {
 /** What the work is about rather than what came of it: the target, its profile and the files. */
 function ContextTab({ tab, artifacts, sessionId, onAsk }: Props) {
   const events = useMemo(() => toolEvents(artifacts.steps), [artifacts.steps]);
-  const molecules = useMemo(() => candidatesOf(artifacts).map((c) => ({ smiles: c.smiles, label: c.name })), [artifacts]);
+  const candidates = useMemo(() => candidatesOf(artifacts), [artifacts]);
+  const molecules = useMemo(() => candidates.map((c) => ({ smiles: c.smiles, label: c.name })), [candidates]);
   if (tab === "target") {
     return (
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
-        <TargetPanel events={events} onAsk={onAsk} />
+        <TargetPanel events={events} candidates={candidates} onAsk={onAsk} />
       </div>
     );
   }
