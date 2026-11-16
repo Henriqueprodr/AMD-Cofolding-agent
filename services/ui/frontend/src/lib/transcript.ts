@@ -67,6 +67,20 @@ export function applyEvent(state: Transcript, event: ConversationEvent): Transcr
         return { ...turn, blocks };
       });
 
+    // How far a running call has got. Only tools that report it send these,
+    // so a step without any stays as it was: a spinner and the time it began.
+    case "tool_progress":
+      return updateOpenTurn(next, at, event.seq, (turn) => {
+        const index = findOpenToolCall(turn.blocks, event.id, event.name);
+        if (index < 0) return turn;
+        const blocks = [...turn.blocks];
+        blocks[index] = {
+          ...(blocks[index] as Extract<TurnBlock, { kind: "tool" }>),
+          progress: { done: event.done, total: event.total ?? null, message: event.message ?? null },
+        };
+        return { ...turn, blocks };
+      });
+
     case "assistant_message":
       return updateOpenTurn(next, at, event.seq, (turn) => ({
         ...turn,

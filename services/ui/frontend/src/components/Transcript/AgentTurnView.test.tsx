@@ -21,7 +21,9 @@ const result = (name: string, extra: Partial<ToolResultEvent> = {}): ToolResultE
   ...extra,
 });
 
-const tool = (name: string, done?: Partial<ToolResultEvent>): TraceEntry => ({
+// Narrowed to the tool variant so tests can spread it and add fields such
+// as progress, which the wider TraceEntry union does not admit.
+const tool = (name: string, done?: Partial<ToolResultEvent>): Extract<TraceEntry, { kind: "tool" }> => ({
   kind: "tool",
   id: name,
   name,
@@ -62,5 +64,44 @@ describe("TraceList", () => {
 
   it("says so when there is nothing yet", () => {
     expect(renderToStaticMarkup(<TraceList follow entries={[]} />)).toContain("Nothing yet.");
+  });
+
+  it("draws a bar for a running step that says how far it has got", () => {
+    const html = renderToStaticMarkup(
+      <TraceList follow entries={[{ ...tool("rcsb_fetch_files"), progress: { done: 3, total: 4, message: "Fetching 2OSL" } }]} />,
+    );
+
+    expect(html).toContain('role="progressbar"');
+    expect(html).toContain('aria-valuenow="3"');
+    expect(html).toContain('aria-valuemax="4"');
+    expect(html).toContain("width:75%");
+    expect(html).toContain("3/4");
+    expect(html).toContain("Fetching 2OSL");
+  });
+
+  it("shows the message alone when the tool does not know its total", () => {
+    const html = renderToStaticMarkup(
+      <TraceList follow entries={[{ ...tool("cluster_molecules"), progress: { done: 2, total: null, message: "Clustering" } }]} />,
+    );
+
+    // A bar needs an end to measure against; without one it would be a guess.
+    expect(html).not.toContain('role="progressbar"');
+    expect(html).toContain("Clustering");
+  });
+
+  it("drops the bar once the step has answered", () => {
+    const html = renderToStaticMarkup(
+      <TraceList follow entries={[{ ...tool("rcsb_fetch_files", {}), progress: { done: 3, total: 4, message: "Fetching 2OSL" } }]} />,
+    );
+
+    expect(html).not.toContain('role="progressbar"');
+    expect(html).toContain('aria-label="Done"');
+  });
+
+  it("leaves a step that reports no progress exactly as it was", () => {
+    const html = renderToStaticMarkup(<TraceList follow entries={[tool("list_jobs")]} />);
+
+    expect(html).not.toContain('role="progressbar"');
+    expect(html).toContain('aria-label="Running"');
   });
 });

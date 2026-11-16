@@ -201,6 +201,24 @@ export interface ToolResultEvent extends Recorded {
   elapsedMs: number | null;
 }
 
+/**
+ * How far a running tool has got, for the ones that say.
+ *
+ * Carries the call_id of the tool_call it belongs to, so the step already
+ * on screen grows a bar rather than a second row appearing. Tools that
+ * report nothing send none of these at all.
+ */
+export interface ToolProgressEvent extends Recorded {
+  type: "tool_progress";
+  id: string | null;
+  name: string;
+  done: number;
+  /** Null when the tool knows it is working but not how much of. */
+  total: number | null;
+  /** What it is on right now, such as "Fetching 1IQK". */
+  message: string | null;
+}
+
 export interface AssistantMessageEvent extends Recorded {
   type: "assistant_message";
   content: string;
@@ -521,6 +539,7 @@ export type ConversationEvent =
   | ThinkingEvent
   | ToolCallEvent
   | ToolResultEvent
+  | ToolProgressEvent
   | AssistantMessageEvent
   | StatusEvent
   | CancelledEvent
@@ -631,6 +650,8 @@ export type TurnBlock =
       /** Epoch ms when the call started. */
       at: number;
       result?: ToolResultEvent;
+      /** How far it has got, while it is still running and if it says. */
+      progress?: { done: number; total: number | null; message: string | null };
       /** The same call sent this many times in a row with the same answer, shown once. */
       repeats?: number;
     }

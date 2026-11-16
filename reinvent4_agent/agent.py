@@ -15,6 +15,7 @@ structured JSONL transcript file for post-hoc analysis.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import json
 import logging
@@ -102,9 +103,32 @@ class AgentEventHandler(Protocol):
     def on_thinking(self, text: str) -> None: ...
     def on_tool_call(self, name: str, arguments: dict[str, Any]) -> None: ...
     def on_tool_result(self, name: str, result: str, is_error: bool) -> None: ...
+    #: How far a tool has got, for the ones that say. Optional: a handler
+    #: without it is simply not told, and shows work of unknown length.
+    def on_tool_progress(
+        self, name: str, done: float, total: float | None, message: str | None
+    ) -> None: ...
     def on_error(self, message: str) -> None: ...
     def on_monitor_alert(self, alert: dict[str, Any]) -> None: ...
     def on_monitor_response(self, text: str) -> None: ...
+
+
+@functools.lru_cache(maxsize=None)
+def _call_tool_takes_progress(call_tool: Any) -> bool:
+    try:
+        return "on_progress" in inspect.signature(call_tool).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _reports_progress(mcp: Any) -> bool:
+    """Whether this MCP client can pass a tool's progress back to us.
+
+    The agent is handed whatever speaks call_tool — the real client, a
+    remote stand-in, a test double — and only the real one forwards MCP
+    progress notifications. Asking first keeps the rest working unchanged.
+    """
+    return _call_tool_takes_progress(getattr(type(mcp), "call_tool", None))
 
 
 class _NullEventHandler:
@@ -470,7 +494,38 @@ class Agent:
                         tc.name,
                         resolved,
                     )
-                result_text = await self.mcp.call_tool(resolved, tc.arguments)
+                async def on_progress(
+                    progress: float,
+                    total: float | None,
+                    message: str | None,
+                    _name: str = tc.name,
+                    _round: int = round_idx,
+                ) -> None:
+                    """Pass a tool's own progress on to whoever is watching.
+
+                    Only tools that call ``Context.report_progress`` send
+                    any; the rest never call this and are shown as work of
+                    unknown length, as before.
+                    """
+                    self._write_event("tool_progress", {
+                        "name": _name,
+                        "done": progress,
+                        "total": total,
+                        "message": message,
+                        "round": _round,
+                    })
+                    # Not every sink reports progress: the CLI and the
+                    # supervisor render differently and do not need it.
+                    sink = getattr(self._events, "on_tool_progress", None)
+                    if sink is not None:
+                        sink(_name, progress, total, message)
+
+                if _reports_progress(self.mcp):
+                    result_text = await self.mcp.call_tool(
+                        resolved, tc.arguments, on_progress=on_progress
+                    )
+                else:
+                    result_text = await self.mcp.call_tool(resolved, tc.arguments)
                 elapsed = time.monotonic() - t0
 
                 logger.info(

@@ -364,6 +364,37 @@ function LiveSteps({ steps }: { steps: ToolStep[] }) {
   );
 }
 
+/**
+ * How far a running tool has got, under the step it belongs to.
+ *
+ * A tool that knows its total gets a filled bar and a count; one that only
+ * knows it is working gets the message alone, since a bar with no end to
+ * measure against would be a guess.
+ */
+function StepProgress({ progress }: { progress: NonNullable<ToolStep["progress"]> }) {
+  const { done, total, message } = progress;
+  const pct = total && total > 0 ? Math.min(100, Math.max(0, (done / total) * 100)) : null;
+  return (
+    <div className="flex items-center gap-2 pr-3 pb-1.5 pl-10">
+      {pct !== null && (
+        <span
+          role="progressbar"
+          aria-valuenow={done}
+          aria-valuemin={0}
+          aria-valuemax={total ?? undefined}
+          className="bg-inset h-1 min-w-0 flex-1 overflow-hidden rounded-full"
+        >
+          <span className="block h-full rounded-full transition-[width] duration-300" style={{ width: `${pct}%`, background: "var(--color-structure)" }} />
+        </span>
+      )}
+      <span className={`text-muted truncate font-mono text-[10px] ${pct === null ? "min-w-0 flex-1" : "shrink-0"}`}>
+        {pct !== null ? `${Math.round(done)}/${Math.round(total as number)}` : ""}
+        {message ? `${pct !== null ? " · " : ""}${message}` : ""}
+      </span>
+    </div>
+  );
+}
+
 const StepRow = memo(function StepRow({ step, index }: { step: ToolStep; index: number }) {
   const [open, setOpen] = useState(false);
   const result = step.result;
@@ -401,6 +432,7 @@ const StepRow = memo(function StepRow({ step, index }: { step: ToolStep; index: 
           {took === null ? <Elapsed since={step.at} /> : Number.isFinite(took) ? duration(Math.max(0, took)) : ""}
         </span>
       </button>
+      {!result && step.progress && <StepProgress progress={step.progress} />}
       {error && !open && (
         <p className="-mt-1 truncate pr-3 pb-1.5 pl-10 text-[11px]" style={{ color: "var(--color-accent)" }}>
           {error}

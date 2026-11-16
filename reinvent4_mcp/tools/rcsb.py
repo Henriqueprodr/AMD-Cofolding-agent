@@ -15,6 +15,7 @@ Architecture — six layers, no circular imports:
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
@@ -22,12 +23,24 @@ import os
 import concurrent.futures
 import random
 import time
+
+import anyio
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Literal
 
 import requests
+
+try:  # pragma: no cover - import shape depends on the installed SDK
+    from mcp.server.fastmcp import Context
+except ModuleNotFoundError:
+    # The server targets the 1.x SDK, where progress reporting lives on
+    # FastMCP's Context. This module is also imported on its own by tests and
+    # by callers that never register a tool, and those must not need the SDK
+    # at all. Annotating with Any there costs only the injection, which only
+    # happens when a server is registering tools in the first place.
+    Context = Any  # type: ignore[assignment,misc]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Thread-runner — rcsbapi.data.DataQuery.exec() calls asyncio.run() internally.
@@ -1673,12 +1686,13 @@ def register_tools(mcp: Any) -> None:
         return {"pubmed": MetadataClient().get_pubmed(pubmed_ids)}
 
     @mcp.tool()
-    def rcsb_fetch_files(
+    async def rcsb_fetch_files(
         entry_ids: list[str],
         formats: list[str] | None = None,
         assembly_ids: list[str] | None = None,
         include_validation_report: bool = False,
         output_dir: str | None = None,
+        ctx: Context | None = None,
     ) -> dict:
         """Download coordinate files; return artifact records with SHA-256.
 
@@ -1688,25 +1702,51 @@ def register_tools(mcp: Any) -> None:
         """
         out_path = Path(output_dir or "/shared/rcsb_structures")
         client = RCSBHTTPClient()
+
+        async def step(done: int, total: int, what: str) -> None:
+            """Say how far the download has got, for callers that listen."""
+            if ctx is not None:
+                await ctx.report_progress(done, total, what)
+
+        # Downloading is blocking and can run for minutes over many entries.
+        # Kept on a worker thread so the progress reports in between are
+        # actually delivered rather than queued behind the event loop.
+        def blocking(fn: Any, **kwargs: Any) -> Any:
+            return anyio.to_thread.run_sync(functools.partial(fn, **kwargs))
+
         # Pre-fetch metadata to get atom counts for B4 PDB size guard
         # Gracefully handled: if metadata is unavailable, size guard is skipped.
+        total = len(entry_ids)
+        await step(0, total, f"Reading metadata for {total} entries")
         metadata_cache: dict[str, dict] = {}
         try:
             mc = MetadataClient()
-            raw_map = mc.get_entries(entry_ids)
+            raw_map = await blocking(mc.get_entries, entry_ids=entry_ids)
             for eid, raw in raw_map.items():
                 if raw is not None:
                     metadata_cache[eid.upper()] = normalize_entry(raw, eid)
         except Exception:
             pass  # size guard will be skipped silently
+
         fc = FileClient(http=client, output_dir=out_path)
-        artifacts = fc.fetch(
-            entry_ids=entry_ids,
-            formats=formats or ["cif"],
-            assembly_ids=assembly_ids,
-            include_validation_report=include_validation_report,
-            metadata_cache=metadata_cache,
-        )
+        # One entry at a time rather than the whole list, purely so there is
+        # somewhere to report from. fetch() loops entries outermost, so the
+        # artifacts come out in the same order either way, and its promise
+        # that one file's failure does not abort the rest still holds.
+        artifacts: list[FileArtifact] = []
+        for index, entry_id in enumerate(entry_ids):
+            await step(index, total, f"Fetching {entry_id}")
+            artifacts.extend(
+                await blocking(
+                    fc.fetch,
+                    entry_ids=[entry_id],
+                    formats=formats or ["cif"],
+                    assembly_ids=assembly_ids,
+                    include_validation_report=include_validation_report,
+                    metadata_cache=metadata_cache,
+                )
+            )
+        await step(total, total, f"Fetched {len(artifacts)} files")
         return {
             "schema_version": SCHEMA_VERSION,
             "output_dir": str(out_path),

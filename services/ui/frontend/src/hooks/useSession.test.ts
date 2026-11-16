@@ -55,3 +55,42 @@ describe("automatic turns", () => {
     expect(asked.role === "agent" && asked.auto).toBeUndefined();
   });
 });
+
+describe("how far a running tool has got", () => {
+  const started = () =>
+    applyEvent(
+      applyEvent(EMPTY_TRANSCRIPT, { type: "status", state: "busy", seq: 1, ts: UNTIL }),
+      { type: "tool_call", seq: 2, ts: UNTIL, id: "call-1", name: "rcsb_fetch_files", arguments: {} },
+    );
+
+  const toolBlock = (state: ReturnType<typeof started>) => {
+    const turn = state.turns[0];
+    if (turn.role !== "agent") throw new Error("expected an agent turn");
+    const block = turn.blocks[0];
+    if (block.kind !== "tool") throw new Error("expected a tool block");
+    return block;
+  };
+
+  const progress = (seq: number, done: number) =>
+    ({ type: "tool_progress", seq, ts: UNTIL, id: "call-1", name: "rcsb_fetch_files", done, total: 4, message: `at ${done}` }) as const;
+
+  it("lands on the step it belongs to rather than adding a row", () => {
+    const state = applyEvent(started(), progress(3, 1));
+
+    const turn = state.turns[0];
+    expect(turn.role === "agent" && turn.blocks).toHaveLength(1);
+    expect(toolBlock(state).progress).toEqual({ done: 1, total: 4, message: "at 1" });
+  });
+
+  it("keeps only the latest report", () => {
+    const state = applyEvent(applyEvent(started(), progress(3, 1)), progress(4, 3));
+
+    expect(toolBlock(state).progress?.done).toBe(3);
+  });
+
+  it("is ignored when no such call is open", () => {
+    const state = applyEvent(started(), { ...progress(3, 1), id: "call-9", name: "other_tool" });
+
+    expect(toolBlock(state).progress).toBeUndefined();
+  });
+});

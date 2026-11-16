@@ -13,10 +13,15 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import AsyncExitStack
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
+#: What a tool reports while it works: how far, of how much, doing what.
+#: Matches MCP's own ProgressFnT, spelled out here so callers do not have to
+#: import from the SDK's internals to pass one.
+ProgressFn = Callable[[float, Optional[float], Optional[str]], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
 
@@ -219,13 +224,24 @@ class MCPClient:
         return None
 
     async def call_tool(
-        self, name: str, arguments: dict[str, Any]
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        on_progress: ProgressFn | None = None,
     ) -> str:
         """Call an MCP tool by name and return the text result.
 
+        ``on_progress`` receives the tool's own progress reports, as MCP
+        delivers them: how far it has got, what of, and what it is doing.
+        Only tools that call ``Context.report_progress`` send any, so a tool
+        that reports nothing simply never calls back and the caller shows
+        whatever it shows for work of unknown length.
+
         Raises ValueError if the tool call returns an error.
         """
-        result = await self.session.call_tool(name, arguments)
+        result = await self.session.call_tool(
+            name, arguments, progress_callback=on_progress
+        )
 
         text_parts = []
         for content_block in result.content:

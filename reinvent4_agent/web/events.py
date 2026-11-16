@@ -80,6 +80,28 @@ class WebSocketEventHandler:
             }
         )
 
+    def on_tool_progress(
+        self, name: str, done: float, total: float | None, message: str | None
+    ) -> None:
+        """How far the call is, against the call_id the UI already has.
+
+        Keyed by the same pending call_id as the result, so the step on
+        screen grows a bar rather than a second row appearing.
+        """
+        call_id = self._pending.get(name)
+        if call_id is None:
+            return
+        self._emit(
+            {
+                "type": "tool_progress",
+                "id": call_id,
+                "name": name,
+                "done": done,
+                "total": total,
+                "message": message,
+            }
+        )
+
     def on_tool_result(self, name: str, result: str, is_error: bool) -> None:
         if self._on_result is not None:
             try:
