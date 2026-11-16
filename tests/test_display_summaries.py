@@ -8,7 +8,14 @@ more campaigns trying to recover.
 
 from __future__ import annotations
 
-from reinvent4_agent.display import _summarize_tool_result
+import pytest
+
+# The module under test renders through rich, which is a runtime dependency of
+# the agent rather than of the tests; without it the import error during
+# collection aborts the whole `pytest tests/` run rather than just this module.
+pytest.importorskip("rich")
+
+from reinvent4_agent.display import _summarize_tool_result  # noqa: E402
 
 
 class TestAnErrorFieldThatIsEmpty:

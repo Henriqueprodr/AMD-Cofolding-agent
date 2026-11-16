@@ -160,3 +160,6 @@ def test_mol2mol_submission_uses_singleton_and_real_paths(tmp_path) -> None:
     assert kwargs["max_steps"] == 25
     assert kwargs["model"] == ".m2m_medium"
     assert kwargs["extra_files"] == {"seed.smi": "CCO\nCCN\n"}
+    # The decorated name is a display tag; the supervisor harvests the run by
+    # the TTP it belongs to, so that has to travel separately.
+    assert kwargs["ttp_id"] == ttp.id

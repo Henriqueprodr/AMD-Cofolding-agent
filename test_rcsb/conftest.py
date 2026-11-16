@@ -1,7 +1,10 @@
 """Shared test fixtures for the RCSB fetcher test harness.
 
-sys.path is patched so that `import rcsb` resolves to
-01-rcsb-pdb-fetcher/rcsb.py — no agent stack needed.
+``import rcsb`` and ``import registry`` are aliased to the modules the server
+actually loads. They used to resolve to pre-merge copies at the repo root,
+which drifted: the root copy had none of the retry handling the package copy
+grew, and the root registry listed one extension where the real one lists
+nine. The suite passed against code nothing ran.
 """
 
 from __future__ import annotations
@@ -16,11 +19,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # ── path setup ───────────────────────────────────────────────────────────────
-# Insert the parent of test_rcsb/ (i.e. 01-rcsb-pdb-fetcher/) so that
-# `import rcsb` and `import registry` work without any package install.
+# Insert the repo root so the package is importable without an install, then
+# point the short names the test files use at the real modules. The aliases
+# are what make `monkeypatch.setattr("rcsb.RCSBHTTPClient", ...)` and the
+# bare `from rcsb import ...` in each test file land on the shipped code.
 _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+import reinvent4_mcp.registry as _registry_module  # noqa: E402
+import reinvent4_mcp.tools.rcsb as _rcsb_module  # noqa: E402
+
+sys.modules["rcsb"] = _rcsb_module
+sys.modules["registry"] = _registry_module
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 

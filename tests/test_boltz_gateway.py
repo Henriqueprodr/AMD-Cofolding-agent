@@ -853,6 +853,11 @@ class TestContract:
     """The gateway has to be a drop-in for a Boltz replica."""
 
     def test_it_speaks_the_same_request_shape_as_boltz(self):
+        # Only this test reads the real Boltz app, which locks its worker pool
+        # with POSIX-only fcntl; the rest of the file exercises the gateway
+        # alone and runs anywhere.
+        pytest.importorskip("fcntl")
+
         boltz_spec = importlib.util.spec_from_file_location(
             "boltz2_app_for_gateway", str(_ROOT / "services" / "boltz2" / "app.py")
         )

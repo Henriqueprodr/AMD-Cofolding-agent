@@ -1,8 +1,8 @@
-﻿"""Tests for reinvent4_agent/conductor.py -- the campaign loop.
+"""Tests for reinvent4_agent/conductor.py -- the campaign loop.
 
 ``tick()`` is a pure function of a ledger read, so the whole loop is testable
-against a fake store: the windows, the top-up arithmetic, the Pareto-guided
-proposals, admission control, and the hard stop.
+against a fake store: the windows, the top-up arithmetic, the proposals,
+admission control, and the hard stop.
 """
 
 from __future__ import annotations
@@ -50,16 +50,14 @@ def _campaign(**overrides: Any) -> dict[str, Any]:
 def _status(
     phase: str = "dispatching",
     counts: dict[str, int] | None = None,
-    front: list[dict[str, Any]] | None = None,
+    n_results: int = 0,
     **campaign_overrides: Any,
 ) -> dict[str, Any]:
     return {
         "campaign": _campaign(**campaign_overrides),
         "task_counts": counts or {},
         "in_flight": [],
-        "n_results": len(front or []),
-        "front": front or [],
-        "n_ineligible": 0,
+        "n_results": n_results,
         "window": {
             "dispatch_remaining": None,
             "hard_stop_remaining": None,
@@ -90,15 +88,16 @@ class FakeStore:
     def status(self, campaign_id):
         return self._status
 
+    def conducted(self, campaign_id):
+        self.calls.append("conducted")
+        return self._status["campaign"]
+
     def campaign(self, campaign_id):
         return self._status["campaign"]
 
     def tasks(self, campaign_id, state=None):
         self.calls.append("tasks")
         return self._tasks
-
-    def pareto(self, campaign_id):
-        return {"front": self._status["front"], "ineligible": []}
 
     def results(self, campaign_id):
         # A list, as the store returns. It was a dict here once and the
@@ -108,6 +107,18 @@ class FakeStore:
     def enqueue_task(self, campaign_id, **spec):
         self.enqueued.append(spec)
         return {"task_id": f"t{len(self.enqueued)}", "spec": spec}
+
+    open_proposals: list[dict[str, Any]] = []
+
+    def proposals(self, campaign_id, state="open"):
+        return list(self.open_proposals)
+
+    def take_proposals(self, campaign_id, proposal_ids, priority=0):
+        taken = [p for p in self.open_proposals if p["proposal_id"] in proposal_ids]
+        self.open_proposals = [p for p in self.open_proposals if p not in taken]
+        for proposal in taken:
+            self.enqueued.append({**proposal["spec"], "priority": priority, "from": proposal["proposal_id"]})
+        return [{"task_id": p["proposal_id"]} for p in taken]
 
     def close_campaign(self, campaign_id):
         self.closed += 1
@@ -374,19 +385,79 @@ class TestDispatchWindow:
 
 class TestAdmissionControl:
 
-    def test_a_deep_scorer_queue_holds_dispatch_back(self, monkeypatch):
-        """Another supervisor would deepen the bottleneck, not relieve it."""
+    @staticmethod
+    def _pressure(monkeypatch, queued):
         monkeypatch.setattr(
             requests, "get",
-            lambda *a, **k: _ok(_stats(healthy=2, queued=20)),
+            lambda *a, **k: _ok(_stats(healthy=2, queued=queued)),
         )
-        store = FakeStore(_status())
+
+    def test_a_deep_scorer_queue_holds_dispatch_back(self, monkeypatch):
+        """Another supervisor would deepen the bottleneck, not relieve it.
+
+        The window halves, from the campaign's eight to four, and four are
+        already open.
+        """
+        self._pressure(monkeypatch, queued=20)
+        store = FakeStore(_status(counts={"claimed": 4}, concurrency=8))
 
         report = _conductor(store, max_queue_pressure=2.0).tick()
 
         assert report.dispatched == 0
         assert "boltz queue" in report.held_back
+        assert "window is at 4 of 8" in report.held_back
         assert store.enqueued == []
+
+    def test_a_deep_queue_still_lets_a_quiet_campaign_through_at_half(self, monkeypatch):
+        """Halving, not stopping: the fixed threshold let nothing through."""
+        self._pressure(monkeypatch, queued=20)
+        store = FakeStore(_status(concurrency=8))
+
+        assert _conductor(store, max_queue_pressure=2.0).tick().dispatched == 4
+
+    def test_one_congestion_is_one_cut(self, monkeypatch):
+        """Ticks inside the cooldown read the same queue and must not halve again."""
+        self._pressure(monkeypatch, queued=20)
+        clock = [0.0]
+        conductor = _conductor(
+            FakeStore(_status(counts={"claimed": 6}, concurrency=8)),
+            max_queue_pressure=2.0, clock=lambda: clock[0],
+        )
+
+        conductor.tick()
+        clock[0] = 30.0
+        report = conductor.tick()
+
+        assert "window is at 4 of 8" in report.held_back
+
+    def test_a_queue_hovering_near_the_limit_holds_the_window(self, monkeypatch):
+        """Between half the limit and the limit is the hysteresis band."""
+        self._pressure(monkeypatch, queued=20)
+        conductor = _conductor(
+            FakeStore(_status(counts={"claimed": 6}, concurrency=8)),
+            max_queue_pressure=2.0,
+        )
+        conductor.tick()
+
+        self._pressure(monkeypatch, queued=3)
+        for _ in range(3):
+            report = conductor.tick()
+
+        assert "window is at 4 of 8" in report.held_back
+
+    def test_a_drained_queue_opens_the_window_one_a_pass(self, monkeypatch):
+        self._pressure(monkeypatch, queued=20)
+        conductor = _conductor(
+            FakeStore(_status(counts={"claimed": 6}, concurrency=8)),
+            max_queue_pressure=2.0,
+        )
+        conductor.tick()
+
+        self._pressure(monkeypatch, queued=1)
+        store = FakeStore(_status(counts={"claimed": 4}, concurrency=8))
+        conductor.store = store
+
+        assert conductor.tick().dispatched == 1
 
     def test_a_shallow_queue_lets_work_through(self, monkeypatch):
         monkeypatch.setattr(
@@ -517,7 +588,72 @@ class TestDeadlines:
         assert store.enqueued[0]["max_steps"] == 120
 
 
+class TestConductorDirectedMode:
+    """An agent conducting its own campaign dispatches the work itself.
+
+    The loop still holds the pool at size and still minds the windows; what
+    it does not do is decide what to run. A loop proposing alongside the
+    agent would spend the pool on work nobody asked for and queue the user's
+    own tasks behind it.
+    """
+
+    def test_an_idle_slot_is_left_for_the_agent(self):
+        proposer = FakeProposer()
+        store = FakeStore(_status(counts={}))
+
+        report = _conductor(store, proposer=proposer, propose=False).tick()
+
+        assert report.dispatched == 0
+        assert store.enqueued == []
+        assert proposer.asked_for == [], "the model should not even be asked"
+
+    def test_the_pool_is_still_held_at_size(self):
+        """The sub-agents have to exist before the agent can dispatch to them."""
+        scaler = FakeScaler()
+        store = FakeStore(_status(counts={}))
+
+        _conductor(store, scaler=scaler, propose=False).tick()
+
+        assert scaler.scaled_to == [2]
+
+    def test_the_windows_are_still_minded(self):
+        store = FakeStore(_status(phase="past_hard_stop"))
+
+        report = _conductor(store, propose=False).tick()
+
+        assert report.finalized is True
+        assert store.finalized == 1
+
+    def test_proposing_is_still_available_for_an_unattended_campaign(self):
+        store = FakeStore(_status(counts={}))
+
+        report = _conductor(store, propose=True).tick()
+
+        assert report.dispatched == 2
+
+
 class TestWindows:
+
+    def test_a_campaign_closed_by_hand_finalizes_once_it_is_empty(self):
+        """Closed by the agent rather than by the clock. Without this the
+        pool sits at concurrency doing nothing until the hard stop, which for
+        a campaign opened with no deadline is forever."""
+        store = FakeStore(_status(counts={"done": 3}, state="draining"))
+        scaler = FakeScaler()
+
+        report = _conductor(store, scaler=scaler).tick()
+
+        assert report.finalized is True
+        assert store.finalized == 1
+        assert scaler.scaled_to == [0]
+
+    def test_a_closed_campaign_with_work_left_is_left_to_drain(self):
+        store = FakeStore(_status(counts={"claimed": 1}, state="draining"))
+
+        report = _conductor(store).tick()
+
+        assert report.finalized is False
+        assert store.finalized == 0
 
     def test_draining_closes_the_queue_once(self):
         store = FakeStore(_status(phase="draining"))
@@ -617,7 +753,28 @@ class TestWindows:
         ):
             _conductor(store).tick()
 
-        assert store.calls == ["tasks", "finalize", "stop"]
+        assert store.calls == ["conducted", "tasks", "finalize", "stop"]
+
+    def test_a_person_stopping_it_ends_it_mid_window(self):
+        """The stop button: no hard stop reached, everything ends anyway."""
+        from reinvent4_agent.conducting import ConductingRegistry
+
+        store = FakeStore(
+            _status(phase="dispatching"),
+            tasks=[{"task_id": "aaa", "state": "claimed", "spec": {}, "job_id": "job-a"}],
+        )
+        scaler = FakeScaler()
+        stopped: list[str] = []
+
+        with patch(
+            "reinvent4_mcp.tools.optimization.stop_optimization",
+            lambda job_id: stopped.append(job_id) or {},
+        ):
+            ConductingRegistry().wind_down("c1", store=store, scaler=scaler)
+
+        assert store.finalized == 1
+        assert stopped == ["job-a"]
+        assert scaler.scaled_to == [0]
 
     def test_a_task_with_no_job_is_skipped_quietly(self):
         store = FakeStore(
@@ -771,10 +928,7 @@ class TestEntrypointGuards:
 class TestStatusView:
 
     def test_it_renders_the_things_an_operator_asks_about(self):
-        status = _status(
-            counts={"claimed": 1, "done": 2},
-            front=[{"task_id": "a", "objective_profile": {"QED": 0.812}}],
-        )
+        status = _status(counts={"claimed": 1, "done": 2}, n_results=2)
         status["in_flight"] = [{
             "task_id": "b", "owner": "dd-agentic-supervisor-xyz",
             "claimed_at": "2026-10-08T12:00:00+00:00",
@@ -789,13 +943,13 @@ class TestStatusView:
         assert "feed0001" in rendered
         assert "claimed=1, done=2" in rendered
         assert "dd-agentic-supervisor-xyz" in rendered
-        assert "QED=0.812" in rendered
+        assert "results: 2" in rendered
         assert "2.0h" in rendered
 
     def test_an_empty_campaign_reads_sensibly(self):
         rendered = format_status(_status())
 
-        assert "none yet" in rendered
+        assert "results: 0" in rendered
         assert "in flight: none" in rendered
 
     def test_the_pool_is_shown_when_it_is_known(self):
@@ -818,13 +972,6 @@ class TestStatusView:
         rendered = format_status(_status())
 
         assert "supervisors:" not in rendered
-
-    def test_results_off_the_front_are_called_out(self):
-        """A missing objective usually means a failed scorer, not a bad run."""
-        status = _status()
-        status["n_ineligible"] = 2
-
-        assert "failed scorer" in format_status(status)
 
 
 # ---------------------------------------------------------------------------
@@ -902,3 +1049,103 @@ def _service_account(path) -> None:
     (path / "token").write_text("sa-token")
     (path / "ca.crt").write_text("ca")
     (path / "namespace").write_text("demo-lux")
+
+
+# ---------------------------------------------------------------------------
+# The floor: what the loop does about a slot an agent leaves free
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _floored(store, clock, **kwargs) -> CampaignConductor:
+    return _conductor(store, propose=False, floor_seconds=90, clock=clock, **kwargs)
+
+
+class TestFloor:
+
+    def test_a_free_slot_is_the_agents_to_fill_within_the_grace(self):
+        store = FakeStore(_status(counts={"claimed": 1}))
+        clock = _Clock()
+        conductor = _floored(store, clock)
+
+        conductor.tick()
+        clock.now += 60
+        report = conductor.tick()
+
+        assert store.enqueued == []
+        assert report.dispatched == 0
+
+    def test_past_the_grace_the_loop_fills_it_below_the_agents_priority(self):
+        store = FakeStore(_status(counts={"claimed": 1}))
+        clock = _Clock()
+        conductor = _floored(store, clock)
+
+        conductor.tick()
+        clock.now += 91
+        report = conductor.tick()
+
+        assert report.floor is True
+        assert report.dispatched == 1
+        assert store.enqueued[0]["priority"] == -1
+        assert store.enqueued[0]["rationale"].startswith("Filled a sub-agent")
+
+    def test_what_the_sub_agents_proposed_goes_first(self):
+        """Written by an agent that had just done the work it follows from."""
+        store = FakeStore(_status(counts={}))
+        store._status["open_proposals"] = 1
+        store.open_proposals = [{"proposal_id": "p1", "spec": {"intent": "hold the triazole"}}]
+        proposer = FakeProposer()
+        clock = _Clock()
+        conductor = _floored(store, clock, proposer=proposer)
+
+        conductor.tick()
+        clock.now += 91
+        conductor.tick()
+
+        assert [task.get("from") for task in store.enqueued] == ["p1", None]
+        assert proposer.asked_for == [1]
+
+    def test_a_team_back_at_work_restarts_the_grace(self):
+        store = FakeStore(_status(counts={"claimed": 1}))
+        clock = _Clock()
+        conductor = _floored(store, clock)
+
+        conductor.tick()
+        clock.now += 60
+        store._status["task_counts"] = {"claimed": 2}
+        conductor.tick()
+        store._status["task_counts"] = {"claimed": 1}
+        clock.now += 60
+        conductor.tick()
+
+        assert store.enqueued == []
+
+    def test_a_lead_campaigns_tasks_hold_slots_too(self):
+        store = FakeStore(_status(counts={"claimed": 1}))
+        store._status["team_counts"] = {"claimed": 2}
+        clock = _Clock()
+        conductor = _floored(store, clock)
+
+        conductor.tick()
+        clock.now += 91
+        conductor.tick()
+
+        assert store.enqueued == []
+
+    def test_no_floor_leaves_every_slot_to_the_agent(self):
+        store = FakeStore(_status(counts={}))
+        clock = _Clock()
+        conductor = _conductor(store, propose=False, floor_seconds=0, clock=clock)
+
+        conductor.tick()
+        clock.now += 1000
+        conductor.tick()
+
+        assert store.enqueued == []

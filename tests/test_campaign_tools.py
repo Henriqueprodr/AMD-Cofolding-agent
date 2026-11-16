@@ -178,6 +178,273 @@ class TestPoolCapacity:
         assert capacity["supervisors"] == {"idle": 1, "busy": 2, "alive": 3}
         assert capacity["scorer"]["queue_pressure"] == 1.5
 
+    def test_a_full_run_window_still_leaves_room_for_other_kinds(self, store, monkeypatch):
+        """No design task could start a run; a research task needs none."""
+        store(pool=_pool(idle=2))
+        monkeypatch.setattr(tools, "run_room", lambda: {
+            "limit": 4, "ceiling": 16, "active": 4, "waiting": 2, "free": 0,
+            "reason": "a run has waited 20 min for the scheduler to start it",
+        })
+
+        with self._pressure(0.5):
+            capacity = tools.get_pool_capacity()
+
+        assert capacity["can_dispatch"] == "not design"
+        assert "waited 20 min" in capacity["binding_limit"]
+        assert capacity["runs"]["free"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Dispatching
+# ---------------------------------------------------------------------------
+
+
+class TestEnqueueTask:
+
+    class Recording(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.enqueued: list[dict[str, Any]] = []
+
+        def enqueue_task(self, campaign_id, **spec):
+            self.enqueued.append(spec)
+            return {"task_id": "t2", "spec": spec}
+
+    def test_the_tasks_it_builds_on_reach_the_ledger(self, monkeypatch):
+        """They are the lines between the tasks in the user's view."""
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+
+        tools.enqueue_task("feed0001", "Grow into the ribose pocket", derived_from=["t1"])
+
+        assert ledger.enqueued[0]["derived_from"] == ["t1"]
+
+    def test_a_first_task_carries_no_lineage(self, monkeypatch):
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+
+        tools.enqueue_task("feed0001", "Survey the hinge binders")
+
+        assert "derived_from" not in ledger.enqueued[0]
+
+    def test_its_workstream_and_priority_reach_the_ledger(self, monkeypatch):
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+
+        tools.enqueue_task("feed0001", "Counter-screen BRD2", workstream="selectivity", priority=2)
+
+        assert ledger.enqueued[0]["workstream"] == "selectivity"
+        assert ledger.enqueued[0]["priority"] == 2
+
+
+class TestEnqueueTasks:
+
+    class Recording(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.batches: list[list[dict[str, Any]]] = []
+
+        def enqueue_tasks(self, campaign_id, tasks):
+            self.batches.append(tasks)
+            return [{"task_id": f"t{i}", "spec": spec} for i, spec in enumerate(tasks)]
+
+    def test_a_batch_reaches_the_ledger_in_one_call(self, monkeypatch):
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+
+        answer = tools.enqueue_tasks("feed0001", [
+            {"intent": "Survey the hinge binders", "kind": "research"},
+            {"intent": "Counter-screen BRD2", "kind": "question", "workstream": "selectivity"},
+        ])
+
+        assert answer["n_queued"] == 2
+        assert len(ledger.batches) == 1
+        assert ledger.batches[0][1]["workstream"] == "selectivity"
+
+    def test_a_task_without_an_intent_refuses_the_batch(self, monkeypatch):
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+
+        answer = tools.enqueue_tasks("feed0001", [{"intent": "fine"}, {"kind": "research"}])
+
+        assert "Task 2" in answer["error"]
+        assert ledger.batches == []
+
+    def test_a_field_no_task_has_refuses_the_batch(self, monkeypatch):
+        """Silently dropped, it would be an instruction the sub-agent never got."""
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+
+        answer = tools.enqueue_tasks("feed0001", [{"intent": "fine", "urgency": "high"}])
+
+        assert "urgency" in answer["error"]
+        assert ledger.batches == []
+
+    @staticmethod
+    def _room(free, limit=4, reason=None):
+        return {"limit": limit, "ceiling": 16, "active": limit - free,
+                "waiting": 0, "free": free, "reason": reason}
+
+    def test_a_fan_out_is_told_how_much_of_it_starts_now(self, monkeypatch):
+        """Queued whole, since waiting in the ledger costs nothing, but said.
+
+        A comparison whose branches start an hour apart reads differently
+        from one that ran side by side.
+        """
+        ledger = self.Recording()
+        ledger._tasks = [
+            {"spec": {"kind": "design"}, "state": "queued"},
+            {"spec": {"kind": "design"}, "state": "claimed", "job_id": "j1"},
+            {"spec": {"kind": "research"}, "state": "queued"},
+        ]
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+        monkeypatch.setattr(tools, "run_room", lambda: self._room(free=2, reason="a run waited"))
+
+        answer = tools.enqueue_tasks("feed0001", [
+            {"intent": "Branch A"}, {"intent": "Branch B"}, {"intent": "Branch C"},
+            {"intent": "Read the SAR", "kind": "research"},
+        ])
+
+        assert answer["n_queued"] == 4
+        # One design task of the campaign was already waiting for a run.
+        assert (answer["runs"]["design_tasks"], answer["runs"]["can_start_now"]) == (3, 1)
+        assert "2 of the 3 design tasks will wait" in answer["runs"]["detail"]
+        assert "a run waited" in answer["runs"]["detail"]
+
+    def test_a_fan_out_with_room_says_so_without_a_warning(self, monkeypatch):
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+        monkeypatch.setattr(tools, "run_room", lambda: self._room(free=4))
+
+        answer = tools.enqueue_tasks("feed0001", [{"intent": "A"}, {"intent": "B"}])
+
+        assert answer["runs"]["can_start_now"] == 2
+        assert "detail" not in answer["runs"]
+
+    def test_a_batch_without_design_tasks_does_not_ask_about_runs(self, monkeypatch):
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+        monkeypatch.setattr(tools, "run_room", lambda: pytest.fail("asked the runner"))
+
+        answer = tools.enqueue_tasks("feed0001", [{"intent": "Survey", "kind": "research"}])
+
+        assert "runs" not in answer
+
+    def test_an_unreadable_runner_does_not_hold_the_batch_up(self, monkeypatch):
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+        monkeypatch.setattr(tools, "run_room", lambda: None)
+
+        answer = tools.enqueue_tasks("feed0001", [{"intent": "A"}])
+
+        assert answer["n_queued"] == 1
+        assert "runs" not in answer
+
+    def test_fields_left_empty_are_not_sent(self):
+        spec = tools.task_spec("Survey", kind="research", title="", derived_from=[], priority=0)
+
+        assert spec == {"kind": "research", "intent": "Survey", "fidelity_tier": "exploration"}
+
+
+class TestPlan:
+
+    class Recording(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.plans: list[list[dict[str, Any]]] = []
+
+        def set_plan(self, campaign_id, workstreams):
+            self.plans.append(workstreams)
+            return {"campaign_id": campaign_id, "plan": {"workstreams": workstreams}}
+
+        def coverage(self, campaign_id):
+            return {"campaign_id": campaign_id, "workstreams": [], "gaps": ["admet"]}
+
+    def test_the_plan_reaches_the_ledger_whole(self, monkeypatch):
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+        streams = [{"id": "selectivity", "name": "Selectivity"}, {"id": "admet", "name": "ADMET"}]
+
+        answer = tools.set_campaign_plan("feed0001", streams)
+
+        assert ledger.plans == [streams]
+        assert answer["plan"]["workstreams"] == streams
+
+    def test_coverage_is_the_ledgers_answer(self, monkeypatch):
+        monkeypatch.setattr(tools, "_store", lambda: self.Recording())
+
+        assert tools.get_campaign_coverage("feed0001")["gaps"] == ["admet"]
+
+
+# ---------------------------------------------------------------------------
+# What the sub-agents reported
+# ---------------------------------------------------------------------------
+
+
+class TestTaskReports:
+    """The report is the only thing that crosses from a sub-agent."""
+
+    REPORT = {
+        "task_id": "t1",
+        "report": "## Report\n\nTwo handles survive the 400 Da cut.",
+        "summary": "Two handles survive the 400 Da cut.",
+        "job_ids": ["j1", "j2"],
+        "objective_profile": {"QED": 0.8},
+        "candidates": [{"smiles": "CCO"}] * 25,
+        "posted_at": "2026-11-09T10:00:00+00:00",
+    }
+
+    def test_it_returns_what_the_sub_agent_wrote(self, store):
+        store(results=[dict(self.REPORT)])
+
+        reports = tools.get_task_reports("feed0001")
+
+        assert reports["n_reports"] == 1
+        assert "400 Da cut" in reports["reports"][0]["report"]
+        assert reports["reports"][0]["job_ids"] == ["j1", "j2"]
+
+    def test_the_molecules_are_left_out(self, store):
+        """A dozen reports with 25 molecules each would not fit in a turn;
+        get_supervisor_result has them for one task."""
+        store(results=[dict(self.REPORT)])
+
+        report = tools.get_task_reports("feed0001")["reports"][0]
+
+        assert "candidates" not in report
+        assert report["n_candidates"] == 25
+
+    def test_one_task_can_be_asked_for(self, store):
+        store(results=[dict(self.REPORT), {**self.REPORT, "task_id": "t2"}])
+
+        reports = tools.get_task_reports("feed0001", task_id="t2")
+
+        assert [r["task_id"] for r in reports["reports"]] == ["t2"]
+
+    def test_an_unknown_task_is_said_so(self, store):
+        store(results=[dict(self.REPORT)])
+
+        assert "error" in tools.get_task_reports("feed0001", task_id="nope")
+
+    def test_a_result_without_a_report_is_named(self, store):
+        """No report is not "found nothing" -- it is an older supervisor or an
+        agent that said nothing, and the conductor should not read it as a
+        finding."""
+        store(results=[{**self.REPORT, "report": None}])
+
+        reports = tools.get_task_reports("feed0001")
+
+        assert reports["without_a_report"] == ["t1"]
+
+    def test_a_store_outage_is_reported_not_raised(self, store, monkeypatch):
+        fake = store(results=[])
+
+        def _down(campaign_id, full=False):
+            raise StoreUnavailable("the ledger is unreachable")
+
+        monkeypatch.setattr(fake, "results", _down)
+
+        assert "error" in tools.get_task_reports("feed0001")
+
 
 # ---------------------------------------------------------------------------
 # Where the files are
@@ -206,7 +473,10 @@ class TestCampaignFiles:
         job_dir = root / f"job_{job_id}"
         job_dir.mkdir()
         for name, body in files.items():
-            (job_dir / name.replace("__", ".")).write_text(body)
+            # newline="" keeps the bytes on disk the ones written here; left to
+            # translate, a "\n" becomes "\r\n" on Windows and the size a test
+            # asserts is one byte short per line.
+            (job_dir / name.replace("__", ".")).write_text(body, newline="")
         return job_dir
 
     def test_a_finished_task_points_at_its_directory(self, store, jobs_root):
@@ -284,3 +554,103 @@ class TestCampaignFiles:
 
         assert "list_shared_assets" in files["hint"]
         assert files["jobs_root"] == str(jobs_root)
+
+
+# ---------------------------------------------------------------------------
+# The atlas
+# ---------------------------------------------------------------------------
+
+
+class TestAtlas:
+    """Both sides read and write this, so the tools sign what they write."""
+
+    class Recording(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.written: list[dict[str, Any]] = []
+            self.queries: list[dict[str, Any]] = []
+
+        def atlas(self, campaign_id):
+            return {"campaign_id": campaign_id, "branches": [], "empty_branches": ["admet"]}
+
+        def findings(self, campaign_id, branch=None, q=None, tag=None, limit=50):
+            self.queries.append(
+                {"branch": branch, "q": q, "tag": tag, "limit": limit}
+            )
+            return {"campaign_id": campaign_id, "findings": []}
+
+        def record_finding(self, campaign_id, author, branch, claim, **fields):
+            self.written.append(
+                {"author": author, "branch": branch, "claim": claim, **fields}
+            )
+            return {"finding_id": "f1", "claim": claim}
+
+        def note_finding(self, campaign_id, finding_id, author, body, **fields):
+            self.written.append(
+                {"finding_id": finding_id, "author": author, "body": body, **fields}
+            )
+            return {"note_id": 1}
+
+    @pytest.fixture
+    def ledger(self, monkeypatch):
+        recording = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: recording)
+        return recording
+
+    def test_the_overview_is_the_ledgers_answer(self, ledger):
+        assert tools.atlas_overview("feed0001")["empty_branches"] == ["admet"]
+
+    def test_a_branch_is_read_without_a_query(self, ledger):
+        tools.atlas_branch("feed0001", "selectivity", limit=10)
+
+        assert ledger.queries == [
+            {"branch": "selectivity", "q": None, "tag": None, "limit": 10}
+        ]
+
+    def test_a_search_crosses_every_branch(self, ledger):
+        tools.atlas_search("feed0001", "hinge donor", tag="BD1", limit=5)
+
+        assert ledger.queries == [
+            {"branch": None, "q": "hinge donor", "tag": "BD1", "limit": 5}
+        ]
+
+    def test_a_finding_is_signed_by_the_agent_recording_it(self, ledger, monkeypatch):
+        """Two sub-agents on one node must not write under one name."""
+        monkeypatch.setenv("SUPERVISOR_ID", "sup-7")
+
+        tools.atlas_finding(
+            "feed0001", "selectivity", "BD1 tolerates a methyl",
+            evidence=["10.1021/x"], confidence="high", tags=["BD1"], task_id="t1",
+        )
+
+        assert ledger.written == [{
+            "author": "sup-7", "branch": "selectivity",
+            "claim": "BD1 tolerates a methyl", "detail": None,
+            "evidence": ["10.1021/x"], "confidence": "high", "tags": ["BD1"],
+            "task_id": "t1", "supersedes": None,
+        }]
+
+    def test_an_omitted_list_reaches_the_ledger_as_a_list(self, ledger):
+        tools.atlas_finding("feed0001", "admet", "Clearance is the liability")
+
+        assert ledger.written[0]["evidence"] == []
+        assert ledger.written[0]["tags"] == []
+
+    def test_a_note_is_signed_too(self, ledger, monkeypatch):
+        monkeypatch.setenv("SUPERVISOR_ID", "sup-9")
+
+        tools.atlas_note("feed0001", "f1", "Our run says otherwise", stance="disputes")
+
+        assert ledger.written == [{
+            "finding_id": "f1", "author": "sup-9",
+            "body": "Our run says otherwise", "stance": "disputes", "task_id": None,
+        }]
+
+    def test_a_store_that_is_down_is_an_error_not_a_lost_turn(self, monkeypatch):
+        class Down(FakeStore):
+            def atlas(self, campaign_id):
+                raise StoreUnavailable("connection refused")
+
+        monkeypatch.setattr(tools, "_store", lambda: Down())
+
+        assert "connection refused" in tools.atlas_overview("feed0001")["error"]

@@ -15,6 +15,12 @@ _ROOT = Path(__file__).resolve().parent.parent
 _SERVICE_DIR = _ROOT / "services" / "boltz2"
 sys.path.insert(0, str(_SERVICE_DIR))
 
+# app.py locks its worker pool with fcntl, a POSIX-only module, so this file
+# cannot be imported at all on a Windows checkout -- and an import error
+# during collection aborts the whole `pytest tests/` run rather than just
+# this module.
+pytest.importorskip("fcntl")
+
 _app_spec = importlib.util.spec_from_file_location(
     "boltz2_structure_app",
     _SERVICE_DIR / "app.py",

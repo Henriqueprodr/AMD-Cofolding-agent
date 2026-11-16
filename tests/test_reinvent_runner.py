@@ -49,6 +49,21 @@ REFUSAL = {
 }
 
 
+def _methods_called_on_the_job_manager() -> set[str]:
+    """Every method called on what ``get_job_manager()`` returns, by its callers."""
+    import re
+
+    used: set[str] = set()
+    for path in (_ROOT / "reinvent4_mcp").rglob("*.py"):
+        if path.name in {"manager.py", "runner_client.py"}:
+            continue
+        text = path.read_text(encoding="utf-8")
+        used |= set(re.findall(r"get_job_manager\(\)\.(\w+)\(", text))
+        for name in set(re.findall(r"(\w+)\s*=\s*get_job_manager\(\)", text)):
+            used |= set(re.findall(rf"\b{name}\.(\w+)\(", text))
+    return used
+
+
 @pytest.fixture
 def config(monkeypatch) -> ProcessConfig:
     """A config with the runner enabled, as the agent side would have it."""
@@ -207,12 +222,16 @@ class TestRemoteJobManager:
     """A drop-in for the local manager, including how it fails."""
 
     def test_it_offers_exactly_what_callers_use(self):
+        """Read from the callers, not listed by hand.
+
+        A hand-written list is how ``submit_toml`` went missing: generation
+        called it, nobody added it here, and every generation campaign failed
+        on a cluster with "'RemoteJobManager' object has no attribute".
+        """
         from reinvent4_mcp.jobs.manager import JobManager
 
-        used = {
-            "create_and_start", "create_and_start_tl", "get_status", "stop_job",
-            "get_top_candidates", "list_jobs", "get_alerts",
-        }
+        used = _methods_called_on_the_job_manager()
+        assert {"create_and_start", "get_status", "submit_toml"} <= used
 
         for name in used:
             assert hasattr(runner_client.RemoteJobManager, name), name

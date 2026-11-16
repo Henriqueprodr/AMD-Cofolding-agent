@@ -18,6 +18,7 @@ import os
 import sys
 import signal
 import subprocess
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -360,6 +361,23 @@ class TestModelResolution:
         with patch("reinvent4_mcp.utils.ensure_reinvent4_importable", side_effect=RuntimeError):
             result = resolve_model_path(".reinvent")
         assert result == ".reinvent"
+
+    def test_a_prior_the_image_lacks_is_refused_with_what_is_installed(self, tmp_path):
+        """A sub-agent asked for .m2m_high, which REINVENT4 knows and the image never downloaded."""
+        installed = tmp_path / "mol2mol_medium_similarity.prior"
+        installed.write_bytes(b"")
+        registry = types.ModuleType("reinvent.utils.prior_registry")
+        registry.prior_registry = {
+            ".m2m_high": tmp_path / "mol2mol_high_similarity.prior",
+            ".m2m_medium": installed,
+        }
+        with patch("reinvent4_mcp.utils.ensure_reinvent4_importable"), patch.dict(
+            sys.modules,
+            {"reinvent": types.ModuleType("reinvent"), "reinvent.utils": types.ModuleType("reinvent.utils"), "reinvent.utils.prior_registry": registry},
+        ):
+            with pytest.raises(ValueError, match=r"not installed.*Installed: \.m2m_medium\."):
+                resolve_model_path(".mol2mol_high")
+            assert resolve_model_path(".m2m_medium") == str(installed)
 
 
 # ---------------------------------------------------------------------------
@@ -1064,6 +1082,19 @@ class TestJobInfo:
         assert d["state"] == "queued"
         assert d["ttp_id"] == "test"
 
+    def test_to_dict_says_whether_the_run_uses_boltz(self, tmp_path):
+        """By the test the Slurm relay makes; unsaid while the TOML cannot be read."""
+        def job(name, toml=None):
+            path = tmp_path / f"{name}.toml"
+            if toml is not None:
+                path.write_text(toml)
+            return JobInfo(job_id=name, ttp_id="t", ttp_version=1, model="m",
+                           working_dir=str(tmp_path), toml_path=str(path))
+
+        assert job("cofold", '[params]\nservice = "boltz"\n').to_dict()["uses_boltz"] is True
+        assert job("admet", '[params]\nservice = "admet"\n').to_dict()["uses_boltz"] is False
+        assert "uses_boltz" not in job("missing").to_dict()
+
 
 # ---------------------------------------------------------------------------
 # JobManager -- Creation and Status
@@ -1112,6 +1143,33 @@ class TestJobManagerLifecycle:
         assert result["csv_path"] == str(job_dir / "results_1.csv")
         assert result["checkpoint_path"] == str(job_dir / "stage.chkpt")
         assert (job_dir / "seed.smi").read_text() == "CCO\nCCN\n"
+
+    def test_submit_toml_keeps_the_ttp_id_separate_from_the_display_tag(self, manager):
+        """A generation run must be findable by the TTP it belongs to.
+
+        The tag used to be stored *as* the ttp_id, so ``job_for_ttp`` compared
+        "generation-ttp-7" against "ttp-7", never matched, and every scaffold
+        or linker task was reported as having started nothing while its job ran.
+        """
+        with patch.object(manager, "_start_process"):
+            result = manager.submit_toml(
+                'run_type = "staged_learning"\n',
+                job_name="generation-ttp-7",
+                ttp_id="ttp-7",
+            )
+
+        assert result["ttp_id"] == "ttp-7"
+        assert result["label"] == "generation-ttp-7"
+
+    def test_submit_toml_falls_back_to_the_job_name_without_a_ttp_id(self, manager):
+        """Callers that predate the split keep the behaviour they had."""
+        with patch.object(manager, "_start_process"):
+            result = manager.submit_toml(
+                'run_type = "staged_learning"\n',
+                job_name="generation",
+            )
+
+        assert result["ttp_id"] == "generation"
 
     def test_submit_toml_is_refused_when_every_slot_is_taken(self, manager):
         """The generation entry-point shares the slots, and waits its turn.
@@ -1459,6 +1517,10 @@ class TestJobManagerLifecycle:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not hasattr(signal, "SIGUSR1"),
+    reason="stopping asks for a checkpoint with SIGUSR1, which Windows has not",
+)
 class TestJobManagerStop:
 
     def test_stop_non_running_job(self, manager):
@@ -1676,7 +1738,7 @@ class TestJobManagerTopCandidates:
         """Agent, Prior, Target and Score are REINVENT's own, not components.
 
         Reported as components they show up as objectives beside the real
-        ones, and the supervisor would put them on a Pareto front.
+        ones, and the supervisor would report them in every task's profile.
         """
         job_id = self._completed_job(manager, pd.DataFrame({
             "SMILES": ["CCO"],
@@ -2017,6 +2079,11 @@ class TestWorkerLiveness:
         assert worker_alive(None, tmp_path) is False
         assert worker_alive(0, tmp_path) is False
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows keeps a pid valid while its handle is open, so a "
+               "process that has exited still answers as alive",
+    )
     def test_a_finished_process_is_not_alive(self, tmp_path):
         from reinvent4_mcp.jobs.manager import worker_alive
 
@@ -2105,6 +2172,31 @@ class TestRunOptimizationTool:
 
         result = run_optimization(ttp_id="test-opt-ttp")
         assert "error" in result
+
+    @pytest.mark.parametrize("mode", ["libinvent", "linkinvent"])
+    @patch("reinvent4_mcp.jobs.manager.get_job_manager")
+    @patch("reinvent4_mcp.tools.ttp.resolve_ttp")
+    def test_a_scaffold_or_linker_ttp_is_refused_with_the_tool_that_runs_it(
+        self, mock_resolve, mock_mgr, mode
+    ):
+        """Running the default prior instead would look like success.
+
+        This path builds de novo and Mol2Mol TOML only, so a TTP asking for
+        a scaffold or linker run used to launch a plain de novo job and report
+        a healthy campaign that never touched the scaffold.
+        """
+        from reinvent4_mcp.tools.optimization import run_optimization
+        from reinvent4_mcp.ttp.schema import TTP, GenerationMode
+
+        ttp = TTP.model_validate(MINIMAL_TTP)
+        ttp.generation = types.SimpleNamespace(mode=GenerationMode(mode))
+        mock_resolve.return_value = ttp
+
+        result = run_optimization(ttp_id="test-opt-ttp")
+
+        assert mode in result["error"]
+        assert "run_generation_campaign" in result["error"]
+        mock_mgr.return_value.create_and_start.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -2727,3 +2819,162 @@ class TestMol2MolValidation:
         assert "error" not in result
         call_kwargs = mock_mgr.return_value.create_and_start.call_args.kwargs
         assert call_kwargs["seed_smiles"] is None
+
+
+class TestIsotopeStripping:
+    """Isotope-labelled SMILES are silently cleaned before the seed file is
+    written: REINVENT4's token vocabulary has no [2H], [13C], [18F] etc.
+    """
+
+    @patch("reinvent4_mcp.jobs.manager.get_job_manager")
+    @patch("reinvent4_mcp.ttp.mapper.ttp_to_scorer_config")
+    @patch("reinvent4_mcp.ttp.mapper.get_mapper_summary")
+    @patch("reinvent4_mcp.tools.ttp.resolve_ttp")
+    def test_deuterium_label_stripped(
+        self, mock_resolve, mock_summary, mock_scorer, mock_mgr
+    ):
+        """The TYK2 deuterated compound that failed real runs is accepted."""
+        try:
+            from rdkit import Chem  # noqa: F401
+        except ImportError:
+            pytest.skip("RDKit not available")
+
+        from reinvent4_mcp.tools.optimization import run_optimization
+        from reinvent4_mcp.ttp.schema import TTP
+
+        ttp = TTP.model_validate(MINIMAL_TTP)
+        mock_resolve.return_value = ttp
+        mock_scorer.return_value = {"type": "geometric_mean", "component": [{"QED": {}}]}
+        mock_summary.return_value = {"n_total_components": 1}
+        mock_mgr.return_value.create_and_start.return_value = {"job_id": "iso01", "state": "running"}
+
+        deuterated = "[2H]C([2H])([2H])NC(=O)C1=NN=C(C=C1NC2=CC=CC(=C2OC)C3=NN(C=N3)C)NC(=O)C4CC4"
+        result = run_optimization(
+            ttp_id="test-ttp",
+            model=".m2m_medium",
+            seed_smiles=[deuterated],
+        )
+
+        assert "error" not in result
+        sent = mock_mgr.return_value.create_and_start.call_args.kwargs["seed_smiles"]
+        assert len(sent) == 1
+        assert "[2H]" not in sent[0]
+        assert "[H]" not in sent[0] or "C" in sent[0]  # still a real molecule
+
+    @patch("reinvent4_mcp.jobs.manager.get_job_manager")
+    @patch("reinvent4_mcp.ttp.mapper.ttp_to_scorer_config")
+    @patch("reinvent4_mcp.ttp.mapper.get_mapper_summary")
+    @patch("reinvent4_mcp.tools.ttp.resolve_ttp")
+    def test_isotope_free_smiles_unchanged(
+        self, mock_resolve, mock_summary, mock_scorer, mock_mgr
+    ):
+        try:
+            from rdkit import Chem  # noqa: F401
+        except ImportError:
+            pytest.skip("RDKit not available")
+
+        from reinvent4_mcp.tools.optimization import run_optimization
+        from reinvent4_mcp.ttp.schema import TTP
+
+        ttp = TTP.model_validate(MINIMAL_TTP)
+        mock_resolve.return_value = ttp
+        mock_scorer.return_value = {"type": "geometric_mean", "component": [{"QED": {}}]}
+        mock_summary.return_value = {"n_total_components": 1}
+        mock_mgr.return_value.create_and_start.return_value = {"job_id": "iso02", "state": "running"}
+
+        result = run_optimization(
+            ttp_id="test-ttp",
+            model=".m2m_medium",
+            seed_smiles=["c1ccccc1", "CCO"],
+        )
+
+        assert "error" not in result
+        sent = mock_mgr.return_value.create_and_start.call_args.kwargs["seed_smiles"]
+        assert len(sent) == 2
+
+
+# ---------------------------------------------------------------------------
+# Boltz fidelity tier and automatic step cap
+# ---------------------------------------------------------------------------
+
+_BOLTZ_TTP = {
+    "id": "boltz-ttp",
+    "name": "Boltz TTP",
+    "target": {"protein_sequence": "MVLSPADKTNVK"},
+    "scoring": {
+        "objectives": [
+            {
+                "name": "affinity",
+                "type": "external",
+                "service": "boltz",
+                "service_url": "http://boltz:8080/score",
+                "weight": 1.0,
+            }
+        ]
+    },
+}
+
+
+class TestBoltzFidelityTier:
+    """run_optimization applies exploration defaults and an auto step cap
+    for Boltz-scored runs; validation tier gets full-accuracy parameters."""
+
+    @staticmethod
+    def _run_with_mocks(fidelity_tier="exploration", max_steps=None):
+        """Call run_optimization with Boltz TTP and return create_and_start kwargs."""
+        from reinvent4_mcp.tools.optimization import run_optimization
+        from reinvent4_mcp.ttp.schema import TTP
+
+        ttp = TTP.model_validate(_BOLTZ_TTP)
+
+        with patch("reinvent4_mcp.tools.ttp.resolve_ttp", return_value=ttp), \
+             patch("reinvent4_mcp.ttp.mapper.ttp_to_scorer_config",
+                   return_value={"type": "geometric_mean",
+                                 "component": [{"ExternalRESTScorer": {}}]}), \
+             patch("reinvent4_mcp.ttp.mapper.get_mapper_summary", return_value={}), \
+             patch("reinvent4_mcp.jobs.manager.get_job_manager") as mock_mgr:
+            mock_mgr.return_value.create_and_start.return_value = {
+                "job_id": "j1", "state": "running"
+            }
+            kwargs: dict = {}
+            if max_steps is not None:
+                kwargs["max_steps"] = max_steps
+            run_optimization(ttp_id="boltz-ttp", fidelity_tier=fidelity_tier, **kwargs)
+            return mock_mgr.return_value.create_and_start.call_args.kwargs
+
+    def test_exploration_boltz_run_caps_steps_at_64(self):
+        """Without an explicit max_steps, exploration Boltz runs cap at 64."""
+        sent = self._run_with_mocks(fidelity_tier="exploration")
+        assert sent["max_steps"] == 64
+
+    def test_explicit_max_steps_is_honoured(self):
+        """An explicit max_steps overrides the exploration cap."""
+        sent = self._run_with_mocks(fidelity_tier="exploration", max_steps=200)
+        assert sent["max_steps"] == 200
+
+    def test_validation_boltz_run_uses_300_steps(self):
+        """Validation tier is not capped at 64 steps."""
+        sent = self._run_with_mocks(fidelity_tier="validation")
+        # max_steps is None → auto → Boltz run BUT validation tier → 300
+        assert sent["max_steps"] == 300
+
+    def test_ttp_to_scorer_config_receives_tier(self):
+        """The fidelity_tier is forwarded to ttp_to_scorer_config."""
+        from reinvent4_mcp.tools.optimization import run_optimization
+        from reinvent4_mcp.ttp.schema import TTP
+
+        ttp = TTP.model_validate(_BOLTZ_TTP)
+        captured: list = []
+
+        def _mock_scorer(t, fidelity_tier="exploration"):
+            captured.append(fidelity_tier)
+            return {"type": "geometric_mean", "component": [{"ExternalRESTScorer": {}}]}
+
+        with patch("reinvent4_mcp.tools.ttp.resolve_ttp", return_value=ttp), \
+             patch("reinvent4_mcp.ttp.mapper.ttp_to_scorer_config", _mock_scorer), \
+             patch("reinvent4_mcp.ttp.mapper.get_mapper_summary", return_value={}), \
+             patch("reinvent4_mcp.jobs.manager.get_job_manager") as mock_mgr:
+            mock_mgr.return_value.create_and_start.return_value = {"job_id": "j2"}
+            run_optimization(ttp_id="boltz-ttp", fidelity_tier="validation")
+
+        assert captured == ["validation"]

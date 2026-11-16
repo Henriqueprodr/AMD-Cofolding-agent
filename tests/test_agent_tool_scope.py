@@ -46,6 +46,12 @@ class _ScriptedBackend(LLMBackend):
     def reset(self, system_prompt: str) -> None:
         pass
 
+    def export_history(self) -> list[dict[str, Any]]:
+        return []
+
+    def import_history(self, messages: list[dict[str, Any]]) -> None:
+        pass
+
 
 class _CatalogMCP:
     def __init__(self) -> None:
@@ -117,6 +123,47 @@ def test_allowed_tool_is_executed() -> None:
 
     assert _chat(agent) == "done"
     assert mcp.called == ["read_results"]
+
+
+# ---------------------------------------------------------------------------
+# Withholding a tool for the moment
+# ---------------------------------------------------------------------------
+
+
+def test_a_withheld_tool_is_refused_with_what_to_do_instead() -> None:
+    backend = _ScriptedBackend("delete_job")
+    mcp = _CatalogMCP()
+    agent = Agent(mcp, backend)
+    agent.withheld = {"delete_job": "Ask a sub-agent to delete it."}
+
+    _chat(agent)
+
+    assert mcp.called == []
+    assert backend.tool_results is not None
+    assert backend.tool_results[0].is_error is True
+    assert "Ask a sub-agent to delete it." in backend.tool_results[0].content
+
+
+def test_a_withheld_tool_is_not_offered() -> None:
+    agent = Agent(_CatalogMCP(), _ScriptedBackend("read_results"))
+    agent.withheld = {"delete_job": "later"}
+
+    offered = asyncio.run(agent._scoped_tools())
+
+    assert [t["name"] for t in offered] == ["read_results"]
+
+
+def test_handing_a_tool_back_makes_it_callable_again() -> None:
+    """Unlike the allow-list, withholding follows the conversation."""
+    backend = _ScriptedBackend("delete_job")
+    mcp = _CatalogMCP()
+    agent = Agent(mcp, backend)
+    agent.withheld = {"delete_job": "later"}
+    agent.withheld = {}
+
+    _chat(agent)
+
+    assert mcp.called == ["delete_job"]
 
 
 # ---------------------------------------------------------------------------

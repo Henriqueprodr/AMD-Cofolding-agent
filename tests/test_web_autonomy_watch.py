@@ -65,6 +65,7 @@ def make_session(tmp_path: Path, agent: FakeAgent, runs: dict[str, str] | None =
     store.create(meta)
     live = LiveSession(meta=meta, store=store, agent=agent)
     live.auto_delay = 0.0
+    live.auto_idle_delay = 0.0
     if runs is not None:
         state = dict(runs)
 
@@ -139,11 +140,9 @@ def test_a_stop_is_checked_at_once_even_while_a_run_goes(tmp_path):
         live = make_session(tmp_path, agent, runs={"abc12345": "running"})
         live.set_autonomy(60)
         await wait_until(lambda: len(agent.asked) >= 2)
-        await settle(live)
+        await stop(live)
 
         assert "You were about to hand the campaign back." in agent.asked[1]
-        assert len(agent.asked) == 2
-        assert not live.auto_on
 
     asyncio.run(run())
 
@@ -440,6 +439,331 @@ def test_without_a_log_the_wake_asks_for_the_goal_first(tmp_path):
     asyncio.run(run())
 
 
+# -- what the sub-agents send back -----------------------------------------
+
+
+def done(event_id: int, task_id: str = "t-0001", **payload: Any) -> dict:
+    body = {"task_kind": "design", "title": "JAK3 selectivity", "summary": "12 candidates, best 0.81"}
+    body.update(payload)
+    return {"event_id": event_id, "task_id": task_id, "kind": "task_done", "payload": body}
+
+
+def news(events: list[dict], idle: int = 0, queued: int = 0, last: int | None = None, alive: int = 1) -> dict:
+    return {
+        "events": events,
+        "last_event_id": last if last is not None else (events[-1]["event_id"] if events else 0),
+        "idle": idle,
+        "alive": alive,
+        "queued": queued,
+    }
+
+
+def test_a_report_from_a_sub_agent_is_news(tmp_path):
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", news([done(7)]))
+
+    assert live.pending == [
+        "Sub-agent reported on JAK3 selectivity (task t-0001): 12 candidates, "
+        "best 0.81. Read it with get_task_reports, and give the sub-agent it "
+        "freed its next task."
+    ]
+
+
+def test_a_report_wakes_the_conductor_of_an_open_campaign_without_autonomy(tmp_path):
+    """Without it a sub-agent that reported sits idle until the user next types."""
+    live = make_session(tmp_path, FakeAgent())
+    woken: list[str] = []
+    live._wake = woken.append
+    live.campaigns_seen["feed0001"] = 0
+    live.campaigns_open.add("feed0001")
+    assert not live.auto_on
+
+    live.note_campaign("feed0001", news([done(7)]))
+    live.wake_if_due()
+    assert woken == ["events"]
+
+    # Closed: its news is the user's to read when they come back.
+    live.note_campaign("feed0001", {**news([done(8)]), "open": False})
+    live.wake_if_due()
+    assert woken == ["events"]
+
+
+def test_a_report_cuts_short_the_pause_after_an_answer_that_saw_nothing_to_do(tmp_path):
+    """The BRD4 campaign: S1 reported, and waited out the conductor's five minutes."""
+
+    async def run() -> None:
+        agent = FakeAgent(answer="Both tasks are in flight. AUTONOMY DONE")
+        live = make_session(tmp_path, agent, runs={})
+        live.auto_idle_delay = 300.0
+        live.campaigns_seen["feed0001"] = 0
+        live.campaigns_open.add("feed0001")
+        live.set_autonomy(60)
+        await wait_until(lambda: len(agent.asked) >= 2)
+        await wait_until(lambda: not live.busy and live.auto_task is not None)
+
+        live.note_campaign("feed0001", news([done(7)]))
+        live.wake_if_due()
+        await wait_until(lambda: len(agent.asked) >= 3, timeout=2)
+        await stop(live)
+
+        assert "Sub-agent reported on JAK3 selectivity" in agent.asked[2]
+
+    asyncio.run(run())
+
+
+def test_a_pause_with_nothing_new_is_left_to_run(tmp_path):
+    async def run() -> None:
+        agent = FakeAgent(answer="Both tasks are in flight. AUTONOMY DONE")
+        live = make_session(tmp_path, agent, runs={})
+        live.auto_idle_delay = 300.0
+        live.set_autonomy(60)
+        await wait_until(lambda: len(agent.asked) >= 2)
+        await wait_until(lambda: not live.busy and live.auto_task is not None)
+
+        live.wake_if_due()
+        await asyncio.sleep(0.05)
+        assert len(agent.asked) == 2
+        assert live.auto_task is not None
+        await stop(live)
+
+    asyncio.run(run())
+
+
+def test_a_report_that_proposed_next_tasks_says_so(tmp_path):
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", news([done(7, n_follow_ups=2)]))
+
+    assert "It proposed 2 next task(s)" in live.pending[0]
+    assert "take_proposals" in live.pending[0]
+
+
+def test_a_ready_queue_running_low_is_told_once(tmp_path):
+    """Kept just under target, it would otherwise wake the conductor every look."""
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", {**news([], queued=1), "backlog": 2})
+    live.note_campaign("feed0001", {**news([], queued=1), "backlog": 2})
+
+    assert len(live.pending) == 1
+    assert "Only 1 task(s) are queued" in live.pending[0]
+    assert "enqueue_tasks" in live.pending[0]
+
+
+def test_a_refilled_queue_is_told_again_when_it_next_runs_low(tmp_path):
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", {**news([], queued=0, idle=0), "backlog": 2})
+    live.note_campaign("feed0001", {**news([], queued=3), "backlog": 2})
+    live.note_campaign("feed0001", {**news([], queued=1), "backlog": 2})
+
+    assert len(live.pending) == 2
+
+
+def test_a_closed_campaigns_queue_is_nobodys_concern(tmp_path):
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", {**news([], queued=0), "backlog": 2, "open": False})
+
+    assert live.pending == []
+
+
+def test_a_report_already_read_is_not_told_twice(tmp_path):
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", news([done(7)]))
+    live.pending.clear()
+    live.note_campaign("feed0001", news([], last=7))
+
+    assert live.pending == []
+    assert live.campaigns_seen["feed0001"] == 7
+
+
+def test_a_task_that_failed_is_news_too(tmp_path):
+    """A sub-agent that came back empty still freed its slot."""
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", news([{
+        "event_id": 3, "task_id": "t-0002", "kind": "task_failed",
+        "payload": {"title": "BRD4 retrosynthesis", "error": "no route under 6 steps"},
+    }]))
+
+    assert live.pending == [
+        "Task t-0002 (BRD4 retrosynthesis) did not finish: no route under 6 steps"
+    ]
+
+
+def test_idle_sub_agents_with_nothing_queued_are_news(tmp_path):
+    """The state a campaign stalls in: budget running, nobody working."""
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", news([], idle=3))
+
+    assert live.pending == [
+        "3 sub-agent(s) are idle on campaign feed0001 with nothing queued. "
+        "Give them work or close the campaign."
+    ]
+
+
+def test_a_campaign_that_stays_stalled_is_told_once(tmp_path):
+    """It woke the conductor every half minute to say the same thing, and a
+    conductor waiting on the sub-agent that is working cannot act on it."""
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    for _ in range(4):
+        live.note_campaign("feed0001", news([], idle=1))
+
+    assert len(live.pending) == 1
+
+
+def test_a_campaign_that_stalls_again_is_told_again(tmp_path):
+    """Told once while it lasts, not once for the whole campaign."""
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", news([], idle=1))
+    live.note_campaign("feed0001", news([], idle=1, queued=2, alive=1))
+    live.pending.clear()
+    live.note_campaign("feed0001", news([], idle=1))
+
+    assert len(live.pending) == 1
+
+
+def test_sub_agents_with_work_waiting_for_them_are_not_news(tmp_path):
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", news([], idle=2, queued=4, alive=2))
+
+    assert live.pending == []
+
+
+def test_queued_work_with_no_sub_agent_to_do_it_is_news(tmp_path):
+    """The pool rests at zero; a scale-up that did not happen looks like this."""
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", news([], queued=4, alive=0))
+
+    assert live.pending == [
+        "4 task(s) are queued on campaign feed0001 and no sub-agent is running "
+        "to take them. Check the campaign with get_campaign_status before "
+        "queueing more."
+    ]
+
+
+def test_a_reader_that_does_not_count_the_pool_raises_no_alarm(tmp_path):
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", {"events": [], "last_event_id": 3, "queued": 4})
+
+    assert live.pending == []
+
+
+def test_a_report_is_told_rather_than_the_idleness_it_leaves_behind(tmp_path):
+    """Both are true at once; the report is what there is to act on."""
+    live = make_session(tmp_path, FakeAgent())
+    live.campaigns_seen["feed0001"] = 0
+
+    live.note_campaign("feed0001", news([done(7)], idle=1))
+
+    assert len(live.pending) == 1
+    assert live.pending[0].startswith("Sub-agent reported")
+
+
+def test_a_campaign_with_sub_agents_working_is_looked_at_after_a_quiet_spell(tmp_path, monkeypatch):
+    """No run of the conversation's own is going, so only this wakes it."""
+
+    async def run() -> None:
+        monkeypatch.setattr(web_sessions, "AUTO_BACKSTOP_S", 0.0)
+        agent = FakeAgent()
+        live = make_session(tmp_path, agent, runs={})
+        live.campaigns_seen["feed0001"] = 4
+        live.set_autonomy(60)
+        await wait_until(lambda: len(agent.asked) >= 2)
+        await stop(live)
+
+    asyncio.run(run())
+
+
+def test_the_watcher_wakes_a_session_whose_sub_agent_reported(tmp_path):
+    async def run() -> None:
+        agents: list[FakeAgent] = []
+        feed = [done(9)]
+        asked_for: list[dict[str, int]] = []
+
+        async def run_states(ids: list[str]) -> dict[str, dict[str, str]]:
+            return {sid: {} for sid in ids}
+
+        async def job_alerts() -> list[dict[str, Any]]:
+            return []
+
+        async def campaign_news(since: dict[str, int]) -> dict[str, dict[str, Any]]:
+            asked_for.append(dict(since))
+            out = {"feed0001": news(list(feed))}
+            feed.clear()
+            return out
+
+        manager = SessionManager(make_store(tmp_path), lambda handler: agents.append(FakeAgent()) or agents[-1])
+        manager.watch_interval = 0.01
+        live = manager.create()
+        live.auto_delay = 0.0
+        live.meta["turns"] = 1
+        live.campaigns_seen["feed0001"] = 4
+        # Autonomy on before the watcher starts: the first tick consumes the
+        # feed, so a tick landing between the two would clear the news while
+        # nothing was listening and the session would never be woken. Rare
+        # when this test runs alone, reachable under a loaded full suite.
+        live.set_autonomy(60)
+        manager.watch(run_states, job_alerts, campaign_news)
+        try:
+            await wait_until(lambda: any("Sub-agent reported" in asked for asked in agents[0].asked))
+            assert asked_for[0] == {"feed0001": 4}
+        finally:
+            live.set_autonomy(0)
+            await manager.close()
+
+    asyncio.run(run())
+
+
+def test_the_watcher_reads_no_campaign_for_a_conversation_that_owns_none(tmp_path):
+    async def run() -> None:
+        async def run_states(ids: list[str]) -> dict[str, dict[str, str]]:
+            return {sid: {} for sid in ids}
+
+        async def job_alerts() -> list[dict[str, Any]]:
+            return []
+
+        async def campaign_news(since: dict[str, int]) -> dict[str, dict[str, Any]]:
+            raise AssertionError("no campaign should be read")
+
+        manager = SessionManager(make_store(tmp_path), lambda handler: FakeAgent())
+        manager.watch_interval = 0.01
+        live = manager.create()
+        live.auto_delay = 0.0
+        live.meta["turns"] = 1
+        manager.watch(run_states, job_alerts, campaign_news)
+        try:
+            live.set_autonomy(60)
+            await asyncio.sleep(0.05)
+        finally:
+            live.set_autonomy(0)
+            await manager.close()
+
+    asyncio.run(run())
+
+
 # -- keeping turns small ---------------------------------------------------
 
 
@@ -470,10 +794,51 @@ def test_a_short_history_is_kept(tmp_path):
         agent.context_tokens = 5_000
         live.set_autonomy(60)
         await wait_until(lambda: len(agent.asked) >= 1)
-        await settle(live)
+        await stop(live)
 
         assert agent.resets == 0
         assert "condensed" not in agent.asked[0]
+
+    asyncio.run(run())
+
+
+def test_a_long_history_is_condensed_before_the_users_own_turn(tmp_path):
+    """The conversation the user drives fills the context like any other."""
+
+    async def run() -> None:
+        agent = FakeAgent()
+        live = make_session(tmp_path, agent, runs={})
+        live.publish({"type": "user_message", "content": "Design soluble JAK3 inhibitors"})
+        live.publish({"type": "assistant_message", "content": "Here are five."})
+        agent.context_tokens = web_sessions.COMPACT_ABOVE_TOKENS + 1
+
+        live.start_turn("Now check their ADMET")
+        await wait_until(lambda: len(agent.asked) >= 1)
+        await settle(live)
+
+        assert agent.resets == 1
+        assert "condensed" in agent.asked[0]
+        # The question itself still comes last, after the brief.
+        assert agent.asked[0].rstrip().endswith("Now check their ADMET")
+
+    asyncio.run(run())
+
+
+def test_how_much_history_is_kept_follows_the_window_the_endpoint_serves(tmp_path):
+    """A 32k endpoint cannot carry what a 128k one can, whatever the model."""
+
+    async def run() -> None:
+        agent = FakeAgent()
+        live = make_session(tmp_path, agent, runs={})
+        agent.context_window = 32_768
+        agent.context_tokens = 30_000
+
+        live.start_turn("Carry on")
+        await wait_until(lambda: len(agent.asked) >= 1)
+        await settle(live)
+
+        # Well under the 100k fallback, but over 70% of what is served.
+        assert agent.resets == 1
 
     asyncio.run(run())
 

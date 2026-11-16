@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -63,13 +64,21 @@ def make_session(tmp_path: Path, agent: FakeAgent) -> LiveSession:
     meta = {"id": "s-20260101-000000-abcdef", "title": "BRD4", "created": "", "updated": "", "turns": 0}
     store.create(meta)
     live = LiveSession(meta=meta, store=store, agent=agent)
-    # Real continuations wait a minute; the tests must not.
+    # Real continuations wait a minute or five; the tests must not.
     live.auto_delay = 0.0
+    live.auto_idle_delay = 0.0
     return live
 
 
 def published(live: LiveSession, kind: str) -> list[dict[str, Any]]:
     return [event for event in live.events if event.get("type") == kind]
+
+
+def _drain(queue: Any) -> list[dict[str, Any]]:
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    return events
 
 
 def busy_statuses(live: LiveSession) -> list[dict[str, Any]]:
@@ -96,6 +105,17 @@ async def quiesce(live: LiveSession) -> None:
 async def idle(live: LiveSession) -> None:
     """Wait until nothing runs and nothing is queued."""
     await wait_until(lambda: not live.busy and live.auto_task is None)
+
+
+async def settled(live: LiveSession, turns: int) -> None:
+    """Wait for *turns* turns, then stop the loop and let the last one finish.
+
+    Auto mode no longer winds down on its own, so a test with the budget on
+    has to say when it has seen enough; waiting for the loop to go quiet
+    would wait for the budget.
+    """
+    await wait_until(lambda: len(live.agent.asked) >= turns)
+    await quiesce(live)
 
 
 # -- the budget itself -----------------------------------------------------
@@ -214,21 +234,40 @@ def test_turning_the_budget_on_between_turns_picks_the_campaign_up(tmp_path):
     asyncio.run(run())
 
 
-def test_the_loop_stops_when_the_agent_says_it_is_done(tmp_path):
+def test_the_agent_saying_it_is_done_does_not_end_the_budget(tmp_path):
+    """Auto mode is the user saying "carry on without me"; only they end it."""
+
     async def run() -> None:
         agent = FakeAgent(answer="Nothing left to try. AUTONOMY DONE")
         live = make_session(tmp_path, agent)
         live.set_autonomy(60)
         assert live.start_turn("Design ligands for BRD4")
-        await idle(live)
-        await asyncio.sleep(0.05)
+        await settled(live, 3)
 
-        # Saying it once gets a check; saying it again after the check is final.
-        assert len(agent.asked) == 2
+        # The first "done" is checked, and every one after it is told to look
+        # again rather than taken as the end of the campaign.
         assert "You were about to hand the campaign back." in agent.asked[1]
-        # Nothing is taking turns any more, so the budget must not look live.
-        assert not live.auto_on
-        assert live.auto_until is None
+        assert "look again rather than wait" in agent.asked[2]
+
+    asyncio.run(run())
+
+
+def test_the_looking_again_turn_waits_longer_than_a_working_one(tmp_path):
+    """Once it has twice found nothing, what changes next is a run finishing."""
+
+    async def run() -> None:
+        waits: list[float] = []
+        live = make_session(tmp_path, FakeAgent(answer="Nothing left. AUTONOMY DONE"))
+        live.auto_idle_delay = web_sessions.AUTO_IDLE_DELAY_S
+        live._schedule_continuation = lambda delay, reason="continue": waits.append(delay)
+        live.set_autonomy(60)
+        assert live.start_turn("Design ligands for BRD4")
+        await wait_until(lambda: bool(waits))
+
+        live.done_once = True
+        await live._run_turn("again")
+
+        assert waits == [0.0, web_sessions.AUTO_IDLE_DELAY_S]
 
     asyncio.run(run())
 
@@ -241,7 +280,7 @@ def test_work_found_at_the_check_keeps_the_loop_going(tmp_path):
 
         async def chat(self, content: str) -> str:
             self.asked.append(content)
-            return self.answers.pop(0)
+            return self.answers.pop(0) if self.answers else "Waiting on the run."
 
     async def run() -> None:
         agent = Scripted(
@@ -255,13 +294,11 @@ def test_work_found_at_the_check_keeps_the_loop_going(tmp_path):
         live = make_session(tmp_path, agent)
         live.set_autonomy(60)
         assert live.start_turn("Design ligands for BRD4")
-        await wait_until(lambda: not agent.answers and not live.busy)
-        await asyncio.sleep(0.05)
+        await settled(live, 4)
 
         checks = ["You were about to hand the campaign back." in asked for asked in agent.asked]
         # Work in between makes the next stop a first one again, so it is checked too.
-        assert checks == [False, True, False, True]
-        assert not live.auto_on
+        assert checks[:4] == [False, True, False, True]
 
     asyncio.run(run())
 
@@ -272,29 +309,44 @@ def test_the_stop_phrase_is_not_part_of_the_answer(tmp_path):
         live = make_session(tmp_path, agent)
         live.set_autonomy(60)
         assert live.start_turn("Design ligands for BRD4")
-        await idle(live)
-        await asyncio.sleep(0.05)
+        await settled(live, 1)
 
         assert published(live, "assistant_message")[0]["content"] == "The campaign is finished."
 
     asyncio.run(run())
 
 
-def test_consecutive_automatic_turns_are_capped(tmp_path, monkeypatch):
+def test_nothing_but_the_budget_limits_how_many_turns_it_takes(tmp_path):
+    """There used to be a cap of fifty, which stopped a campaign mid-flight."""
+
     async def run() -> None:
-        monkeypatch.setattr(web_sessions, "MAX_AUTO_TURNS", 3)
         agent = FakeAgent()
         live = make_session(tmp_path, agent)
         live.set_autonomy(120)
         assert live.start_turn("Design ligands for BRD4")
-        await idle(live)
-        await asyncio.sleep(0.05)
+        await settled(live, 60)
 
         assert agent.asked[0] == "Design ligands for BRD4"
-        assert len(agent.asked) == 4
         assert all(asked.startswith("[AUTO]") for asked in agent.asked[1:])
-        # The cap ends the budget too: no turn is coming, so none is promised.
-        assert not live.auto_on
+
+    asyncio.run(run())
+
+
+def test_a_budget_that_runs_out_ends_it_and_says_so(tmp_path):
+    async def run() -> None:
+        agent = FakeAgent()
+        live = make_session(tmp_path, agent)
+        queue = live.subscribe()
+        live.set_autonomy(60)
+        assert live.start_turn("Design ligands for BRD4")
+        await wait_until(lambda: len(agent.asked) >= 2)
+        # The deadline passes mid-campaign, which is the budget running out
+        # rather than anybody deciding the work is finished.
+        live.auto_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await wait_until(lambda: not live.busy and live.auto_until is None)
+
+        ended = [event for event in _drain(queue) if event["type"] == "auto"]
+        assert ended[-1]["until"] is None
 
     asyncio.run(run())
 
@@ -322,7 +374,9 @@ def test_a_cancelled_turn_never_continues(tmp_path):
     asyncio.run(run())
 
 
-def test_a_failed_turn_never_continues(tmp_path):
+def test_a_failed_turn_is_picked_up_again_rather_than_handed_back(tmp_path):
+    """What fails a turn is usually a service, and services come back."""
+
     async def run() -> None:
         agent = FakeAgent()
 
@@ -332,14 +386,27 @@ def test_a_failed_turn_never_continues(tmp_path):
 
         agent.chat = fail
         live = make_session(tmp_path, agent)
+        waits: list[float] = []
+        live._schedule_continuation = lambda delay, reason="continue": waits.append(delay)
         live.set_autonomy(60)
         assert live.start_turn("Design ligands for BRD4")
-        await idle(live)
-        await asyncio.sleep(0.05)
+        await wait_until(lambda: bool(waits))
+        await live._run_turn("again")
 
-        assert agent.asked == ["Design ligands for BRD4"]
         assert published(live, "error")[0]["message"] == "Boltz is unreachable"
-        assert not live.auto_on
+        assert live.auto_on
+        # Each failure in a row waits longer, so a service that is down for
+        # an hour is not retried two hundred times.
+        assert waits == [web_sessions.AUTO_RETRY_DELAY_S, web_sessions.AUTO_RETRY_DELAY_S * 2]
+
+    asyncio.run(run())
+
+
+def test_the_retry_wait_stops_growing(tmp_path):
+    async def run() -> None:
+        live = make_session(tmp_path, FakeAgent())
+        live.auto_failures = 20
+        assert live._retry_delay() == web_sessions.AUTO_RETRY_MAX_S
 
     asyncio.run(run())
 
@@ -373,13 +440,62 @@ def test_two_turns_never_run_at_once(tmp_path):
         live.set_autonomy(60)
         assert live.start_turn("Design ligands for BRD4")
         await wait_until(lambda: live.busy and agent.asked != [])
-        assert not live.start_turn("and another")
+        # Kept for the running turn rather than started beside it.
+        assert live.start_turn("and another")
         # A continuation that wakes while a turn runs stands down.
         await live._continue_after(0.0)
         assert agent.asked == ["Design ligands for BRD4"]
 
+        agent.hang = False
         live.cancel()
         await idle(live)
+        assert len(agent.asked) == 2
+
+    asyncio.run(run())
+
+
+def test_a_message_sent_mid_turn_is_read_after_the_current_step(tmp_path):
+    async def run() -> None:
+        agent = FakeAgent(hang=True)
+        live = make_session(tmp_path, agent)
+        assert live.start_turn("Design ligands for BRD4")
+        await wait_until(lambda: live.busy and agent.asked != [])
+
+        assert live.start_turn("Use the morpholine series")
+        shown = published(live, "user_message")[-1]
+        assert shown["content"] == "Use the morpholine series"
+        assert shown["interjected"] is True
+        # What Agent.chat calls between tool rounds.
+        assert agent.inbox() == ["Use the morpholine series"]
+        assert agent.inbox() == []
+
+        agent.hang = False
+        live.cancel()
+        await idle(live)
+        # Read mid-turn, so it does not start a turn of its own.
+        assert agent.asked == ["Design ligands for BRD4"]
+
+    asyncio.run(run())
+
+
+def test_a_message_the_turn_never_read_starts_the_next_one(tmp_path):
+    async def run() -> None:
+        agent = FakeAgent(hang=True)
+        live = make_session(tmp_path, agent)
+        live.auto_delay = 30.0
+        live.set_autonomy(60)
+        assert live.start_turn("Design ligands for BRD4")
+        await wait_until(lambda: live.busy and agent.asked != [])
+        assert live.start_turn("Use the morpholine series")
+        assert live.start_turn("and check ADMET")
+
+        agent.hang = False
+        live.running.cancel()
+        await wait_until(lambda: len(agent.asked) == 2 and not live.busy)
+        assert "Use the morpholine series\n\nand check ADMET" in agent.asked[1]
+        # The user led that turn, so the autonomy count starts over.
+        assert live.auto_turns == 0
+        await quiesce(live)
 
     asyncio.run(run())
 

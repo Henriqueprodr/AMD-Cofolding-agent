@@ -112,6 +112,21 @@ def test_references_come_from_messages_calls_and_results(roots):
     assert [a["name"] for a in refs.analyses] == ["PoseBusters checks", "Interaction profile"]
 
 
+def test_a_generation_campaign_is_owned_by_the_conversation_that_launched_it(roots):
+    job_id = "dfd92605ae11467c"
+    events = call(
+        1,
+        "run_generation_campaign",
+        {"ttp_id": "benzamide-solubility-opt"},
+        {"job_id": job_id, "submitted": True, "state": "queued"},
+    )
+
+    refs = collect_references(events, roots.shared)
+
+    assert set(refs.launched) == {job_id}
+    assert set(refs.jobs) == {job_id}
+
+
 def test_inventory_tools_do_not_count_as_use(roots):
     refs = collect_references(conversation(), roots.shared)
     assert "predictions/out_9999" not in refs.units()

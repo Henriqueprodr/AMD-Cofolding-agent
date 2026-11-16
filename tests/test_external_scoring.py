@@ -661,9 +661,7 @@ class TestListSharedAssets:
 
         assets = self._assets(tmp_path, limit=10)
 
-        assert assets["cofold_outputs"][0] == str(
-            paths[-1].relative_to(tmp_path)
-        )
+        assert assets["cofold_outputs"][0] == paths[-1].relative_to(tmp_path).as_posix()
 
     def test_prefix_reaches_one_jobs_outputs(self, tmp_path):
         self._volume(tmp_path, n_predictions=5)

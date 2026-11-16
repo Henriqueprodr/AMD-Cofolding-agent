@@ -145,8 +145,10 @@ def test_an_automatic_turn_opens_a_marked_turn_with_no_user_message(agents):
         assert receive_until(ws, "status")["auto"] is True
         receive_until(ws, "assistant_message")
         assert receive_until(ws, "status")["state"] == "idle"
-        # Saying it again hands the budget back.
-        assert receive_until(ws, "auto")["until"] is None
+        # Saying it again keeps the budget: only the user or the clock ends
+        # it, and the next look is AUTO_IDLE_DELAY_S away.
+        with client.websocket_connect(f"/api/chat?session={session_id}") as again:
+            assert receive_until(again, "session")["auto_until"] is not None
 
         events = client.get(f"/api/sessions/{session_id}/events").json()["events"]
         assert [e["type"] for e in events] == [

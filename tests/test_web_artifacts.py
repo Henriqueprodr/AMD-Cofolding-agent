@@ -365,6 +365,7 @@ def test_the_first_heading_of_an_answer_is_read_without_its_marks():
     assert first_heading("Some text\n\n### **Top candidates** ###\n") == "Top candidates"
     assert first_heading("No heading here, just prose.") is None
     assert first_heading("#\n") is None
+    assert first_heading("## Answer\n\nbody") is None
     assert first_heading("") is None
 
 

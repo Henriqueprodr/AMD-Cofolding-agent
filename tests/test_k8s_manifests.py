@@ -1140,7 +1140,7 @@ class TestAimTiers:
         """32768 was the profile's choice; the weights go to 131072.
 
         vLLM derives ``max_tokens`` as max-model-len minus the prompt, so the
-        profile default turned a front-plus-molecules question into
+        profile default turned a results-plus-molecules question into
         "max_tokens must be at least 1, got -72257".
         """
         overrides = aim_services["dd-agentic-aim-conductor"]["spec"][
@@ -1317,7 +1317,10 @@ class TestKustomization:
 
     def test_every_manifest_file_is_a_resource(self, kustomization):
         listed = set(kustomization["resources"])
-        on_disk = {str(p.relative_to(_MANIFESTS)) for p in _manifest_files()}
+        # as_posix because the resource list is kustomize's, which is always
+        # forward-slashed; str() gives backslashes on Windows and every nested
+        # manifest then reads as unlisted.
+        on_disk = {p.relative_to(_MANIFESTS).as_posix() for p in _manifest_files()}
 
         assert on_disk == listed
 

@@ -189,9 +189,7 @@ class TestObjectiveProfile:
     def test_the_profile_is_one_molecules_scores(self):
         """Not the best value per objective, which would mix molecules.
 
-        A per-objective maximum describes a compound nobody made, which is
-        worse than useless on a front whose job is to show achievable
-        trade-offs.
+        A per-objective maximum describes a compound nobody made.
         """
         candidates = [
             {
@@ -234,7 +232,7 @@ class TestObjectiveProfile:
         assert objective_profile([{"smiles": "CCO"}]) == {}
 
     def test_a_nan_component_is_left_out(self):
-        """A failed scorer must not become a number on the front."""
+        """A failed scorer must not become a number in the profile."""
         candidates = [{
             "total_score": 0.5,
             "components": {
@@ -281,6 +279,28 @@ class TestBuildGoal:
 
         assert "run_optimization" in goal
         assert "create_generation_campaign" in goal
+
+    def test_it_names_the_starter_a_scaffold_or_linker_run_needs(self):
+        """run_optimization cannot build either one and refuses them.
+
+        Told only to "start the run", a Driver reaches for run_optimization,
+        which builds de novo and Mol2Mol TOML only -- so a task asking for a
+        scaffold or linker run would stall on a refusal it has no answer to.
+        """
+
+        goal = build_goal(_task(), "ttp-t1", authored=True)
+
+        assert "run_generation_campaign" in goal
+        assert "libinvent" in goal
+        assert "linkinvent" in goal
+
+    def test_a_generation_campaign_is_a_way_of_writing_the_ttp(self):
+        """It persists a TTP under the id it is given, so forbidding it
+        outright withheld the only tool that writes a scaffold profile."""
+
+        goal = build_goal(_task(), "ttp-t1", authored=True)
+
+        assert "campaign_id='ttp-t1'" in goal
 
     def test_an_authored_task_is_given_the_campaign_goal(self):
         """It has to choose objectives, and cannot do that from the task
@@ -338,6 +358,24 @@ class TestBuildGoal:
         assert "look the reference" in goal
         assert "why before starting" in goal
 
+    def test_what_the_campaign_knows_reaches_the_driver_writing_a_profile(self):
+        """What the campaign learnt about the target is what decides which
+        objectives are worth scoring."""
+
+        goal = build_goal(
+            _task(workstream="design"), "ttp-1", authored=True,
+            findings=[{
+                "finding_id": "f1", "confidence": "high",
+                "claim": "hERG is the series liability above 400 Da",
+                "evidence": ["job-7"],
+            }],
+        )
+
+        assert "hERG is the series liability above 400 Da" in goal
+        assert "job-7" in goal
+        assert "atlas_finding" in goal
+        assert "'design'" in goal
+
     def test_a_task_without_an_intent_says_nothing_about_priors(self):
         """Silence keeps the default de novo behaviour for ordinary sweeps."""
         goal = build_goal(_task(), "ttp-1")
@@ -359,7 +397,7 @@ class TestTheDeNovoFallback:
         assert default_run_substitutes_for({"weight_overrides": {"QED": 2.0}})
 
     def test_a_task_with_an_intent_cannot(self):
-        """A substituted run posts into the same front while measuring else."""
+        """A substituted run reports a result for an experiment nobody asked for."""
         from reinvent4_agent.supervisor import default_run_substitutes_for
 
         assert not default_run_substitutes_for({"intent": "hold the JQ1 core"})
@@ -439,18 +477,39 @@ class TestDriverToolBoundary:
         assert driver_denied_tools(authored=False) == DRIVER_DENIED_TOOLS
 
     def test_it_cannot_steer_the_fleet(self):
-        # A worker must not open campaigns, queue work, or cancel its peers.
-        assert {
-            "start_campaign", "enqueue_task", "set_concurrency",
-            "cancel_supervisor", "close_campaign", "finalize_campaign",
-        } <= DRIVER_DENIED_TOOLS
+        """Asserted against the fleet set, not a list written out by hand.
+
+        Written out by hand it held enqueue_task and not its plural twin
+        enqueue_tasks, so a Driver could queue work for the whole campaign --
+        and rewrite the plan, and claim proposals -- while the denial's own
+        reason said only the conducting agent divides the work. Phrased this
+        way a thirteenth fleet tool cannot slip past.
+        """
+        from reinvent4_agent.supervisor import driver_denied_tools
+        from reinvent4_agent.web.sessions import FLEET_TOOLS
+
+        assert FLEET_TOOLS <= DRIVER_DENIED_TOOLS
+        for authored in (True, False):
+            for kind in ("design", "research"):
+                assert FLEET_TOOLS <= driver_denied_tools(authored, kind)
+
+    def test_every_withheld_tool_says_what_to_do_instead(self):
+        """A refusal with no reason is retried, or the work is abandoned.
+
+        That is what DENIAL_REASONS is for, so a tool added to either denial
+        set without one quietly loses the sub-agent its way round.
+        """
+        from reinvent4_agent.supervisor import DENIAL_REASONS, GENERAL_DENIED_TOOLS
+
+        for tool in sorted(DRIVER_DENIED_TOOLS | GENERAL_DENIED_TOOLS):
+            assert DENIAL_REASONS.get(tool), f"{tool} is withheld with no reason"
 
     def test_reading_is_still_allowed(self):
         # The denial is about mutation, not curiosity -- it still has to be
         # able to watch its own job.
         for tool in (
             "run_optimization", "get_optimization_status", "get_top_candidates",
-            "get_ttp", "get_campaign_state", "get_pareto_front",
+            "get_ttp", "get_campaign_state", "get_supervisor_result",
         ):
             assert tool not in DRIVER_DENIED_TOOLS
 
@@ -466,6 +525,269 @@ class TestDriverToolBoundary:
         assert allowed == {
             "run_optimization", "get_optimization_status", "some_future_tool",
         }
+
+
+class TestSubAgentToolBoundary:
+    """A task that is not a design run must not start one.
+
+    The supervisor's deadline, monitoring and harvest are built around a
+    single RL job. A research task that starts one has nobody watching it and
+    nobody stopping it at the deadline, so it would hold a GPU until the
+    runner was restarted.
+    """
+
+    def test_it_cannot_start_a_run(self):
+        from reinvent4_agent.supervisor import driver_denied_tools
+
+        denied = driver_denied_tools(authored=False, kind="research")
+
+        assert {
+            "run_optimization", "run_transfer_learning",
+            "run_generation_campaign", "create_generation_campaign",
+        } <= denied
+
+    def test_it_can_still_write_a_profile(self):
+        """Preparing the TTP a later design task runs is a reasonable job,
+        and create_ttp cannot overwrite one that already exists."""
+        from reinvent4_agent.supervisor import driver_denied_tools
+
+        assert "create_ttp" not in driver_denied_tools(authored=False, kind="research")
+
+    def test_reading_and_scoring_are_untouched(self):
+        from reinvent4_agent.supervisor import driver_denied_tools
+
+        denied = driver_denied_tools(authored=False, kind="retrosynthesis")
+        for tool in (
+            "score_molecules", "predict_admet", "plan_synthesis",
+            "fetch_target_info", "get_top_candidates", "list_jobs",
+        ):
+            assert tool not in denied
+
+    def test_a_design_task_keeps_its_run(self):
+        from reinvent4_agent.supervisor import driver_denied_tools
+
+        assert "run_optimization" not in driver_denied_tools(authored=False, kind="design")
+
+    def test_no_sub_agent_can_steer_the_fleet(self):
+        from reinvent4_agent.supervisor import driver_denied_tools
+
+        for kind in ("design", "research", "question"):
+            assert {"conduct_campaign", "enqueue_task", "start_campaign"} <= (
+                driver_denied_tools(authored=False, kind=kind)
+            )
+
+    def test_every_refusal_says_what_to_do_instead(self):
+        """A bare "not available" gets the same call retried, or the work dropped."""
+        from reinvent4_agent.supervisor import denial_reasons, driver_denied_tools
+
+        for kind in ("design", "research"):
+            for authored in (True, False):
+                reasons = denial_reasons(driver_denied_tools(authored=authored, kind=kind))
+                assert all(reasons.values()), (kind, authored, reasons)
+
+
+class TestSubAgentBrief:
+    """What the conductor wrote, and what the sub-agent is told regardless."""
+
+    def test_every_field_the_conductor_filled_in_is_passed_on(self):
+        from reinvent4_agent.supervisor import build_brief
+
+        brief = build_brief(
+            _task(
+                kind="research", title="BD1 vs BD2 selectivity",
+                context="The series loses selectivity above 400 Da.",
+                intent="Find published selectivity handles.",
+                deliverable="A ranked list with references.",
+            ),
+            campaign_goal="improve BRD4 BD1 affinity",
+        )
+
+        assert "BD1 vs BD2 selectivity" in brief
+        assert "loses selectivity above 400 Da" in brief
+        assert "Find published selectivity handles" in brief
+        assert "A ranked list with references" in brief
+        assert "improve BRD4 BD1 affinity" in brief
+
+    def test_a_one_line_task_is_still_a_brief(self):
+        """The conductor decides how precise to be; a terse task is not a
+        broken one, so nothing is required but the intent."""
+        from reinvent4_agent.supervisor import build_brief
+
+        brief = build_brief(_task(kind="question", intent="Is PROTAC degradation plausible here?"))
+
+        assert "Is PROTAC degradation plausible here?" in brief
+        assert "None" not in brief
+
+    def test_it_is_told_the_report_is_the_only_thing_that_leaves(self):
+        """The conductor sees no transcript and no tool calls, so a finding
+        left in the transcript did not happen."""
+        from reinvent4_agent.supervisor import REPORT_HEADING, build_brief
+
+        brief = build_brief(_task(kind="research", intent="look it up"))
+
+        assert REPORT_HEADING in brief
+        assert "only thing the conductor sees" in brief
+
+    def test_it_is_told_it_cannot_start_a_run(self):
+        """Being refused the tool without being told why reads as a broken
+        toolchain; it should report the run it would have started instead."""
+        from reinvent4_agent.supervisor import build_brief
+
+        brief = build_brief(_task(kind="research", intent="look it up"))
+
+        assert "cannot start a reinforcement-learning run" in brief
+
+    def test_a_sub_agent_is_told_nobody_will_answer_a_question(self):
+        """There is no user in a sub-agent's conversation: a clarifying
+        question would end the task with nothing in it."""
+        from reinvent4_agent.system_prompt import SUBAGENT_BRIEFING
+
+        assert "Nobody will answer a question" in SUBAGENT_BRIEFING
+
+    def test_it_is_told_which_campaign_and_branch_to_record_against(self):
+        """The atlas tools need both, and nothing else in the brief said so."""
+        from reinvent4_agent.supervisor import build_brief
+
+        brief = build_brief(_task(kind="research", intent="look it up",
+                                  workstream="selectivity"))
+
+        assert "feed0001" in brief
+        assert "a1b2c3d4" in brief
+        assert "'selectivity'" in brief
+        assert "atlas_finding" in brief
+
+    def test_what_the_branch_already_knows_is_in_the_brief(self):
+        """The sub-agent that does not know the question was answered will
+        not think to ask: that duplicated work is what this prevents."""
+        from reinvent4_agent.supervisor import build_brief
+
+        brief = build_brief(
+            _task(kind="research", intent="look it up", workstream="selectivity"),
+            findings=[{
+                "finding_id": "f1", "confidence": "high",
+                "claim": "BD1 tolerates a methyl at the ZA channel",
+                "evidence": ["10.1021/jm501245q"],
+            }],
+        )
+
+        assert "BD1 tolerates a methyl at the ZA channel" in brief
+        assert "10.1021/jm501245q" in brief
+        assert "f1" in brief
+        assert "Do not redo this work" in brief
+
+    def test_an_empty_atlas_adds_nothing_to_the_brief(self):
+        """A heading over no findings reads as a campaign that knows nothing
+        when it is a branch nobody has filed under yet."""
+        from reinvent4_agent.supervisor import build_brief
+
+        brief = build_brief(_task(kind="research", intent="look it up"), findings=[])
+
+        assert "already knows" not in brief
+
+
+class TestDesignReport:
+    """A design task reports to the conductor too, not only a profile."""
+
+    @staticmethod
+    def _outcome() -> TaskOutcome:
+        return TaskOutcome(
+            objective_profile={"QED": 0.81, "BoltzAffinity": 0.93},
+            candidates=[{"smiles": "CCO"}],
+            job_id="job-1",
+        )
+
+    def test_it_leads_with_what_the_ledger_already_knows(self):
+        from reinvent4_agent.supervisor import design_report
+
+        report = design_report("I ran it.", self._outcome(), "ttp-a1b2c3d4", False)
+
+        assert "ttp-a1b2c3d4" in report
+        assert "BoltzAffinity=0.93" in report
+        assert "1 molecule(s) reported" in report
+        assert "I ran it." in report
+
+    def test_the_reviewer_handoff_block_is_cut(self):
+        """It is addressed to the Reviewer. A conductor reading a wall of
+        SMILES-as-JSON learns nothing the candidates do not already say."""
+        from reinvent4_agent.supervisor import design_report
+
+        fence = "`" * 3
+        account = (
+            "Two survived the confidence gate.\n\n"
+            f"{fence}json\n"
+            '{"candidates": ["CCO"], "ready_for_review": true}\n'
+            f"{fence}"
+        )
+
+        report = design_report(account, self._outcome(), "ttp-a1b2c3d4", False)
+
+        assert "Two survived the confidence gate." in report
+        assert "ready_for_review" not in report
+
+    def test_a_deadline_stop_is_stated(self):
+        """Partial results read as a weak run unless the reason is there."""
+        from reinvent4_agent.supervisor import design_report
+
+        report = design_report("", self._outcome(), "ttp-a1b2c3d4", True)
+
+        assert "deadline" in report
+
+    def test_an_agent_that_said_nothing_still_reports(self):
+        from reinvent4_agent.supervisor import design_report
+
+        report = design_report(None, self._outcome(), "ttp-a1b2c3d4", False)
+
+        assert "ttp-a1b2c3d4" in report
+
+
+class TestJobIdCollection:
+    """Every run a task started, not only the one its molecules came from."""
+
+    @staticmethod
+    def _collector():
+        from reinvent4_agent.supervisor import _JobIdCollector
+
+        return _JobIdCollector()
+
+    def test_it_notes_the_runs_the_agent_started(self):
+        collector = self._collector()
+
+        collector.on_tool_result(
+            "run_optimization", '{"job_id": "job-1", "state": "queued"}', False
+        )
+        collector.on_tool_result(
+            "run_transfer_learning", '{"job_id": "job-2"}', False
+        )
+
+        assert collector.job_ids == ["job-1", "job-2"]
+
+    def test_reading_the_job_table_is_not_starting_a_job(self):
+        """list_jobs answers with every job in the pool, including other
+        tasks' -- attributing those here would credit this task with them."""
+        collector = self._collector()
+
+        collector.on_tool_result(
+            "list_jobs", '{"jobs": [{"job_id": "someone-elses"}]}', False
+        )
+
+        assert collector.job_ids == []
+
+    def test_a_failed_call_started_nothing(self):
+        collector = self._collector()
+
+        collector.on_tool_result(
+            "run_optimization", '{"error": "Maximum concurrent jobs (2) reached"}', True
+        )
+
+        assert collector.job_ids == []
+
+    def test_the_same_run_is_noted_once(self):
+        collector = self._collector()
+
+        for _ in range(3):
+            collector.on_tool_result("run_optimization", '{"job_id": "job-1"}', False)
+
+        assert collector.job_ids == ["job-1"]
 
 
 # ---------------------------------------------------------------------------
@@ -870,7 +1192,7 @@ def ttp_store(tmp_path, monkeypatch):
     monkeypatch.setattr("reinvent4_mcp.tools.ttp.get_config", lambda: config)
     ttp_tools.reset_store()
 
-    ttp_tools.create_ttp({
+    created = ttp_tools.create_ttp({
         "id": "brd4-bd1-lead-opt",
         "name": "BRD4 BD1 lead optimisation",
         "pre_scoring": {"components": [
@@ -881,6 +1203,14 @@ def ttp_store(tmp_path, monkeypatch):
              "weight": 1.0},
         ]},
     })
+    # Checked, because an unstored base TTP leaves the store empty and every
+    # test here then fails on "TTP not found" instead of on what it meant to
+    # assert -- which is how eleven of them read as broken for weeks.
+    if "error" in created:
+        if "REINVENT4" in created["error"]:
+            pytest.skip("validating the base TTP needs a REINVENT4 checkout")
+        pytest.fail(f"base TTP rejected: {created['error']}")
+
     yield ttp_tools
     ttp_tools.reset_store()
     reset_config()
@@ -1031,6 +1361,26 @@ class TestBaseTtpResolution:
         runner = CoscientistTaskRunner(object(), self._Store({"base_ttp_id": ""}))
 
         assert runner._base_ttp_id(_task()) is None
+
+
+class TestLeadTasks:
+
+    def test_a_lead_conducts_its_workstream_instead_of_running_an_agent(self):
+        from reinvent4_agent.supervisor import CoscientistTaskRunner
+
+        store = MagicMock()
+        runner = CoscientistTaskRunner(MagicMock(), store)
+        led: list[tuple[Any, dict[str, Any]]] = []
+
+        def conduct(ledger, task, proposer):
+            led.append((ledger, task))
+            return TaskOutcome(summary="led it")
+
+        with patch("reinvent4_agent.leading.conduct", conduct):
+            outcome = asyncio.run(runner(_task(kind="lead")))
+
+        assert outcome.summary == "led it"
+        assert led[0][0] is store
 
 
 class TestJobDiscovery:
@@ -1262,7 +1612,7 @@ class TestStartingTheRunDirectly:
         with patch("reinvent4_mcp.tools.optimization.run_optimization", _run):
             assert self._runner()._start_job("ttp-1", 5) == "job-9"
 
-        assert calls == [{"ttp_id": "ttp-1", "max_steps": 5}]
+        assert calls == [{"ttp_id": "ttp-1", "max_steps": 5, "fidelity_tier": "exploration"}]
 
     def test_no_step_budget_is_left_to_the_default(self):
         calls: list[dict[str, Any]] = []
@@ -1274,7 +1624,9 @@ class TestStartingTheRunDirectly:
         with patch("reinvent4_mcp.tools.optimization.run_optimization", _run):
             self._runner()._start_job("ttp-1", None)
 
-        assert calls == [{"ttp_id": "ttp-1"}]
+        # max_steps is omitted (None) so run_optimization can apply the
+        # Boltz exploration cap; fidelity_tier defaults to exploration.
+        assert calls == [{"ttp_id": "ttp-1", "fidelity_tier": "exploration"}]
 
     def test_a_refused_run_is_an_error(self):
         """e.g. the concurrency cap, which names the jobs to stop."""
@@ -1284,6 +1636,65 @@ class TestStartingTheRunDirectly:
         ):
             with pytest.raises(RuntimeError, match="Maximum concurrent jobs"):
                 self._runner()._start_job("ttp-1", 5)
+
+    def test_a_refusal_for_want_of_a_slot_is_told_apart(self):
+        """Only that one is worth waiting out; it names the runs holding slots."""
+        from reinvent4_agent.supervisor import RunRefused
+
+        with patch(
+            "reinvent4_mcp.tools.optimization.run_optimization",
+            return_value={"error": "The cluster is slow to start runs", "active_jobs": ["a"]},
+        ):
+            with pytest.raises(RunRefused):
+                self._runner()._start_job("ttp-1", 5)
+
+    def test_a_run_refused_for_a_slot_is_started_when_one_frees(self, monkeypatch):
+        """Several supervisors can see the same last slot; the losers wait."""
+        from reinvent4_agent import supervisor
+
+        monkeypatch.setattr(supervisor, "RUN_ROOM_POLL_SECONDS", 0.0)
+        replies = iter([
+            {"error": "full", "active_jobs": ["a", "b"]},
+            {"error": "full", "active_jobs": ["a", "b"]},
+            {"job_id": "job-9"},
+        ])
+        with patch("reinvent4_mcp.tools.optimization.run_optimization", lambda **k: next(replies)):
+            job_id = asyncio.run(self._runner()._start_when_room(_task(), "ttp-1", 5))
+
+        assert job_id == "job-9"
+
+    def test_a_run_refused_at_the_deadline_fails_the_task(self, monkeypatch):
+        from reinvent4_agent.supervisor import RunRefused
+
+        task = _task()
+        task["spec"]["deadline"] = "2000-01-01T00:00:00+00:00"
+        with patch(
+            "reinvent4_mcp.tools.optimization.run_optimization",
+            return_value={"error": "full", "active_jobs": ["a"]},
+        ):
+            with pytest.raises(RunRefused):
+                asyncio.run(self._runner()._start_when_room(task, "ttp-1", 5))
+
+    def test_a_design_task_waits_for_room_before_its_agents_start(self, monkeypatch):
+        from reinvent4_agent import supervisor
+
+        monkeypatch.setattr(supervisor, "RUN_ROOM_POLL_SECONDS", 0.0)
+        rooms = iter([{"free": 0, "active": 4, "limit": 4}, {"free": 0, "active": 4, "limit": 4},
+                      {"free": 1, "active": 3, "limit": 4}])
+        asked: list[int] = []
+
+        def _room():
+            asked.append(1)
+            return next(rooms)
+
+        with patch("reinvent4_mcp.tools.campaign.run_room", _room):
+            asyncio.run(self._runner()._wait_for_run_room(_task()))
+
+        assert len(asked) == 3
+
+    def test_an_unreadable_window_holds_nothing_up(self):
+        with patch("reinvent4_mcp.tools.campaign.run_room", return_value=None):
+            asyncio.run(self._runner()._wait_for_run_room(_task()))
 
     def test_a_null_error_is_not_a_failure(self):
         """Same trap as the status dict: the key is always there."""
@@ -1340,8 +1751,8 @@ class TestHarvestedProfileIsScopedToTheCampaign:
 
     A results CSV carries a column per scorer diagnostic -- std,
     confidence_score, affinity_probability_binary and friends -- and reporting
-    those as objectives put a dozen keys on every point of the front where
-    three belonged, and bloated the stored results.
+    those as objectives put a dozen keys on every result where three
+    belonged, and bloated the stored results.
     """
 
     @staticmethod
@@ -1361,7 +1772,8 @@ class TestHarvestedProfileIsScopedToTheCampaign:
         assert runner._objectives(_task()) == ["BoltzAffinity", "QED"]
 
     def test_an_unreadable_campaign_falls_back_to_every_column(self):
-        """Reporting nothing would fail the task; reporting extra only clutters."""
+        """Reporting nothing leaves the molecules unscored; reporting extra
+        only clutters."""
         runner = self._runner(RuntimeError("store down"))
 
         assert runner._objectives(_task()) is None
@@ -1369,13 +1781,46 @@ class TestHarvestedProfileIsScopedToTheCampaign:
     def test_a_campaign_that_declares_none_falls_back_the_same_way(self):
         """A campaign whose tasks write their own TTPs declares no
         objectives. Narrowing a result to an empty list keeps no scores at
-        all, and the task then fails for having no coordinates on a front
-        that campaign does not have -- seen on LUMI, on a run that had
-        already produced 25 molecules."""
+        all, so the molecules arrive with nothing to say what they scored --
+        seen on LUMI, on a run that had already produced 25 molecules."""
 
         runner = self._runner({"objectives": []})
 
         assert runner._objectives(_task()) is None
+
+    def test_molecules_without_scores_are_still_reported(self):
+        """The molecules are what the run was for. An unreadable score column
+        is a note on the result, not a reason to spend the GPU-hour again."""
+        runner = self._runner({"objectives": ["BoltzAffinity"]})
+        top = {"candidates": [{"smiles": "CCO", "total_score": 0.4, "components": {}}]}
+
+        with patch("reinvent4_mcp.tools.results.get_top_candidates", return_value=top):
+            outcome = runner._harvest(_task(), "job-1", "ok", 1, 0, False)
+
+        assert outcome.objective_profile == {}
+        assert len(outcome.candidates) == 1
+        assert "no per-objective scores" in outcome.summary
+
+    def test_each_molecule_names_the_run_that_scored_it(self):
+        """Where the UI finds its complex, also once a lead pools it with others."""
+        runner = self._runner({"objectives": ["BoltzAffinity"]})
+        top = {"candidates": [{"smiles": "CCO", "total_score": 0.4}, {"smiles": "CCN", "total_score": 0.3}]}
+
+        with patch("reinvent4_mcp.tools.results.get_top_candidates", return_value=top):
+            outcome = runner._harvest(_task(), "job-1", "ok", 1, 0, False)
+
+        assert [c["job_id"] for c in outcome.candidates] == ["job-1", "job-1"]
+        assert "job_id" not in top["candidates"][0]
+
+    def test_a_run_with_no_molecules_still_fails(self):
+        runner = self._runner({"objectives": ["BoltzAffinity"]})
+
+        with patch(
+            "reinvent4_mcp.tools.results.get_top_candidates",
+            return_value={"candidates": []},
+        ):
+            with pytest.raises(RuntimeError, match="without a single molecule"):
+                runner._harvest(_task(), "job-1", "ok", 1, 0, False)
 
     def test_the_profile_drops_the_diagnostic_columns(self):
         candidates = [{
@@ -1435,7 +1880,11 @@ class TestOverdueTasks:
 
         overdue = _overdue_seconds(_task(deadline=when.isoformat()))
 
-        assert 7150 < overdue <= 7200
+        # Two hours plus however long this test took to get here, so the slack
+        # belongs above 7200 and not below: the deadline is read after it is
+        # written, never before. Capped at 7200 this passed only where the
+        # clock was too coarse to tick between the two reads.
+        assert 7200 <= overdue < 7260
 
     def test_a_task_still_inside_its_deadline_is_not(self):
         when = datetime.now(timezone.utc) + timedelta(seconds=600)
@@ -1514,6 +1963,82 @@ class TestCampaignStoreClient:
         client.fail("abc", "boom")
 
         assert [body.get("owner") for body in sent] == ["supervisor-3"] * 4
+
+
+class TestFollowUps:
+    """What a sub-agent proposes at the end of its report."""
+
+    def test_the_proposed_tasks_are_read_off_the_report(self):
+        from reinvent4_agent.supervisor import parse_follow_ups
+
+        proposals = parse_follow_ups(
+            "## Report\n\nBD1 and BD2 differ at the ZA loop.\n\n"
+            "## Next tasks\n"
+            "- (design) Hold the triazole: run RL holding the methyl-triazole "
+            "and varying the fused ring, since the 0.81 scorer came from it.\n"
+            "- (retrosynthesis) Route the top two: check building-block "
+            "availability for the two best candidates.\n"
+        )
+
+        assert [p["kind"] for p in proposals] == ["design", "retrosynthesis"]
+        assert proposals[0]["title"] == "Hold the triazole"
+        assert "varying the fused ring" in proposals[0]["intent"]
+
+    def test_a_report_that_proposes_nothing_proposes_nothing(self):
+        from reinvent4_agent.supervisor import parse_follow_ups
+
+        assert parse_follow_ups("## Report\n\nNothing conclusive.") == []
+
+    def test_an_unknown_kind_is_research_rather_than_dropped(self):
+        """The line is the task; its label is the least of it."""
+        from reinvent4_agent.supervisor import parse_follow_ups
+
+        proposals = parse_follow_ups(
+            "## Next tasks\n- (wetlab) Assay the series: measure the top five in BD1."
+        )
+
+        assert proposals[0]["kind"] == "research"
+
+    def test_a_line_without_a_title_is_titled_by_its_first_words(self):
+        from reinvent4_agent.supervisor import parse_follow_ups
+
+        proposals = parse_follow_ups(
+            "## Next tasks\n- Counter-screen the best two against BRD2 and BRD3."
+        )
+
+        assert proposals[0]["title"] == "Counter-screen the best two against BRD2"
+        assert proposals[0]["intent"].startswith("Counter-screen")
+
+    def test_no_more_than_three_are_taken(self):
+        """A budget, not a limit on what it may think: the conductor ranks them."""
+        from reinvent4_agent.supervisor import MAX_FOLLOW_UPS, parse_follow_ups
+
+        proposals = parse_follow_ups(
+            "## Next tasks\n" + "".join(
+                f"- (research) Task {i}: do the {i}th thing worth doing.\n" for i in range(6)
+            )
+        )
+
+        assert len(proposals) == MAX_FOLLOW_UPS
+
+    def test_prose_after_the_list_ends_it(self):
+        from reinvent4_agent.supervisor import parse_follow_ups
+
+        proposals = parse_follow_ups(
+            "## Next tasks\n"
+            "- (research) Check selectivity: counter-screen against BRD2.\n"
+            "I would start with the first of these.\n"
+            "- (design) Not this one: it comes after the prose.\n"
+        )
+
+        assert len(proposals) == 1
+
+    def test_the_brief_asks_for_them(self):
+        from reinvent4_agent.supervisor import NEXT_TASKS_HEADING, build_brief
+
+        brief = build_brief(_task(kind="research", intent="Find selectivity handles."))
+
+        assert NEXT_TASKS_HEADING in brief
 
 
 class _response:

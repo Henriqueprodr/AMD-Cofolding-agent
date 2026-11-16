@@ -201,3 +201,113 @@ class TestSuccessfulLookup:
         pubchem.fetch_compound("(+)-JQ1")
 
         assert "%28%2B%29-JQ1" in urls[0]
+
+    def test_the_inchikey_comes_back_with_it(self, monkeypatch):
+        """It is the only identifier that joins this hit to a ChEMBL one."""
+        _responses(monkeypatch, _found(InChIKey="LFQSCWFLJHTTHZ-UHFFFAOYSA-N"))
+
+        result = pubchem.fetch_compound("ethanol")
+
+        assert result["inchikey"] == "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
+
+    def test_the_inchikey_is_asked_for(self, monkeypatch):
+        urls = _responses(monkeypatch, _found())
+
+        pubchem.fetch_compound("ethanol")
+
+        assert "InChIKey" in urls[0]
+
+
+class TestAnAmbiguousName:
+    """A name can match a salt, a racemate and three stereoisomers."""
+
+    @staticmethod
+    def _many(n: int) -> _Response:
+        props = [
+            {"CID": 100 + i, "SMILES": "CCO", "Title": f"variant {i}"}
+            for i in range(n)
+        ]
+        return _Response(body={"PropertyTable": {"Properties": props}})
+
+    def test_the_first_is_still_returned(self, monkeypatch):
+        # Something has to be chosen to cofold; the point is to say so.
+        _responses(monkeypatch, self._many(4))
+
+        assert pubchem.fetch_compound("ambiguous")["cid"] == 100
+
+    def test_it_says_how_many_matched_and_names_them(self, monkeypatch):
+        _responses(monkeypatch, self._many(4))
+
+        result = pubchem.fetch_compound("ambiguous")
+
+        assert result["matches"] == 4
+        assert result["other_cids"] == [101, 102, 103]
+        # The warning has to name the one taken and the way to ask for another.
+        assert "100" in result["ambiguous"]
+        assert "cid=" in result["ambiguous"]
+
+    def test_a_long_list_of_siblings_is_capped(self, monkeypatch):
+        _responses(monkeypatch, self._many(50))
+
+        result = pubchem.fetch_compound("ambiguous")
+
+        assert result["matches"] == 50
+        assert len(result["other_cids"]) == pubchem._MAX_OTHER_CIDS
+
+    def test_a_single_match_is_not_called_ambiguous(self, monkeypatch):
+        _responses(monkeypatch, _found())
+
+        result = pubchem.fetch_compound("ethanol")
+
+        assert "ambiguous" not in result
+        assert "matches" not in result
+
+
+class TestTheOtherWaysToAsk:
+
+    def test_a_cid_is_looked_up_by_cid(self, monkeypatch):
+        urls = _responses(monkeypatch, _found())
+
+        result = pubchem.fetch_compound_by_cid(702)
+
+        assert "/compound/cid/702/" in urls[0]
+        assert result["cid"] == 702
+
+    def test_an_inchikey_is_looked_up_by_inchikey(self, monkeypatch):
+        urls = _responses(monkeypatch, _found())
+
+        pubchem.fetch_compound_by_inchikey("LFQSCWFLJHTTHZ-UHFFFAOYSA-N")
+
+        assert "/compound/inchikey/LFQSCWFLJHTTHZ-UHFFFAOYSA-N/" in urls[0]
+
+    def test_a_smiles_is_posted_rather_than_quoted_into_a_url(self, monkeypatch):
+        # "#", "/" and "+" in a SMILES are a quoting problem PubChem itself
+        # tells callers to avoid, so this one goes in a body.
+        sent: dict[str, Any] = {}
+
+        def _post(url, data=None, timeout=None):
+            sent["url"] = url
+            sent["data"] = data
+            return _found()
+
+        monkeypatch.setattr(pubchem.requests, "post", _post)
+        monkeypatch.setattr(
+            pubchem.requests, "get",
+            lambda *a, **k: pytest.fail("a SMILES must not be sent as a URL"),
+        )
+
+        pubchem.fetch_compound_by_smiles("C#CC[C@H](N)C(=O)O")
+
+        assert sent["data"] == {"smiles": "C#CC[C@H](N)C(=O)O"}
+        assert sent["url"].endswith("/JSON")
+        assert "C%23C" not in sent["url"]
+
+    def test_an_unknown_namespace_never_reaches_the_network(self, monkeypatch):
+        monkeypatch.setattr(
+            pubchem.requests, "get",
+            lambda *a, **k: pytest.fail("should not have been called"),
+        )
+
+        result = pubchem._lookup("x", "smells_like")
+
+        assert "Unknown PubChem namespace" in result["error"]

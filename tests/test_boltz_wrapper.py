@@ -28,6 +28,12 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
+# services/boltz2/app.py locks its worker pool with fcntl, a POSIX-only
+# module, so this file cannot be imported at all on a Windows checkout -- and
+# an import error during collection aborts the whole `pytest tests/` run
+# rather than just this module.
+pytest.importorskip("fcntl")
+
 _boltz_spec = importlib.util.spec_from_file_location(
     "boltz2_app",
     str(Path(__file__).resolve().parent.parent / "services" / "boltz2" / "app.py"),
@@ -673,3 +679,62 @@ class TestScoreEndpoint:
             },
         })
         assert resp.status_code == 500
+
+
+# ---------------------------------------------------------------------------
+# TestGcdSlotDetection
+# ---------------------------------------------------------------------------
+
+
+class TestGcdSlotDetection:
+    """Which GCDs a scoring batch may be split across.
+
+    rocm-smi reads the driver and so reports every GCD on the node however
+    few this process may open: on a session node it answers for all eight
+    while ROCR_VISIBLE_DEVICES grants one. Counting its rows picked eight
+    slots on a one-GCD service and pinned seven of them onto dies belonging
+    to the vLLM servers next door.
+    """
+
+    @staticmethod
+    def _detect(env, free):
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(boltz_app, "_query_free_vram_per_gcd", return_value=free):
+            return boltz_app._detect_slot_gcds()
+
+    ALL_IDLE = {g: 64.0 for g in range(8)}
+
+    def test_only_the_granted_gcd_is_used_when_the_driver_reports_eight(self):
+        assert self._detect({"ROCR_VISIBLE_DEVICES": "5"}, self.ALL_IDLE) == [5]
+
+    def test_both_gcds_of_a_run_are_used_when_they_fit(self):
+        assert self._detect({"ROCR_VISIBLE_DEVICES": "4,5"}, self.ALL_IDLE) == [4, 5]
+
+    def test_a_busy_gcd_drops_out_of_the_slots(self):
+        free = {**self.ALL_IDLE, 4: 3.0}
+        assert self._detect({"ROCR_VISIBLE_DEVICES": "4,5"}, free) == [5]
+
+    def test_a_neighbours_gcd_is_never_claimed(self):
+        # vLLM holds 0-3; nothing granted 4,5 may reach them.
+        free = {**self.ALL_IDLE, 0: 2.0, 1: 2.0, 2: 2.0, 3: 2.0}
+        assert self._detect({"ROCR_VISIBLE_DEVICES": "4,5"}, free) == [4, 5]
+
+    def test_without_a_visibility_variable_every_idle_gcd_counts(self):
+        assert self._detect({}, self.ALL_IDLE) == [0, 1, 2, 3, 4, 5, 6, 7]
+
+    def test_one_slot_when_the_vram_query_is_unavailable(self):
+        assert self._detect({"ROCR_VISIBLE_DEVICES": "4,5"}, {}) == [4]
+
+    def test_the_override_cannot_exceed_what_is_visible(self):
+        env = {"ROCR_VISIBLE_DEVICES": "5", "BOLTZ_GCD_SLOTS": "8"}
+        assert self._detect(env, self.ALL_IDLE) == [5]
+
+    def test_the_override_picks_the_first_visible_gcds(self):
+        env = {"ROCR_VISIBLE_DEVICES": "4,5", "BOLTZ_GCD_SLOTS": "1"}
+        assert self._detect(env, self.ALL_IDLE) == [4]
+
+    def test_a_shard_is_pinned_to_a_physical_gcd_not_its_own_index(self):
+        # ROCR reads the subprocess value against the driver's numbering, so
+        # shard 0 of a run holding 4,5 must say 4 -- saying 0 lands elsewhere.
+        slots = self._detect({"ROCR_VISIBLE_DEVICES": "4,5"}, self.ALL_IDLE)
+        assert [slots[k] for k in range(len(slots))] == [4, 5]

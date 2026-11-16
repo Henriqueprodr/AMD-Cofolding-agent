@@ -56,12 +56,21 @@ class _FakeBackend(LLMBackend):
     def reset(self, system_prompt: str) -> None:
         pass
 
+    def export_history(self) -> list[dict[str, Any]]:
+        return []
+
+    def import_history(self, messages: list[dict[str, Any]]) -> None:
+        pass
+
 
 class _FakeMCP:
     """MCP client whose tool call raises a (non-Exception) cancellation."""
 
     async def list_tools(self) -> list[dict[str, Any]]:
         return [{"name": "boom", "description": "", "input_schema": {}}]
+
+    def resolve_tool_name(self, name: str) -> str | None:
+        return name
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         raise asyncio.CancelledError()

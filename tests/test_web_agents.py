@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 
+from reinvent4_agent.web import sessions as web_sessions
 from test_web_autonomy import FakeAgent, idle, make_session, published
 
 
@@ -84,7 +85,7 @@ def test_the_allowance_reaches_the_agent(tmp_path):
         assert live.start_turn("optimise this series")
         await idle(live)
         assert agent.asked[0].startswith("optimise this series")
-        assert "up to 3 sub-agents" in agent.asked[0]
+        assert "Team size: 3 sub-agents at once" in agent.asked[0]
 
     asyncio.run(run())
 
@@ -102,8 +103,8 @@ def test_the_user_message_is_recorded_as_they_typed_it(tmp_path):
     asyncio.run(run())
 
 
-def test_the_agent_still_decides_whether_to_spend_them(tmp_path):
-    """Said plainly: a bare number reads as an instruction to run a campaign."""
+def test_two_or_more_make_the_long_work_the_sub_agents(tmp_path):
+    """Setting the allowance is the user choosing how the work is done."""
 
     async def run() -> None:
         agent = FakeAgent()
@@ -111,6 +112,80 @@ def test_the_agent_still_decides_whether_to_spend_them(tmp_path):
         live.set_agents(2)
         assert live.start_turn("what does this molecule look like?")
         await idle(live)
-        assert "if it does not, say so and do it yourself" in agent.asked[0]
+        assert "Team size: 2 sub-agents at once" in agent.asked[0]
+        assert "enqueue_tasks call" in agent.asked[0]
+        # run starters are withheld — the note says so
+        assert "withheld" in agent.asked[0]
 
     asyncio.run(run())
+
+
+def test_working_alone_withholds_the_campaign_tools(tmp_path):
+    """At one there are no sub-agents, so a campaign would have nobody to run it."""
+
+    live = make_session(tmp_path, FakeAgent())
+    live.apply_allowance()
+    assert set(live.agent.withheld) == web_sessions.FLEET_TOOLS
+    assert "no sub-agents" in live.agent.withheld["start_campaign"]
+
+
+def test_two_or_more_withhold_the_run_starters_instead(tmp_path):
+    async def run() -> None:
+        live = make_session(tmp_path, FakeAgent())
+        live.set_agents(2)
+        assert set(live.agent.withheld) == web_sessions.RUN_STARTERS
+        assert "enqueue_task" in live.agent.withheld["run_optimization"]
+        # Back to one, and the agent has its own runs again.
+        live.set_agents(1)
+        assert set(live.agent.withheld) == web_sessions.FLEET_TOOLS
+
+    asyncio.run(run())
+
+
+def test_the_allowance_names_the_tools_a_campaign_is_run_with(tmp_path):
+    """A number alone leaves the agent to guess how sub-agents are reached."""
+
+    async def run() -> None:
+        agent = FakeAgent()
+        live = make_session(tmp_path, agent)
+        live.set_agents(4)
+        assert live.start_turn("optimise this series")
+        await idle(live)
+        for tool in ("start_campaign", "conduct_campaign", "enqueue_task", "enqueue_tasks"):
+            assert tool in agent.asked[0]
+
+    asyncio.run(run())
+
+
+# -- what the conducting agent is told it is doing --------------------------
+
+
+def test_the_agent_the_user_talks_to_is_told_how_to_conduct():
+    """The allowance says a campaign is allowed; this says how to run one."""
+    from reinvent4_agent.system_prompt import CONDUCTOR_PLAYBOOK
+
+    assert "Conducting a campaign" in CONDUCTOR_PLAYBOOK
+    assert "cannot see this conversation" in CONDUCTOR_PLAYBOOK
+
+
+def test_it_is_told_to_keep_the_sub_agents_working():
+    """What the user asked auto mode for: nobody idle while the budget runs."""
+    from reinvent4_agent.system_prompt import CONDUCTOR_PLAYBOOK
+
+    assert "no sub-agent should be idle" in CONDUCTOR_PLAYBOOK
+
+
+def test_it_is_told_a_sub_agent_cannot_come_back_with_a_question():
+    """The other half of the sub-agent's briefing, said to the side that
+    writes the task."""
+    from reinvent4_agent.system_prompt import CONDUCTOR_PLAYBOOK
+
+    assert "cannot ask you a question" in CONDUCTOR_PLAYBOOK
+
+
+def test_the_conductor_half_is_added_to_the_chemistry_not_swapped_for_it():
+    from reinvent4_agent.system_prompt import CONDUCTOR_PLAYBOOK, SYSTEM_PROMPT
+
+    prompt = SYSTEM_PROMPT + CONDUCTOR_PLAYBOOK
+    assert "Medicinal Chemistry Knowledge" in prompt
+    assert "Conducting a campaign" in prompt

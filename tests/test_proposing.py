@@ -30,7 +30,6 @@ OBJECTIVES = ["BoltzAffinity", "QED"]
 def _context(
     tasks: list[dict[str, Any]] | None = None,
     results: list[dict[str, Any]] | None = None,
-    front: list[dict[str, Any]] | None = None,
     objectives: list[str] | None = None,
 ) -> CampaignContext:
     return CampaignContext(
@@ -38,7 +37,6 @@ def _context(
         objectives=OBJECTIVES if objectives is None else objectives,
         tasks=tasks or [],
         results=results or [],
-        front=front or [],
     )
 
 
@@ -123,14 +121,6 @@ class TestRenderContext:
         ))
 
         assert "the runner refused the job" in rendered
-
-    def test_front_members_are_flagged(self):
-        rendered = render_context(_context(
-            tasks=[{"task_id": "a1", "state": "done", "spec": {}}],
-            front=[{"task_id": "a1"}],
-        ))
-
-        assert "Pareto front" in rendered
 
     def test_lineage_is_shown_so_it_can_be_continued(self):
         rendered = render_context(_context(
@@ -339,3 +329,50 @@ class TestTaskProposal:
             "weight_overrides": {"QED": 2.0},
             "rationale": "because",
         }
+
+
+PLAN = {"workstreams": [
+    {"id": "selectivity", "name": "BD1/BD2 selectivity", "question": "Which handle separates them?"},
+    {"id": "admet", "name": "ADMET liabilities", "status": "settled"},
+]}
+
+
+class TestPlan:
+
+    def test_each_workstream_is_shown_with_what_it_has_had(self):
+        context = _context(tasks=[
+            {"task_id": "a1", "state": "done", "spec": {"intent": "x", "workstream": "selectivity"}},
+        ])
+        context.plan = PLAN
+
+        text = render_context(context)
+
+        assert "selectivity: BD1/BD2 selectivity [open] -- 1 done" in text
+        assert "admet: ADMET liabilities [settled] -- no tasks yet" in text
+        assert "Which handle separates them?" in text
+
+    def test_no_plan_means_no_workstream_section(self):
+        assert "workstreams" not in render_context(_context())
+
+    def test_a_task_keeps_the_workstream_it_names(self):
+        context = _context()
+        context.plan = PLAN
+
+        [task] = parse_proposals(
+            '{"tasks": [{"intent": "hold the triazole", "workstream": "selectivity"}]}',
+            context, 3,
+        )
+
+        assert task.workstream == "selectivity"
+        assert task.as_spec()["workstream"] == "selectivity"
+
+    def test_a_workstream_not_in_the_plan_is_dropped_not_the_task(self):
+        context = _context()
+        context.plan = PLAN
+
+        [task] = parse_proposals(
+            '{"tasks": [{"intent": "hold the triazole", "workstream": "made-up"}]}',
+            context, 3,
+        )
+
+        assert task.workstream is None

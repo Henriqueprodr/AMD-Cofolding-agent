@@ -260,6 +260,36 @@ class TestSearchTargets:
         params = mock_get.call_args[1]["params"]
         assert "target_type__icontains" in params
 
+    def _raw_target(self) -> dict:
+        return {
+            "target_chembl_id": "CHEMBL2148", "pref_name": "Tyrosine-protein kinase JAK3",
+            "target_type": "SINGLE PROTEIN", "organism": "Homo sapiens",
+            "target_components": [{
+                "component_id": 1, "component_type": "PROTEIN", "accession": "P52333",
+                "target_component_xrefs": [{"xref_id": f"GO:{i:07d}"} for i in range(500)],
+                "target_component_synonyms": [{"component_synonym": "JAK3"}] * 50,
+            }],
+            "cross_references": [{"xref_id": "x"}] * 100,
+        }
+
+    def test_records_are_slim_by_default(self):
+        payload = {"targets": [self._raw_target()], "page_meta": {"total_count": 1, "next": None}}
+        with patch("requests.get", return_value=_mock_json(payload)):
+            r = _call("search_chembl_targets", query="JAK3 human")
+        record = r["records"][0]
+        assert record["target_chembl_id"] == "CHEMBL2148"
+        assert record["target_components"][0]["accession"] == "P52333"
+        assert "cross_references" not in record
+        assert "target_component_xrefs" not in record["target_components"][0]
+        assert len(json.dumps(r)) < 2000
+
+    def test_only_keeps_the_fields_asked_for(self):
+        raw = self._raw_target()
+        payload = {"targets": [raw], "page_meta": {"total_count": 1, "next": None}}
+        with patch("requests.get", return_value=_mock_json(payload)):
+            r = _call("search_chembl_targets", query="JAK3", only=["cross_references"])
+        assert r["records"][0] == raw
+
 
 # ---------------------------------------------------------------------------
 # Category 5: search_chembl_activities — unit preservation (critical)

@@ -207,9 +207,10 @@ class TestTransformNumbersWrittenAsText:
 
         assert t.mapping == mapping
 
-    def test_text_that_is_not_a_number_is_left_alone(self):
-        """Rejecting it belongs to whoever understands the field, not here."""
-        assert TransformConfig(type="sigmoid", note="steep").note == "steep"
+    def test_text_that_is_not_a_number_in_an_unknown_field_is_rejected(self):
+        """An unrecognised field is caught at creation, not silently forwarded."""
+        with pytest.raises(ValidationError, match="unknown parameter"):
+            TransformConfig(type="sigmoid", low=0.0, high=1.0, note="steep")
 
 
 class TestTransformSteepnessIsFilledIn:
@@ -245,6 +246,43 @@ class TestTransformSteepnessIsFilledIn:
         t = TransformConfig(type="sigmoid")
 
         assert t.model_dump() == {"type": "sigmoid", "k": 0.5}
+
+
+class TestTransformUnknownParameters:
+    """Unknown transform parameters must be caught at TTP creation, not in the
+    Slurm job.
+
+    REINVENT4 builds transforms from strict dataclasses, so an unknown field
+    (e.g. ``value`` on ``step``) raises a TypeError mid-job, wasting the GPU
+    slot and producing an error that names neither the field nor its transform.
+    Rejecting at ``TransformConfig`` creation returns a named error immediately,
+    before any resource is allocated.
+    """
+
+    def test_step_with_value_is_rejected(self):
+        """`step` takes `low`/`high`, not `value`."""
+        with pytest.raises(ValidationError, match="unknown parameter"):
+            TransformConfig(type="step", value=0.7)
+
+    def test_step_with_low_is_accepted(self):
+        t = TransformConfig(type="step", low=0.7)
+        assert t.low == 0.7
+
+    def test_sigmoid_with_unknown_field_is_rejected(self):
+        with pytest.raises(ValidationError, match="unknown parameter"):
+            TransformConfig(type="sigmoid", low=0.0, high=1.0, threshold=0.5)
+
+    def test_known_parameters_still_pass_through(self):
+        t = TransformConfig(type="reverse_sigmoid", low=-2.0, high=0.0)
+        assert t.low == -2.0
+        assert t.k == 0.5  # filled in as default
+
+    def test_error_names_the_bad_field_and_the_accepted_ones(self):
+        with pytest.raises(ValidationError) as exc:
+            TransformConfig(type="step", value=0.7)
+        msg = str(exc.value)
+        assert "value" in msg
+        assert "low" in msg or "high" in msg
 
 
 class TestTransformConfig:
@@ -351,7 +389,11 @@ class TestScoringObjective:
 
     def test_external_requires_service_url(self):
         with pytest.raises(ValidationError, match="requires a 'service_url'"):
-            ScoringObjective(name="Test", type="external", service="boltz")
+            ScoringObjective(name="Test", type="external", service="my_custom_scorer")
+
+    def test_a_configured_service_needs_no_url(self):
+        obj = ScoringObjective(name="Affinity", type="external", service="boltz")
+        assert obj.service_url == "http://boltz:8080/score"
 
     def test_valid_external(self):
         obj = ScoringObjective(
@@ -755,7 +797,7 @@ class TestTTPToScorerConfig:
         # when the process config defaults use_msa_server to True.
         from reinvent4_mcp.ttp import mapper
 
-        def _server_on_defaults():
+        def _server_on_defaults(fidelity_tier="exploration"):
             return {"recycling_steps": 3, "use_msa_server": True}
 
         original = mapper._get_boltz_defaults

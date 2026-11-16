@@ -100,8 +100,8 @@ class TestCampaigns:
         assert client.get("/campaigns/nope").status_code == 404
 
     def test_a_campaign_needs_neither_a_base_ttp_nor_objectives(self, client):
-        """The common case: tasks bring their own TTP, so there is no shared
-        front and nothing to declare up front."""
+        """The common case: tasks bring their own TTP, so there is nothing
+        to declare up front."""
 
         response = client.post("/campaigns", json={"goal": "g"})
 
@@ -254,6 +254,30 @@ class TestClaims:
         claimed = _claim(client, "s0", campaign_id=mine).json()
         assert claimed["task_id"] == wanted["task_id"]
 
+    def test_a_campaign_whose_conductor_went_quiet_gives_its_queue_up(self, store, client, monkeypatch):
+        """The next session's pool went to a dead conversation's leftovers.
+
+        A supervisor working any campaign takes the oldest task first, and a
+        campaign left open by a session that ended is always the oldest.
+        """
+        abandoned = _campaign(client, goal="left open")["campaign_id"]
+        live = _campaign(client, goal="being conducted")["campaign_id"]
+        _task(client, abandoned)
+        wanted = _task(client, live)
+        assert client.post(f"/campaigns/{abandoned}/conducted").status_code == 200
+        monkeypatch.setattr(store.time, "time", lambda real=store.time.time: real() + store.CONDUCTED_WITHIN_SECONDS + 1)
+        assert client.post(f"/campaigns/{live}/conducted").json()["conducted_at"] is not None
+
+        assert _claim(client, "s0").json()["task_id"] == wanted["task_id"]
+        assert _claim(client, "s1").status_code == 204
+        # Still there for a supervisor sent to that campaign by name.
+        assert _claim(client, "s2", campaign_id=abandoned).status_code == 200
+
+    def test_a_campaign_that_never_had_a_conductor_is_claimable(self, client):
+        cid = _campaign(client)["campaign_id"]
+        _task(client, cid)
+        assert _claim(client, "s0").status_code == 200
+
     def test_heartbeat_extends_the_lease(self, client):
         cid = _campaign(client)["campaign_id"]
         _task(client, cid)
@@ -343,7 +367,7 @@ class TestClaims:
         ).json()["state"] == "abandoned"
 
     def test_cancelling_a_finished_task_is_refused(self, client):
-        """Its result is already on the front; abandoning it would lose that."""
+        """Its result is already in; abandoning it would lose that."""
         cid = _campaign(client)["campaign_id"]
         _task(client, cid)
         task = _claim(client, "s0").json()
@@ -860,8 +884,8 @@ class TestResultsAreNarrowedForAContextWindow:
 
     Boltz reports ten per-molecule diagnostics beside the one objective they
     explain, which made a 25-molecule result ~22k characters. Two of those in
-    a turn overflowed the conductor's 32768-token context: the front fix alone
-    left the same question failing with "max_tokens ... got -2623".
+    a turn overflowed the conductor's 32768-token context, failing with
+    "max_tokens ... got -2623".
     """
 
     # The column set a real Boltz + QED candidate carries, because the ratio
@@ -915,7 +939,7 @@ class TestResultsAreNarrowedForAContextWindow:
     def test_the_signals_that_qualify_an_objective_are_kept(self, client):
         """An affinity with no confidence beside it gets narrated, not read.
 
-        Asked for the front's molecules with these dropped, the conductor
+        Asked for the best results' molecules with these dropped, the conductor
         asserted a quality gate it could not see, inventing PoseBusters
         numbers for a campaign that never ran PoseBusters.
         """
@@ -983,6 +1007,15 @@ class TestResultsAreNarrowedForAContextWindow:
         )
         assert "detail_hint" not in result
 
+    def test_narrowing_keeps_the_run_a_molecule_came_from(self, client):
+        """How the UI finds its complex; a molecule posted without one has none."""
+        cid = self._result(client, candidates=[{"smiles": "CCO", "job_id": "a1b2c3d4"}, {"smiles": "CCN"}])
+
+        with_run, without = client.get(f"/campaigns/{cid}/results").json()[0]["candidates"]
+
+        assert with_run["job_id"] == "a1b2c3d4"
+        assert "job_id" not in without
+
     def test_narrowing_survives_a_candidate_with_no_components(self, client):
         cid = self._result(client, candidates=[{"smiles": "CCO"}])
 
@@ -1001,135 +1034,6 @@ class TestResultsAreNarrowedForAContextWindow:
         full = client.get(f"/campaigns/{cid}/results?full=1").text
 
         assert len(narrow) < len(full) / 2
-
-
-# ---------------------------------------------------------------------------
-# Pareto front
-# ---------------------------------------------------------------------------
-
-
-class TestParetoFront:
-
-    def test_dominated_results_are_off_the_front(self, store):
-        results = [
-            {"task_id": "a", "objective_profile": {"x": 0.9, "y": 0.2}},
-            {"task_id": "b", "objective_profile": {"x": 0.2, "y": 0.9}},
-            {"task_id": "c", "objective_profile": {"x": 0.1, "y": 0.1}},
-        ]
-        front, ineligible = store.pareto_front(results, ["x", "y"])
-
-        assert {r["task_id"] for r in front} == {"a", "b"}
-        assert ineligible == []
-
-    def test_a_result_better_everywhere_takes_the_front_alone(self, store):
-        results = [
-            {"task_id": "best", "objective_profile": {"x": 0.9, "y": 0.9}},
-            {"task_id": "worse", "objective_profile": {"x": 0.8, "y": 0.8}},
-        ]
-        front, _ = store.pareto_front(results, ["x", "y"])
-        assert [r["task_id"] for r in front] == ["best"]
-
-    def test_identical_profiles_both_stay(self, store):
-        """Neither dominates, so dropping one would be arbitrary."""
-        results = [
-            {"task_id": "a", "objective_profile": {"x": 0.5, "y": 0.5}},
-            {"task_id": "b", "objective_profile": {"x": 0.5, "y": 0.5}},
-        ]
-        front, _ = store.pareto_front(results, ["x", "y"])
-        assert len(front) == 2
-
-    def test_a_missing_objective_is_reported_not_defaulted(self, store):
-        """A missing objective means a scorer failed; scoring it 0 would hide that."""
-        results = [
-            {"task_id": "ok", "objective_profile": {"x": 0.5, "y": 0.5}},
-            {"task_id": "partial", "objective_profile": {"x": 0.9}},
-        ]
-        front, ineligible = store.pareto_front(results, ["x", "y"])
-
-        assert [r["task_id"] for r in front] == ["ok"]
-        assert ineligible[0]["task_id"] == "partial"
-        assert ineligible[0]["missing_objectives"] == ["y"]
-
-    def test_a_null_objective_is_also_ineligible(self, store):
-        """Services return null for a molecule they could not score."""
-        results = [{"task_id": "nulled", "objective_profile": {"x": 0.5, "y": None}}]
-        front, ineligible = store.pareto_front(results, ["x", "y"])
-
-        assert front == []
-        assert ineligible[0]["missing_objectives"] == ["y"]
-
-    def test_the_front_reports_coordinates_not_molecules(self, client):
-        """A front with the molecules inline does not fit in a context window.
-
-        Three members with 25 candidates each came to ~42k tokens -- larger
-        on its own than the conductor model's 32768 -- so asking about the
-        front failed with "max_tokens must be at least 1, got -72257".
-        """
-        cid = _campaign(client)["campaign_id"]
-        _task(client, cid)
-        task = _claim(client, "s0").json()
-        client.post(
-            f"/tasks/{task['task_id']}/result",
-            json={
-                "owner": "s0",
-                "objective_profile": {"BoltzAffinity": 0.9, "QED": 0.8},
-                "candidates": [{"smiles": "CCO", "score": 0.9}] * 25,
-            },
-        )
-
-        member = client.get(f"/campaigns/{cid}/pareto").json()["front"][0]
-
-        assert "candidates" not in member
-        assert member["n_candidates"] == 25
-        assert member["task_id"] == task["task_id"]
-
-    def test_the_front_profile_is_only_the_campaigns_objectives(self, client):
-        """A stored profile can carry scorer diagnostics; they are not axes."""
-        cid = _campaign(client)["campaign_id"]
-        _task(client, cid)
-        task = _claim(client, "s0").json()
-        client.post(
-            f"/tasks/{task['task_id']}/result",
-            json={
-                "owner": "s0",
-                "objective_profile": {
-                    "BoltzAffinity": 0.9, "QED": 0.8,
-                    "confidence_score (BoltzAffinity)": 0.87,
-                    "std (logD)": 0.18,
-                },
-            },
-        )
-
-        member = client.get(f"/campaigns/{cid}/pareto").json()["front"][0]
-
-        assert set(member["objective_profile"]) == {"BoltzAffinity", "QED"}
-
-    def test_the_front_says_where_the_molecules_are(self, client):
-        cid = _campaign(client)["campaign_id"]
-
-        body = client.get(f"/campaigns/{cid}/pareto").json()
-
-        assert "get_supervisor_result" in body["molecules_hint"]
-
-    def test_front_endpoint_uses_the_campaigns_objectives(self, client):
-        cid = _campaign(client)["campaign_id"]
-        profiles = [
-            {"BoltzAffinity": 0.9, "QED": 0.2},
-            {"BoltzAffinity": 0.2, "QED": 0.9},
-            {"BoltzAffinity": 0.1, "QED": 0.1},
-        ]
-        for i, profile in enumerate(profiles):
-            _task(client, cid)
-            task = _claim(client, f"s{i}").json()
-            client.post(
-                f"/tasks/{task['task_id']}/result",
-                json={"owner": f"s{i}", "objective_profile": profile},
-            )
-
-        body = client.get(f"/campaigns/{cid}/pareto").json()
-        assert body["objectives"] == ["BoltzAffinity", "QED"]
-        assert body["n_results"] == 3
-        assert len(body["front"]) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1174,7 +1078,7 @@ class TestEventsAndStatus:
         assert again["events"] == []
         assert again["last_event_id"] == body["last_event_id"]
 
-    def test_status_reports_counts_in_flight_work_and_the_front(self, client):
+    def test_status_reports_counts_in_flight_work_and_results(self, client):
         cid = _campaign(client)["campaign_id"]
         _task(client, cid, weight_overrides={"QED": 0.5})
         _task(client, cid)
@@ -1183,6 +1087,7 @@ class TestEventsAndStatus:
         status = client.get(f"/campaigns/{cid}/status").json()
 
         assert status["task_counts"] == {"claimed": 1, "queued": 1}
+        assert status["n_results"] == 0
         assert len(status["in_flight"]) == 1
         assert status["in_flight"][0]["owner"] == "supervisor-0"
         assert status["in_flight"][0]["task_id"] == running["task_id"]
@@ -1312,3 +1217,470 @@ class TestDurability:
                 "/campaigns/old1/session", json={"session_id": "s-1"}
             )
             assert attached.json()["session_id"] == "s-1"
+
+
+# ---------------------------------------------------------------------------
+# Follow-ups a sub-agent proposed
+# ---------------------------------------------------------------------------
+
+
+def _reported(client, campaign_id, owner="s0", follow_ups=(), **overrides):
+    """One task taken and reported on, with whatever it proposed next."""
+
+    task = _task(client, campaign_id, kind="research",
+                 intent="Map the BD1/BD2 selectivity handles", **overrides)
+    claimed = _claim(client, owner).json()
+    posted = client.post(
+        f"/tasks/{claimed['task_id']}/result",
+        json={"owner": owner, "summary": "two handles", "report": "## Report\n\nfound them",
+              "follow_ups": list(follow_ups)},
+    )
+    assert posted.status_code == 200, posted.text
+    return task
+
+
+class TestProposals:
+    """A sub-agent proposes; the conductor disposes."""
+
+    FOLLOW_UP = {
+        "kind": "design",
+        "title": "Hold the triazole",
+        "intent": "Run RL holding the methyl-triazole and varying the fused ring.",
+    }
+
+    def test_what_a_report_proposes_waits_for_the_conductor(self, client):
+        campaign = _campaign(client)
+        _reported(client, campaign["campaign_id"], follow_ups=[self.FOLLOW_UP])
+
+        open_ones = client.get(f"/campaigns/{campaign['campaign_id']}/proposals").json()
+
+        assert len(open_ones) == 1
+        assert open_ones[0]["spec"]["title"] == "Hold the triazole"
+        assert open_ones[0]["state"] == "open"
+        # Proposed, not queued: nothing may claim it yet.
+        assert _claim(client, "s1").status_code == 204
+
+    def test_a_proposal_taken_becomes_a_task_derived_from_its_report(self, client):
+        campaign = _campaign(client)
+        source = _reported(client, campaign["campaign_id"], follow_ups=[self.FOLLOW_UP])
+        proposal = client.get(f"/campaigns/{campaign['campaign_id']}/proposals").json()[0]
+
+        taken = client.post(
+            f"/campaigns/{campaign['campaign_id']}/proposals/take",
+            json={"proposal_ids": [proposal["proposal_id"]]},
+        )
+
+        assert taken.status_code == 201, taken.text
+        task = taken.json()[0]
+        assert task["spec"]["intent"] == self.FOLLOW_UP["intent"]
+        assert task["spec"]["derived_from"] == [source["task_id"]]
+        assert _claim(client, "s1").json()["task_id"] == task["task_id"]
+        assert client.get(f"/campaigns/{campaign['campaign_id']}/proposals").json() == []
+
+    def test_a_proposal_is_taken_once(self, client):
+        campaign = _campaign(client)
+        _reported(client, campaign["campaign_id"], follow_ups=[self.FOLLOW_UP])
+        proposal = client.get(f"/campaigns/{campaign['campaign_id']}/proposals").json()[0]
+        body = {"proposal_ids": [proposal["proposal_id"]]}
+        client.post(f"/campaigns/{campaign['campaign_id']}/proposals/take", json=body)
+
+        again = client.post(f"/campaigns/{campaign['campaign_id']}/proposals/take", json=body)
+
+        assert again.status_code == 409
+
+    def test_a_proposal_dropped_is_not_offered_again(self, client):
+        campaign = _campaign(client)
+        _reported(client, campaign["campaign_id"], follow_ups=[self.FOLLOW_UP])
+        proposal = client.get(f"/campaigns/{campaign['campaign_id']}/proposals").json()[0]
+
+        client.post(
+            f"/campaigns/{campaign['campaign_id']}/proposals/drop",
+            json={"proposal_ids": [proposal["proposal_id"]]},
+        )
+
+        assert client.get(f"/campaigns/{campaign['campaign_id']}/proposals").json() == []
+        dropped = client.get(
+            f"/campaigns/{campaign['campaign_id']}/proposals?state=dropped"
+        ).json()
+        assert len(dropped) == 1
+
+    def test_a_follow_up_continues_its_tasks_workstream(self, client):
+        campaign = _campaign(client)
+        _reported(client, campaign["campaign_id"], workstream="selectivity",
+                  follow_ups=[self.FOLLOW_UP])
+
+        proposal = client.get(f"/campaigns/{campaign['campaign_id']}/proposals").json()[0]
+
+        assert proposal["spec"]["workstream"] == "selectivity"
+
+    def test_the_report_event_says_how_many_were_proposed(self, client):
+        """So the conductor is told to look without reading every report."""
+        campaign = _campaign(client)
+        _reported(client, campaign["campaign_id"], follow_ups=[self.FOLLOW_UP])
+
+        events = client.get(f"/campaigns/{campaign['campaign_id']}/events").json()["events"]
+
+        done = [e for e in events if e["kind"] == "task_done"]
+        assert done[0]["payload"]["n_follow_ups"] == 1
+
+    def test_a_report_proposing_nothing_leaves_no_proposals(self, client):
+        campaign = _campaign(client)
+        _reported(client, campaign["campaign_id"])
+
+        assert client.get(f"/campaigns/{campaign['campaign_id']}/proposals").json() == []
+
+
+# ---------------------------------------------------------------------------
+# Keeping the team supplied
+# ---------------------------------------------------------------------------
+
+
+class TestReadyQueue:
+
+    def test_a_batch_is_queued_whole(self, client):
+        campaign = _campaign(client)
+
+        queued = client.post(
+            f"/campaigns/{campaign['campaign_id']}/tasks/batch",
+            json={"tasks": [{"intent": f"question {i}", "kind": "question"} for i in range(3)]},
+        )
+
+        assert queued.status_code == 201, queued.text
+        assert len(queued.json()) == 3
+        assert len(client.get(f"/campaigns/{campaign['campaign_id']}/tasks").json()) == 3
+
+    def test_a_batch_with_one_bad_task_queues_none(self, client):
+        """Half a batch would leave the conductor guessing which half."""
+        campaign = _campaign(client)
+
+        refused = client.post(
+            f"/campaigns/{campaign['campaign_id']}/tasks/batch",
+            json={"tasks": [
+                {"intent": "fine", "kind": "question"},
+                {"intent": "derived from nothing", "kind": "question", "derived_from": ["nope"]},
+            ]},
+        )
+
+        assert refused.status_code == 400
+        assert client.get(f"/campaigns/{campaign['campaign_id']}/tasks").json() == []
+
+    def test_higher_priority_is_claimed_first_then_oldest(self, client):
+        campaign = _campaign(client)
+        first = _task(client, campaign["campaign_id"])
+        urgent = _task(client, campaign["campaign_id"], priority=2)
+        filler = _task(client, campaign["campaign_id"], priority=-1)
+        second = _task(client, campaign["campaign_id"])
+
+        order = [_claim(client, f"s{i}").json()["task_id"] for i in range(4)]
+
+        assert order == [urgent["task_id"], first["task_id"], second["task_id"], filler["task_id"]]
+
+    def test_who_ran_a_task_is_kept_after_it_is_done(self, client):
+        campaign = _campaign(client)
+        task = _reported(client, campaign["campaign_id"], owner="s7")
+
+        done = [t for t in client.get(f"/campaigns/{campaign['campaign_id']}/tasks").json()
+                if t["task_id"] == task["task_id"]][0]
+
+        assert done["lease_owner"] is None
+        assert done["claimed_by"] == "s7"
+
+    def test_the_status_says_how_deep_to_keep_the_queue(self, client):
+        campaign = _campaign(client, concurrency=5)
+
+        status = client.get(f"/campaigns/{campaign['campaign_id']}/status").json()
+
+        assert status["backlog_target"] == 3
+
+
+# ---------------------------------------------------------------------------
+# The plan and how the work covers it
+# ---------------------------------------------------------------------------
+
+
+PLAN = {"workstreams": [
+    {"id": "selectivity", "name": "BD1/BD2 selectivity", "question": "Which handle separates BD1 from BD2?"},
+    {"id": "admet", "name": "ADMET liabilities", "question": "What sinks the series in vivo?"},
+]}
+
+
+class TestPlan:
+
+    def test_a_plan_is_kept_on_the_campaign(self, client):
+        campaign = _campaign(client)
+
+        put = client.put(f"/campaigns/{campaign['campaign_id']}/plan", json=PLAN)
+
+        assert put.status_code == 200, put.text
+        stored = client.get(f"/campaigns/{campaign['campaign_id']}").json()["plan"]
+        assert [s["id"] for s in stored["workstreams"]] == ["selectivity", "admet"]
+        assert stored["workstreams"][0]["status"] == "open"
+
+    def test_workstream_ids_must_be_unique(self, client):
+        campaign = _campaign(client)
+        twice = {"workstreams": [PLAN["workstreams"][0], PLAN["workstreams"][0]]}
+
+        assert client.put(f"/campaigns/{campaign['campaign_id']}/plan", json=twice).status_code == 400
+
+    def test_coverage_shows_a_workstream_nobody_is_working_as_a_gap(self, client):
+        campaign = _campaign(client)
+        client.put(f"/campaigns/{campaign['campaign_id']}/plan", json=PLAN)
+        _task(client, campaign["campaign_id"], workstream="selectivity")
+
+        cover = client.get(f"/campaigns/{campaign['campaign_id']}/coverage").json()
+
+        by_id = {s["id"]: s for s in cover["workstreams"]}
+        assert by_id["selectivity"]["active"] == 1
+        assert cover["gaps"] == ["admet"]
+
+    def test_coverage_carries_the_latest_finding_and_proposals(self, client):
+        campaign = _campaign(client)
+        client.put(f"/campaigns/{campaign['campaign_id']}/plan", json=PLAN)
+        _reported(client, campaign["campaign_id"], workstream="selectivity",
+                  follow_ups=[TestProposals.FOLLOW_UP])
+
+        cover = client.get(f"/campaigns/{campaign['campaign_id']}/coverage").json()
+
+        selectivity = {s["id"]: s for s in cover["workstreams"]}["selectivity"]
+        assert selectivity["latest"]["summary"] == "two handles"
+        assert selectivity["proposals"] == 1
+        assert cover["open_proposals"] == 1
+
+    def test_work_outside_the_plan_is_counted_not_lost(self, client):
+        campaign = _campaign(client)
+        client.put(f"/campaigns/{campaign['campaign_id']}/plan", json=PLAN)
+        _task(client, campaign["campaign_id"])
+
+        cover = client.get(f"/campaigns/{campaign['campaign_id']}/coverage").json()
+
+        assert cover["workstreams"][-1]["id"] is None
+        assert cover["workstreams"][-1]["active"] == 1
+
+
+def _finding(client, campaign_id, **overrides):
+    body = {
+        "branch": "selectivity",
+        "claim": "The BD1 ZA channel tolerates a methyl where BD2 does not",
+        "evidence": ["10.1021/jm501245q"],
+        "author": "s0",
+    }
+    body.update(overrides)
+    response = client.post(f"/campaigns/{campaign_id}/findings", json=body)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+class TestAtlas:
+    """What the campaign knows, as opposed to what it has run."""
+
+    def test_a_finding_is_recorded_with_its_provenance(self, client):
+        cid = _campaign(client)["campaign_id"]
+
+        finding = _finding(client, cid, tags=["BD1", "ZA-channel"], confidence="high")
+
+        assert finding["branch"] == "selectivity"
+        assert finding["evidence"] == ["10.1021/jm501245q"]
+        assert finding["tags"] == ["BD1", "ZA-channel"]
+        assert finding["author"] == "s0"
+        assert finding["confidence"] == "high"
+        assert finding["superseded_by"] is None
+
+    def test_a_finding_needs_a_campaign_that_exists(self, client):
+        assert client.post(
+            "/campaigns/nope/findings",
+            json={"branch": "b", "claim": "c", "author": "s0"},
+        ).status_code == 404
+
+    def test_findings_come_back_newest_first_for_one_branch(self, client):
+        cid = _campaign(client)["campaign_id"]
+        _finding(client, cid, claim="older")
+        _finding(client, cid, claim="newer")
+        _finding(client, cid, branch="admet", claim="elsewhere")
+
+        listed = client.get(f"/campaigns/{cid}/findings?branch=selectivity").json()
+
+        assert [f["claim"] for f in listed["findings"]] == ["newer", "older"]
+
+    def test_superseding_hides_the_old_one_without_deleting_it(self, client):
+        """A campaign that believed something for two hours believed it."""
+        cid = _campaign(client)["campaign_id"]
+        old = _finding(client, cid, claim="IC50 is 40 nM")
+
+        new = _finding(client, cid, claim="IC50 is 400 nM", supersedes=old["finding_id"])
+
+        current = client.get(f"/campaigns/{cid}/findings").json()["findings"]
+        assert [f["claim"] for f in current] == ["IC50 is 400 nM"]
+        assert new["supersedes"] == old["finding_id"]
+
+        kept = client.get(f"/campaigns/{cid}/findings?include_superseded=true").json()
+        was = {f["finding_id"]: f for f in kept["findings"]}[old["finding_id"]]
+        assert was["superseded_by"] == new["finding_id"]
+
+    def test_one_campaign_cannot_supersede_another_campaigns_finding(self, client):
+        mine = _campaign(client)["campaign_id"]
+        theirs = _campaign(client)["campaign_id"]
+        elsewhere = _finding(client, theirs, claim="not yours")
+
+        response = client.post(
+            f"/campaigns/{mine}/findings",
+            json={"branch": "b", "claim": "c", "author": "s0",
+                  "supersedes": elsewhere["finding_id"]},
+        )
+
+        assert response.status_code == 404
+
+    def test_a_note_hangs_off_the_finding_it_answers(self, client):
+        cid = _campaign(client)["campaign_id"]
+        finding = _finding(client, cid)
+
+        noted = client.post(
+            f"/campaigns/{cid}/findings/{finding['finding_id']}/notes",
+            json={"body": "Our own run says otherwise", "stance": "disputes",
+                  "author": "s1"},
+        )
+
+        assert noted.status_code == 201, noted.text
+        listed = client.get(f"/campaigns/{cid}/findings").json()["findings"]
+        assert listed[0]["notes"][0]["stance"] == "disputes"
+        assert listed[0]["notes"][0]["author"] == "s1"
+
+    def test_a_note_needs_a_finding_in_this_campaign(self, client):
+        cid = _campaign(client)["campaign_id"]
+
+        assert client.post(
+            f"/campaigns/{cid}/findings/nope/notes",
+            json={"body": "x", "author": "s1"},
+        ).status_code == 404
+
+    def test_search_wants_every_word_somewhere_in_the_finding(self, client):
+        cid = _campaign(client)["campaign_id"]
+        _finding(client, cid, claim="Methyl on the ZA channel costs BD2 affinity",
+                 tags=["BD2"])
+        _finding(client, cid, claim="Microsomal clearance is the series liability")
+
+        hit = client.get(f"/campaigns/{cid}/findings?q=methyl+bd2").json()["findings"]
+        miss = client.get(f"/campaigns/{cid}/findings?q=methyl+clearance").json()["findings"]
+
+        assert len(hit) == 1 and hit[0]["tags"] == ["BD2"]
+        assert miss == []
+
+    def test_search_reaches_the_detail_and_the_tags(self, client):
+        cid = _campaign(client)["campaign_id"]
+        _finding(client, cid, claim="A handle exists", detail="Asn140 is the anchor",
+                 tags=["hinge"])
+
+        assert len(client.get(f"/campaigns/{cid}/findings?q=asn140").json()["findings"]) == 1
+        assert len(client.get(f"/campaigns/{cid}/findings?tag=hinge").json()["findings"]) == 1
+        assert client.get(f"/campaigns/{cid}/findings?tag=hing").json()["findings"] == []
+
+    def test_the_overview_shows_the_branches_the_plan_named_but_nobody_filled(self, client):
+        """The empty branch is the point: it is what nobody has settled."""
+        cid = _campaign(client)["campaign_id"]
+        client.put(f"/campaigns/{cid}/plan", json=PLAN)
+        _finding(client, cid, claim="BD1 tolerates it", tags=["BD1"])
+
+        atlas = client.get(f"/campaigns/{cid}/atlas").json()
+
+        by_branch = {b["branch"]: b for b in atlas["branches"]}
+        assert by_branch["selectivity"]["findings"] == 1
+        assert by_branch["selectivity"]["latest"]["claim"] == "BD1 tolerates it"
+        assert by_branch["selectivity"]["tags"] == ["BD1"]
+        assert by_branch["admet"]["findings"] == 0
+        assert atlas["empty_branches"] == ["admet"]
+
+    def test_the_overview_counts_what_is_disputed(self, client):
+        cid = _campaign(client)["campaign_id"]
+        finding = _finding(client, cid)
+        client.post(
+            f"/campaigns/{cid}/findings/{finding['finding_id']}/notes",
+            json={"body": "no", "stance": "disputes", "author": "s1"},
+        )
+        client.post(
+            f"/campaigns/{cid}/findings/{finding['finding_id']}/notes",
+            json={"body": "also no", "stance": "disputes", "author": "s2"},
+        )
+
+        atlas = client.get(f"/campaigns/{cid}/atlas").json()
+
+        branch = {b["branch"]: b for b in atlas["branches"]}["selectivity"]
+        assert branch["findings"] == 1
+        assert branch["disputed"] == 1
+
+    def test_one_spelling_per_branch(self, client):
+        """Free text is how a memory fragments: three spellings, one branch."""
+        cid = _campaign(client)["campaign_id"]
+        _finding(client, cid, branch="ADMET", claim="first")
+        _finding(client, cid, branch=" admet ", claim="second")
+
+        listed = client.get(f"/campaigns/{cid}/findings?branch=Admet").json()
+
+        assert [f["claim"] for f in listed["findings"]] == ["second", "first"]
+        atlas = client.get(f"/campaigns/{cid}/atlas").json()
+        assert [b["branch"] for b in atlas["branches"]] == ["admet"]
+
+    def test_a_workstream_meets_its_findings_whatever_the_plan_spells(self, client):
+        cid = _campaign(client)["campaign_id"]
+        client.put(f"/campaigns/{cid}/plan", json={"workstreams": [
+            {"id": "ADMET", "name": "ADMET liabilities"},
+        ]})
+        _finding(client, cid, branch="admet", claim="clearance sinks it")
+
+        atlas = client.get(f"/campaigns/{cid}/atlas").json()
+
+        assert len(atlas["branches"]) == 1
+        assert atlas["branches"][0]["in_plan"] is True
+        assert atlas["branches"][0]["findings"] == 1
+        assert atlas["empty_branches"] == []
+
+    def test_a_branch_outside_the_plan_still_shows(self, client):
+        cid = _campaign(client)["campaign_id"]
+        client.put(f"/campaigns/{cid}/plan", json=PLAN)
+        _finding(client, cid, branch="synthesis")
+
+        atlas = client.get(f"/campaigns/{cid}/atlas").json()
+
+        by_branch = {b["branch"]: b for b in atlas["branches"]}
+        assert by_branch["synthesis"]["in_plan"] is False
+        assert by_branch["selectivity"]["in_plan"] is True
+
+    def test_recording_a_finding_reaches_the_event_feed(self, client):
+        """The watcher drives the UI off events, so a silent write is invisible."""
+        cid = _campaign(client)["campaign_id"]
+
+        _finding(client, cid)
+
+        kinds = [e["kind"] for e in client.get(f"/campaigns/{cid}/events").json()["events"]]
+        assert "finding_recorded" in kinds
+
+
+class TestMetrics:
+
+    def test_a_campaign_nobody_has_claimed_from_has_no_utilisation(self, client):
+        campaign = _campaign(client, concurrency=2)
+        _task(client, campaign["campaign_id"])
+
+        metrics = client.get(f"/campaigns/{campaign['campaign_id']}/metrics").json()
+
+        assert metrics["utilisation"] is None
+        assert metrics["queued"] == 1
+        assert metrics["free_slots"] == 2
+
+    def test_a_running_task_holds_a_slot(self, client):
+        campaign = _campaign(client, concurrency=2)
+        _task(client, campaign["campaign_id"])
+        _claim(client, "s0")
+
+        metrics = client.get(f"/campaigns/{campaign['campaign_id']}/metrics").json()
+
+        assert metrics["running"] == 1
+        assert metrics["free_slots"] == 1
+
+    def test_the_wait_between_tasks_is_timed_per_sub_agent(self, client):
+        campaign = _campaign(client)
+        _reported(client, campaign["campaign_id"], owner="s0")
+        _reported(client, campaign["campaign_id"], owner="s0")
+
+        metrics = client.get(f"/campaigns/{campaign['campaign_id']}/metrics").json()
+
+        assert metrics["handoffs"] == 1
+        assert metrics["handoff_seconds"]["median"] >= 0

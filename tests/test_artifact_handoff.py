@@ -34,6 +34,12 @@ import yaml
 
 _ROOT = Path(__file__).resolve().parent.parent
 
+# services/boltz2/app.py, loaded further down, locks its worker pool with
+# fcntl, a POSIX-only module, so this file cannot be imported at all on a
+# Windows checkout -- and an import error during collection aborts the whole
+# `pytest tests/` run rather than just this module.
+pytest.importorskip("fcntl")
+
 _handoff_spec = importlib.util.spec_from_file_location(
     "verify_artifact_handoff",
     str(_ROOT / "k8s" / "scripts" / "verify-artifact-handoff.py"),

@@ -254,15 +254,31 @@ def test_an_unknown_effort_is_refused(agents, effort):
         assert agents[0].backend.reasoning_effort is None
 
 
-def test_a_second_question_during_a_turn_is_refused_to_that_browser_only(agents):
+def test_a_second_question_during_a_turn_is_kept_and_answered(agents):
+    """Refusing it lost it: the browser had already cleared the box."""
     with TestClient(server.create_app()) as client, client.websocket_connect("/api/chat") as ws:
         session_id = receive_until(ws, "session")["id"]
         ws.send_json({"type": "user_message", "content": "Design a ligand"})
         receive_until(ws, "status")
         ws.send_json({"type": "user_message", "content": "and another"})
-        assert "still working" in receive_until(ws, "notice")["message"]
+        echoed = receive_until(ws, "user_message")
+        assert echoed["content"] == "and another"
+        assert echoed["interjected"] is True
         events = client.get(f"/api/sessions/{session_id}/events").json()["events"]
-        assert [e["type"] for e in events] == ["user_message", "status"]
+        assert [e["type"] for e in events] == ["user_message", "status", "user_message"]
+        # The fake never looks at its inbox, so the next turn answers it.
+        ws.send_json({"type": "cancel"})
+        receive_until(ws, "cancelled")
+        assert receive_until(ws, "status")["state"] == "idle"
+        assert receive_until(ws, "status")["state"] == "busy"
+
+        def asked() -> list[str]:
+            return [m["content"] for m in agents[0].backend.history if m["role"] == "user"]
+
+        deadline = time.monotonic() + 5
+        while len(asked()) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "and another" in asked()[-1]
         ws.send_json({"type": "cancel"})
         receive_until(ws, "cancelled")
 
@@ -826,6 +842,139 @@ def test_a_purge_needs_a_list_of_item_ids(stored, body):
     assert stored["upload"].exists()
 
 
+def test_stopping_a_conversation_ends_its_campaigns_and_its_running_runs(stored, monkeypatch):
+    from reinvent4_agent import campaign_client, conducting
+
+    called: list[tuple[str, dict]] = []
+    wound_down: list[str] = []
+
+    async def call_tool(self, name, arguments):
+        called.append((name, arguments))
+        return "{}"
+
+    class Ledger:
+        def campaigns(self, session_id=None):
+            assert session_id == DATA_SID
+            return [{"campaign_id": "open1", "state": "dispatching"}, {"campaign_id": "over1", "state": "finalized"}]
+
+    monkeypatch.setattr(server.AgentGateway, "call_tool", call_tool)
+    monkeypatch.setattr(campaign_client, "CampaignStoreClient", Ledger)
+    monkeypatch.setattr(conducting.REGISTRY, "wind_down", wound_down.append)
+    with TestClient(server.create_app()) as client:
+        body = client.post(f"/api/sessions/{DATA_SID}/stop").json()
+
+    assert body == {"campaigns": ["open1"], "runs": ["def67890"], "problems": []}
+    assert wound_down == ["open1"]
+    assert called == [("stop_optimization", {"job_id": "def67890"})]
+
+
+class _Ledger:
+    """One campaign with a task, as the fleet view reads it."""
+
+    def tasks(self, campaign_id):
+        return [{"task_id": "t1", "state": "claimed", "lease_owner": "s0"}]
+
+    def events(self, campaign_id, since=0):
+        return {"events": [], "next": since}
+
+    def campaign(self, campaign_id):
+        return {"campaign_id": campaign_id}
+
+    def results(self, campaign_id):
+        return []
+
+    def supervisors(self, campaign_id):
+        return {"supervisors": []}
+
+    def metrics(self, campaign_id):
+        return {"utilisation": 0.5, "running": 1}
+
+
+def test_a_campaign_is_read_with_how_busy_its_team_is(stored, monkeypatch):
+    from reinvent4_agent import campaign_client
+
+    monkeypatch.setattr(campaign_client, "CampaignStoreClient", _Ledger)
+    with TestClient(server.create_app()) as client:
+        body = client.get("/api/fleet/campaigns/feed0001").json()
+
+    assert body["metrics"] == {"utilisation": 0.5, "running": 1}
+
+
+def test_a_store_without_metrics_still_shows_the_campaign(stored, monkeypatch):
+    from reinvent4_agent import campaign_client
+
+    class Older(_Ledger):
+        def metrics(self, campaign_id):
+            raise campaign_client.StoreUnavailable("404 Not Found")
+
+    monkeypatch.setattr(campaign_client, "CampaignStoreClient", Older)
+    with TestClient(server.create_app()) as client:
+        body = client.get("/api/fleet/campaigns/feed0001").json()
+
+    assert body["metrics"] is None
+    assert body["tasks"][0]["ran_by"] == "s0"
+
+
+class _Atlas:
+    """A campaign that knows two things about ADMET and nothing about selectivity."""
+
+    shown = 2
+
+    def atlas(self, campaign_id):
+        return {
+            "campaign_id": campaign_id, "goal": "Beat JQ1", "findings": 2,
+            "branches": [
+                {"branch": "admet", "name": "ADMET", "in_plan": True, "findings": 2, "disputed": 1, "latest": None, "tags": []},
+                {"branch": "selectivity", "name": "Selectivity", "in_plan": True, "findings": 0, "disputed": 0, "latest": None, "tags": []},
+            ],
+            "empty_branches": ["selectivity"],
+        }
+
+    def findings(self, campaign_id, branch=None, q=None, tag=None, limit=50):
+        assert limit == server.FINDINGS_SHOWN
+        found = [{"finding_id": "f1", "branch": "admet", "claim": "Morpholine fixes solubility", "notes": []},
+                 {"finding_id": "f2", "branch": "admet", "claim": "hERG is the risk", "notes": [{"stance": "disputes"}]}]
+        return {"campaign_id": campaign_id, "branch": None, "findings": found[: self.shown]}
+
+
+def test_what_a_campaign_knows_is_read_with_its_findings(monkeypatch):
+    from reinvent4_agent import campaign_client
+
+    monkeypatch.setattr(campaign_client, "CampaignStoreClient", _Atlas)
+    with TestClient(server.create_app()) as client:
+        body = client.get("/api/fleet/campaigns/feed0001/atlas").json()
+
+    assert body["empty_branches"] == ["selectivity"]
+    assert [item["finding_id"] for item in body["items"]] == ["f1", "f2"]
+    assert body["truncated"] is False
+
+
+def test_a_capped_read_of_findings_says_so(monkeypatch):
+    # A branch that looks emptier than it is reads as the campaign knowing less.
+    from reinvent4_agent import campaign_client
+
+    class Capped(_Atlas):
+        shown = 1
+
+    monkeypatch.setattr(campaign_client, "CampaignStoreClient", Capped)
+    with TestClient(server.create_app()) as client:
+        assert client.get("/api/fleet/campaigns/feed0001/atlas").json()["truncated"] is True
+
+
+def test_what_a_campaign_knows_is_unknown_while_the_ledger_is_away(monkeypatch):
+    from reinvent4_agent import campaign_client
+
+    class Away(_Atlas):
+        def atlas(self, campaign_id):
+            raise campaign_client.StoreUnavailable("connection refused")
+
+    monkeypatch.setattr(campaign_client, "CampaignStoreClient", Away)
+    with TestClient(server.create_app()) as client:
+        response = client.get("/api/fleet/campaigns/feed0001/atlas")
+    assert response.status_code == 503
+    assert "what campaign feed0001 knows" in response.json()["detail"]
+
+
 def test_the_data_of_an_unknown_conversation_is_not_found(agents):
     with TestClient(server.create_app()) as client:
         assert client.get("/api/sessions/s-20990101-000000-abcdef/data").status_code == 404
@@ -839,3 +988,33 @@ def test_rcsb_failures_are_reported(shared, rcsb):
         response = client.post("/api/uploads/rcsb", json={"id": "9BAD", "session": "new"})
         assert response.status_code == 502
         assert "9BAD" in response.json()["detail"]
+
+
+# -- who ran which task of a campaign ------------------------------------------
+
+
+class _History:
+    """A ledger's event feed, served in pages as the store serves it."""
+
+    def __init__(self, events: list[dict], page: int = 2) -> None:
+        self._events = [{"event_id": n + 1, **event} for n, event in enumerate(events)]
+        self._page = page
+
+    def events(self, campaign_id: str, since: int = 0) -> dict:
+        page = [event for event in self._events if event["event_id"] > since][: self._page]
+        return {"events": page, "last_event_id": page[-1]["event_id"] if page else since}
+
+
+def _claim(task_id: str, owner: str) -> dict:
+    return {"kind": "task_claimed", "task_id": task_id, "payload": {"owner": owner}}
+
+
+def test_a_finished_task_still_names_the_sub_agent_that_ran_it():
+    """The ledger forgets the owner when the task is done; the history does not."""
+    history = _History([_claim("t1", "sup-a"), {"kind": "task_done", "task_id": "t1", "payload": {}}])
+    assert server.task_runners(history, "c1") == {"t1": "sup-a"}
+
+
+def test_a_task_claimed_again_belongs_to_the_last_claim():
+    history = _History([_claim("t1", "sup-a"), _claim("t2", "sup-b"), _claim("t1", "sup-c")])
+    assert server.task_runners(history, "c1") == {"t1": "sup-c", "t2": "sup-b"}
