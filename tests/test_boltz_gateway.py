@@ -335,6 +335,20 @@ class TestCacheKeying:
 
         assert gateway.prediction_params(params)["msa_path"] == "brd4.a3m"
 
+    def test_progress_id_is_forwarded_but_does_not_split_the_cache(self):
+        first = gateway.ScoreParams(
+            protein_sequence=SEQUENCE, progress_id="job-one"
+        )
+        second = gateway.ScoreParams(
+            protein_sequence=SEQUENCE, progress_id="job-two"
+        )
+
+        assert gateway.prediction_params(first)["progress_id"] == "job-one"
+        assert gateway.molecule_key(ETHANOL, first) == gateway.molecule_key(
+            ETHANOL, second
+        )
+        assert gateway.coalesce_key(first) == gateway.coalesce_key(second)
+
     def test_editing_the_msa_invalidates_the_key(self, tmp_path, monkeypatch):
         monkeypatch.setattr(gateway, "SHARED_DIR", tmp_path)
         path = tmp_path / "a.a3m"

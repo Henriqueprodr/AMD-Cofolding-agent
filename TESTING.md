@@ -1339,6 +1339,22 @@ The gateway reduces how much prediction is asked for at all. See
 | 76 | Hit rate is reported | `curl -s http://localhost:8091/stats` through a port-forward | `cache.hit_rate` 0.5 after one cold and one warm run, `coalescing.molecules_per_call`, `queue.*` and latency percentiles. This is the number §5.4's admission control has always had to assume |
 | 77 | Submit and poll | `curl -s -X POST "http://localhost:8091/score?mode=async" -d @batch.json`, then `GET /result/{task_id}` | `202` with a `task_id`, `202` while queued or predicting, `200` with the scores once, then `404` — results are served once so the registry cannot grow without bound |
 
+### Questionnaire follow-up regressions
+
+- Single-agent campaign bootstrap and reuse: `pytest tests/test_web_agents.py -v`.
+  Verifies that a one-agent conversation gets a durable goal and one attached
+  campaign id, rather than an empty Campaign Overview or duplicate campaigns.
+- Structure-selected TTPs and Boltz templates: `pytest tests/test_ttp.py -v`.
+  Verifies that structure metadata is accepted and its curated template is
+  translated to Boltz's `structure_template` request.
+- Exact run size and molecule progress plumbing:
+  `pytest tests/test_optimization.py -v`. Verifies that a TTP's generation
+  contract supplies its requested steps and batch size, and that a Boltz
+  progress id/record survives through the job manager.
+- TTP endpoint grouping, structure payloads, and generation contracts:
+  `cd services/ui/frontend && npm test -- --run src/lib/ttp.test.ts
+  src/lib/ttpRun.test.ts src/components/TtpBuilder/ObjectivePicker.test.tsx`.
+
 ---
 
 ## Test Matrix Summary

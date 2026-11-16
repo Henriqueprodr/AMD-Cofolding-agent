@@ -79,6 +79,17 @@ describe("parseJobs", () => {
     expect(local).toMatchObject({ slurmJobId: null, usesBoltz: null });
   });
 
+  it("reads molecule progress for the Boltz batch in the current step", () => {
+    const [parsed] = parseJobs([
+      { ...job, batch_size: 4, molecules_completed: 2, molecules_expected: 4 },
+    ]);
+    expect(parsed).toMatchObject({
+      batchSize: 4,
+      moleculesCompleted: 2,
+      moleculesExpected: 4,
+    });
+  });
+
   it("is empty for anything that is not a list", () => {
     expect(parseJobs({ error: "x" })).toEqual([]);
     expect(parseJobs(null)).toEqual([]);

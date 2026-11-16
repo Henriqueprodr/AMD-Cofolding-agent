@@ -371,7 +371,7 @@ function RunLine({ job, entry, now, title, stopping, error, confirming, onConfir
   return (
     <>
       <button type="button" onClick={() => openRun(job.id, "jobs")} className="col-span-8 grid min-w-0 cursor-pointer grid-cols-subgrid items-center text-left">
-        <span aria-hidden="true" className="size-1.5 animate-pulse rounded-full" style={{ background: "var(--color-accent)" }} />
+        <MoleculeStepProgress job={job} />
         <span className="font-medium">{job.state === "queued" ? "Starting" : stopping ? "Stopping" : ""}</span>
         <span className="text-faint min-w-0 truncate">{error ? <span style={{ color: "var(--color-accent)" }}>{error}</span> : title}</span>
         <Bar fraction={progress.fraction ?? 0} />
@@ -395,6 +395,28 @@ function RunLine({ job, entry, now, title, stopping, error, confirming, onConfir
         )}
       </Actions>
     </>
+  );
+}
+
+/** Compact progress for the Boltz batch currently blocking this RL step. */
+function MoleculeStepProgress({ job }: { job: JobSummary }) {
+  const done = job.moleculesCompleted;
+  const total = job.moleculesExpected;
+  if (done == null || total == null || total <= 0) {
+    return <span aria-hidden="true" className="size-1.5 animate-pulse rounded-full" style={{ background: "var(--color-accent)" }} />;
+  }
+  const fraction = Math.max(0, Math.min(1, done / total));
+  const label = `${done}/${total} cofolded in this step`;
+  return (
+    <span
+      role="img"
+      aria-label={label}
+      title={label}
+      className="grid size-5 shrink-0 place-items-center rounded-full"
+      style={{ background: `conic-gradient(var(--color-accent) ${fraction * 360}deg, var(--border-subtle) 0deg)` }}
+    >
+      <span className="bg-sunken grid size-3.5 place-items-center rounded-full text-[7px] font-semibold tabular-nums">{done}</span>
+    </span>
   );
 }
 

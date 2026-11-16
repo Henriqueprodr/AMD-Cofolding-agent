@@ -249,7 +249,9 @@ def params_digest(params: ScoreParams) -> str:
         {
             key: value
             for key, value in prediction_params(params).items()
-            if key != "msa_path"
+            # Observability identifies the caller, not the prediction. Keeping
+            # it in the digest would defeat cache reuse between runs.
+            if key not in {"msa_path", "progress_id"}
         },
         sort_keys=True,
         default=str,

@@ -311,11 +311,16 @@ class JobInfo:
             d["error"] = self.error
         if self.job_type == JobType.OPTIMIZATION:
             d["max_steps"] = self.max_steps
+            d["batch_size"] = job_batch_size(self)
             d["csv_path"] = str(self.csv_path)
             d["checkpoint_path"] = str(self.checkpoint_path)
             d["has_checkpoint"] = self.checkpoint_path.exists()
             if self.uses_boltz is not None:
                 d["uses_boltz"] = self.uses_boltz
+            molecule_progress = boltz_molecule_progress(self.job_id)
+            if molecule_progress is not None:
+                d["molecules_completed"] = molecule_progress["completed"]
+                d["molecules_expected"] = molecule_progress["total"]
         else:
             d["num_epochs"] = self.num_epochs
             if self.output_model_file:
@@ -396,6 +401,7 @@ class JobManager:
         job_id = str(uuid.uuid4())[:8]
         job_dir = self._working_root / f"job_{job_id}"
         job_dir.mkdir(parents=True, exist_ok=True)
+        _inject_boltz_progress_id(scorer_config, job_id)
 
         smiles_file_path: Optional[str] = None
         if seed_smiles:
@@ -1675,6 +1681,38 @@ class JobManager:
 # ---------------------------------------------------------------------------
 # Module-level helpers for CSV analysis
 # ---------------------------------------------------------------------------
+
+
+def _inject_boltz_progress_id(value: Any, job_id: str) -> None:
+    """Tag every Boltz endpoint so its blocked batch can publish progress."""
+
+    if isinstance(value, dict):
+        if value.get("service") == "boltz":
+            value["progress_id"] = job_id
+        for child in value.values():
+            _inject_boltz_progress_id(child, job_id)
+    elif isinstance(value, list):
+        for child in value:
+            _inject_boltz_progress_id(child, job_id)
+
+
+def boltz_molecule_progress(job_id: str) -> Optional[dict[str, int]]:
+    """Read the small atomic progress record written by the Boltz service."""
+
+    path = (
+        Path(os.environ.get("IP_SHARED_DIR", "/shared"))
+        / "progress"
+        / f"boltz_{job_id}.json"
+    )
+    try:
+        payload = json.loads(path.read_text())
+        completed = int(payload["completed"])
+        total = int(payload["total"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    if total <= 0 or completed < 0:
+        return None
+    return {"completed": min(completed, total), "total": total}
 
 
 def job_batch_size(job: JobInfo) -> int:

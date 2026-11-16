@@ -31,6 +31,8 @@ from reinvent4_mcp.jobs.manager import (
     JobInfo,
     JobManager,
     JobState,
+    _inject_boltz_progress_id,
+    boltz_molecule_progress,
     _component_health,
     _compute_diagnostics,
     _generate_recommendations,
@@ -53,6 +55,31 @@ from reinvent4_mcp.jobs.toml_generator import (
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+def test_boltz_progress_id_and_atomic_record(tmp_path, monkeypatch):
+    scorer = {
+        "component": [
+            {
+                "ExternalRESTScorer": {
+                    "endpoint": [{"params": {"service": "boltz"}}]
+                }
+            }
+        ]
+    }
+    _inject_boltz_progress_id(scorer, "job123")
+    assert (
+        scorer["component"][0]["ExternalRESTScorer"]["endpoint"][0]["params"][
+            "progress_id"
+        ]
+        == "job123"
+    )
+
+    monkeypatch.setenv("IP_SHARED_DIR", str(tmp_path))
+    progress = tmp_path / "progress" / "boltz_job123.json"
+    progress.parent.mkdir()
+    progress.write_text('{"completed": 3, "total": 8}')
+    assert boltz_molecule_progress("job123") == {"completed": 3, "total": 8}
 
 MINIMAL_SCORER_CONFIG = {
     "type": "geometric_mean",
@@ -2242,6 +2269,40 @@ class TestRunOptimizationTool:
         assert result["ttp_id"] == "test-opt-ttp"
         mock_mgr.return_value.create_and_start.assert_called_once()
 
+    @patch("reinvent4_mcp.jobs.manager.get_job_manager")
+    @patch("reinvent4_mcp.ttp.mapper.ttp_to_scorer_config")
+    @patch("reinvent4_mcp.ttp.mapper.get_mapper_summary")
+    @patch("reinvent4_mcp.tools.ttp.resolve_ttp")
+    def test_stored_generation_contract_supplies_exact_run_size(
+        self, mock_resolve, mock_summary, mock_scorer, mock_mgr
+    ):
+        from reinvent4_mcp.tools.optimization import run_optimization
+        from reinvent4_mcp.ttp.schema import TTP
+
+        ttp = TTP.model_validate({
+            **MINIMAL_TTP,
+            "generation": {
+                "mode": "reinvent",
+                "model": ".reinvent",
+                "n_steps": 4,
+                "batch_size": 4,
+            },
+        })
+        mock_resolve.return_value = ttp
+        mock_scorer.return_value = {"type": "geometric_mean", "component": [{"QED": {}}]}
+        mock_summary.return_value = {"n_total_components": 1}
+        mock_mgr.return_value.create_and_start.return_value = {
+            "job_id": "small",
+            "state": "running",
+        }
+
+        result = run_optimization(ttp_id=ttp.id)
+
+        assert result["job_id"] == "small"
+        kwargs = mock_mgr.return_value.create_and_start.call_args.kwargs
+        assert kwargs["max_steps"] == 4
+        assert kwargs["batch_size"] == 4
+
     @patch("reinvent4_mcp.tools.ttp.resolve_ttp")
     def test_run_with_bad_ttp(self, mock_resolve):
         from reinvent4_mcp.tools.optimization import run_optimization
@@ -2832,6 +2893,9 @@ class TestMol2MolValidation:
         self, mock_resolve, mock_summary, mock_scorer, mock_mgr,
     ):
         from reinvent4_mcp.tools.optimization import run_optimization
+        from reinvent4_mcp.ttp.schema import TTP
+
+        mock_resolve.return_value = TTP.model_validate(MINIMAL_TTP)
 
         result = run_optimization(
             ttp_id="test-ttp",
@@ -2839,7 +2903,6 @@ class TestMol2MolValidation:
         )
         assert "error" in result
         assert "seed_smiles" in result["error"]
-        mock_resolve.assert_not_called()
 
     @patch("reinvent4_mcp.jobs.manager.get_job_manager")
     @patch("reinvent4_mcp.ttp.mapper.ttp_to_scorer_config")
@@ -2849,6 +2912,9 @@ class TestMol2MolValidation:
         self, mock_resolve, mock_summary, mock_scorer, mock_mgr,
     ):
         from reinvent4_mcp.tools.optimization import run_optimization
+        from reinvent4_mcp.ttp.schema import TTP
+
+        mock_resolve.return_value = TTP.model_validate(MINIMAL_TTP)
 
         result = run_optimization(ttp_id="test-ttp", model=".m2m_medium")
         assert "error" in result

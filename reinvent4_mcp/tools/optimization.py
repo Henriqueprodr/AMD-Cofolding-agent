@@ -107,6 +107,25 @@ def run_optimization(
     from reinvent4_mcp.ttp.schema import TTP as TTPModel
     from reinvent4_mcp.ttp.schema import GenerationMode
 
+    resolved = resolve_ttp(ttp_id=ttp_id, ttp_data=ttp)
+    if isinstance(resolved, dict):
+        return resolved
+
+    assert isinstance(resolved, TTPModel)
+    generation = resolved.generation
+    if generation is not None:
+        # The builder stores exact settings on the TTP because a natural-
+        # language request is not a reliable transport for batch size.
+        if model == ".reinvent":
+            model = getattr(generation, "model", model)
+        if max_steps is None:
+            max_steps = getattr(generation, "n_steps", None)
+        if batch_size is None:
+            batch_size = getattr(generation, "batch_size", None)
+        mol2mol_input = getattr(generation, "mol2mol_input", None)
+        if seed_smiles is None and mol2mol_input is not None:
+            seed_smiles = mol2mol_input.seed_smiles
+
     is_mol2mol = _is_mol2mol_model(model)
     if is_mol2mol and not seed_smiles:
         return {
@@ -162,12 +181,6 @@ def run_optimization(
                     len(stripped), stripped,
                 )
             seed_smiles = cleaned
-
-    resolved = resolve_ttp(ttp_id=ttp_id, ttp_data=ttp)
-    if isinstance(resolved, dict):
-        return resolved
-
-    assert isinstance(resolved, TTPModel)
 
     # This path builds de novo and Mol2Mol TOML only. A TTP asking for a
     # scaffold or linker run would otherwise launch the default prior and

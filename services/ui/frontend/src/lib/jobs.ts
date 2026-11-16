@@ -26,6 +26,10 @@ export interface JobSummary {
   finishedAt: string | null;
   error: string | null;
   maxSteps: number | null;
+  batchSize?: number | null;
+  /** Molecules Boltz has completed in the current REINVENT step. */
+  moleculesCompleted?: number | null;
+  moleculesExpected?: number | null;
   numEpochs: number | null;
   csvPath: string | null;
   checkpointPath: string | null;
@@ -142,6 +146,9 @@ export function parseJob(raw: unknown): JobSummary | null {
     finishedAt: str(d.finished_at),
     error: str(d.error),
     maxSteps: num(d.max_steps),
+    batchSize: num(d.batch_size),
+    moleculesCompleted: num(d.molecules_completed),
+    moleculesExpected: num(d.molecules_expected),
     numEpochs: num(d.num_epochs),
     csvPath: str(d.csv_path),
     checkpointPath: str(d.checkpoint_path),

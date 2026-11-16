@@ -19,7 +19,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
@@ -206,6 +206,9 @@ class ScoreParams(BaseModel):
     # Optional structure template for pocket-conditioned ligand placement.
     # None preserves the original sequence-only behavior.
     structure_template: Optional["StructureTemplate"] = None
+    # The job manager injects this opaque id so molecule-level progress can
+    # be read while REINVENT is blocked on the batch response.
+    progress_id: Optional[str] = None
 
 
 class ScoreRequest(BaseModel):
@@ -714,10 +717,63 @@ class _PredictionHandle:
                 _kill_process_group(p)
 
 
+class _BatchProgress:
+    """Atomically publish completed molecules across all GCD shards."""
+
+    def __init__(self, progress_id: Optional[str], total: int, completed: int = 0) -> None:
+        safe = "".join(ch for ch in (progress_id or "") if ch.isalnum() or ch in "-_")
+        self.path = SHARED_DIR / "progress" / f"boltz_{safe}.json" if safe else None
+        self.total = total
+        self._counts: dict[int, int] = {-1: completed}
+        self._lock = threading.Lock()
+        self._write()
+
+    def update(self, shard: int, completed: int) -> None:
+        with self._lock:
+            self._counts[shard] = completed
+            self._write()
+
+    def finish(self) -> None:
+        with self._lock:
+            self._counts = {-1: self.total}
+            self._write()
+
+    def _write(self) -> None:
+        if self.path is None:
+            return
+        payload = {
+            "completed": min(self.total, sum(self._counts.values())),
+            "total": self.total,
+        }
+        temporary = self.path.with_suffix(".tmp")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(payload))
+            temporary.replace(self.path)
+        except OSError:
+            # Observability must never turn a successful GPU prediction into
+            # a failed scoring call when the shared progress path is read-only.
+            logger.warning("Could not publish Boltz progress to %s", self.path, exc_info=True)
+            self.path = None
+
+
+def _completed_predictions(out_dir: Path) -> int:
+    """Count molecules whose confidence output has reached the filesystem."""
+
+    return sum(
+        1
+        for path in out_dir.glob(
+            "boltz_results_*/predictions/mol_*/confidence_*_model_0.json"
+        )
+        if path.is_file()
+    )
+
+
 def _run_predict(
     cmd: list[str],
     handle: Optional[_PredictionHandle] = None,
     extra_env: Optional[dict[str, str]] = None,
+    on_progress: Optional[Callable[[], None]] = None,
 ) -> subprocess.CompletedProcess:
     env = {**os.environ, **(extra_env or {})} if extra_env else None
     logger.info("Running%s: %s", f" (env: {extra_env})" if extra_env else "", " ".join(cmd))
@@ -740,6 +796,15 @@ def _run_predict(
             _kill_process_group(proc)
             proc.communicate()
             raise PredictionCancelled()
+    stopped = threading.Event()
+    watcher: Optional[threading.Thread] = None
+    if on_progress is not None:
+        def watch() -> None:
+            while not stopped.wait(1.0):
+                on_progress()
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
     try:
         stdout, stderr = proc.communicate(timeout=PREDICT_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
@@ -752,6 +817,12 @@ def _run_predict(
         _kill_process_group(proc)
         proc.communicate()
         raise
+    finally:
+        stopped.set()
+        if watcher is not None:
+            watcher.join(timeout=2)
+        if on_progress is not None:
+            on_progress()
 
     # The request coroutine may have killed the process group concurrently
     # (client disconnect). Surface that as a cancellation rather than a
@@ -1090,6 +1161,7 @@ def _run_prediction_shard(
     use_server_flag: bool,
     msa_free: bool,
     template_dict: Optional[dict],
+    progress: _BatchProgress,
 ) -> ScoreResponse:
     """Run boltz predict for one GCD shard and map results to n_total positions.
 
@@ -1114,7 +1186,12 @@ def _run_prediction_shard(
     # Pin this subprocess to its GCD so shards don't collide on one die.
     # ROCR reads this against the driver's numbering, not against the set the
     # parent was given, so it has to be the physical id.
-    result = _run_predict(cmd, handle, extra_env={"ROCR_VISIBLE_DEVICES": str(gcd_idx)})
+    result = _run_predict(
+        cmd,
+        handle,
+        extra_env={"ROCR_VISIBLE_DEVICES": str(gcd_idx)},
+        on_progress=lambda: progress.update(gcd_idx, _completed_predictions(out_dir)),
+    )
 
     if result.returncode != 0:
         logger.error("shard %s boltz predict failed:\nstdout: %s\nstderr: %s",
@@ -1325,6 +1402,11 @@ def _run_prediction(
                     )
 
         note = msa_note or seq_note
+        progress = _BatchProgress(
+            params.progress_id,
+            n_total,
+            completed=max(0, n_total - len(valid_smiles)),
+        )
 
         # --- Multi-slot: shard the batch across GCDs concurrently ----------
         if _N_BOLTZ_SLOTS > 1:
@@ -1355,6 +1437,7 @@ def _run_prediction(
                     use_server_flag=use_server_flag,
                     msa_free=msa_free,
                     template_dict=template_dict,
+                    progress=progress,
                 )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(shards)) as pool:
@@ -1387,6 +1470,7 @@ def _run_prediction(
             merged_artifacts: dict[str, Any] = (
                 {"structures": merged_structs} if has_structs else {}
             )
+            progress.finish()
             return ScoreResponse(
                 scores=merged_scores,
                 metadata=merged_meta,
@@ -1404,7 +1488,11 @@ def _run_prediction(
         )
 
         cmd = _build_predict_cmd(batch_dir, out_dir, params, use_server_flag)
-        result = _run_predict(cmd, handle)
+        result = _run_predict(
+            cmd,
+            handle,
+            on_progress=lambda: progress.update(0, _completed_predictions(out_dir)),
+        )
 
         if result.returncode != 0:
             logger.error("boltz predict failed:\nstdout: %s\nstderr: %s",
@@ -1459,6 +1547,7 @@ def _run_prediction(
                 structs[orig_idx] = valid_response.artifacts["structures"][batch_idx]
             artifacts["structures"] = structs
 
+        progress.finish()
         return ScoreResponse(scores=scores, metadata=metadata, artifacts=artifacts)
 
     except HTTPException:
