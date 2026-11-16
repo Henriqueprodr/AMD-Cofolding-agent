@@ -399,6 +399,87 @@ class TestClaims:
         assert response.status_code == 409
 
 
+class TestTakingOneNamedTask:
+    """A conductor working on its own takes the task it just wrote.
+
+    ``/tasks/claim`` takes whatever is next, which is what a pool wants. A
+    conductor needs the one it wrote, so its own work is in the ledger
+    beside what it hands out and the campaign is a line of reasoning rather
+    than a list of runs.
+    """
+
+    def _queued(self, client):
+        cid = _campaign(client)["campaign_id"]
+        return cid, _task(client, cid)["task_id"]
+
+    def test_the_named_task_is_claimed_whatever_else_is_queued(self, client):
+        cid, first = self._queued(client)
+        second = _task(client, cid)["task_id"]
+
+        taken = client.post(f"/tasks/{second}/claim", json={"owner": "conductor"})
+
+        assert taken.status_code == 200, taken.text
+        assert taken.json()["task_id"] == second
+        assert taken.json()["lease_owner"] == "conductor"
+        assert client.get(f"/campaigns/{cid}/tasks?state=queued").json()[0]["task_id"] == first
+
+    def test_without_a_lease_it_is_never_swept_back(self, client):
+        """The conductor is not a pool member: there is nobody to hand it back to.
+
+        A swept lease would requeue work that is being done, for a sub-agent
+        to start again from the top.
+        """
+        cid, task_id = self._queued(client)
+        taken = client.post(f"/tasks/{task_id}/claim", json={"owner": "conductor"}).json()
+        assert taken["lease_expires_at"] is None
+
+        # The sweep runs on claim; this is the path that would requeue it.
+        time.sleep(0.05)
+        _claim(client, "a-supervisor")
+
+        claimed = client.get(f"/campaigns/{cid}/tasks?state=claimed").json()
+        assert [t["task_id"] for t in claimed] == [task_id]
+        assert claimed[0]["lease_owner"] == "conductor"
+
+    def test_a_lease_can_still_be_asked_for(self, client):
+        _, task_id = self._queued(client)
+
+        taken = client.post(
+            f"/tasks/{task_id}/claim", json={"owner": "conductor", "lease_seconds": 60}
+        )
+
+        assert taken.json()["lease_expires_at"] is not None
+
+    def test_one_already_claimed_is_refused_rather_than_stolen(self, client):
+        _, task_id = self._queued(client)
+        client.post(f"/tasks/{task_id}/claim", json={"owner": "conductor"})
+
+        again = client.post(f"/tasks/{task_id}/claim", json={"owner": "someone-else"})
+
+        assert again.status_code == 409
+        assert "not queued" in again.json()["detail"]
+
+    def test_a_task_that_does_not_exist_says_so(self, client):
+        assert client.post("/tasks/nope/claim", json={"owner": "conductor"}).status_code == 404
+
+    def test_the_conductor_posts_its_result_like_any_other_holder(self, client):
+        cid, task_id = self._queued(client)
+        client.post(f"/tasks/{task_id}/claim", json={"owner": "conductor"})
+
+        posted = client.post(f"/tasks/{task_id}/result", json={
+            "owner": "conductor",
+            "objective_profile": {"BoltzAffinity": 0.8},
+            "candidates": [{"smiles": "CCO", "total_score": 0.8}],
+            "report": "Ran it myself.",
+        })
+
+        assert posted.status_code == 200, posted.text
+        results = client.get(f"/campaigns/{cid}/results").json()
+        assert [r["task_id"] for r in results] == [task_id]
+        assert results[0]["candidates"][0]["smiles"] == "CCO"
+        assert results[0]["report"] == "Ran it myself."
+
+
 # ---------------------------------------------------------------------------
 # Results and failures
 # ---------------------------------------------------------------------------

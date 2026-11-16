@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from conftest import asked_question
 from reinvent4_agent.web import sessions as web_sessions
 from reinvent4_agent.web.sessions import LiveSession, SessionStore
 
@@ -47,6 +48,11 @@ class FakeAgent:
         self.backend = FakeBackend()
         # Where a session installs the tools that belong to it.
         self.local_tools = {}
+
+    @property
+    def prompts(self) -> list[str]:
+        """What was asked, without the standing note on every turn."""
+        return [asked_question(one) for one in self.asked]
 
     async def chat(self, content: str) -> str:
         self.asked.append(content)
@@ -178,7 +184,7 @@ def test_a_turn_continues_by_itself_while_the_budget_lasts(tmp_path):
         await wait_until(lambda: len(agent.asked) >= 2)
         await quiesce(live)
 
-        assert agent.asked[0] == "Design ligands for BRD4"
+        assert agent.prompts[0] == "Design ligands for BRD4"
         assert agent.asked[1].startswith("[AUTO]")
         # Only the question is recorded as a user message; the instruction is not.
         assert len(published(live, "user_message")) == 1
@@ -200,7 +206,7 @@ def test_nothing_continues_once_the_budget_has_expired(tmp_path):
         live.auto_until = live.auto_until.replace(year=2000)
         await idle(live)
 
-        assert agent.asked == ["Design ligands for BRD4"]
+        assert agent.prompts == ["Design ligands for BRD4"]
 
     asyncio.run(run())
 
@@ -212,7 +218,7 @@ def test_without_a_budget_a_turn_stands_alone(tmp_path):
         assert live.start_turn("Design ligands for BRD4")
         await idle(live)
         await asyncio.sleep(0.05)
-        assert agent.asked == ["Design ligands for BRD4"]
+        assert agent.prompts == ["Design ligands for BRD4"]
 
     asyncio.run(run())
 
@@ -223,7 +229,7 @@ def test_turning_the_budget_on_between_turns_picks_the_campaign_up(tmp_path):
         live = make_session(tmp_path, agent)
         assert live.start_turn("Launch the campaign")
         await idle(live)
-        assert agent.asked == ["Launch the campaign"]
+        assert agent.prompts == ["Launch the campaign"]
 
         live.set_autonomy(60)
         await wait_until(lambda: len(agent.asked) >= 2)
@@ -326,7 +332,7 @@ def test_nothing_but_the_budget_limits_how_many_turns_it_takes(tmp_path):
         assert live.start_turn("Design ligands for BRD4")
         await settled(live, 60)
 
-        assert agent.asked[0] == "Design ligands for BRD4"
+        assert agent.prompts[0] == "Design ligands for BRD4"
         assert all(asked.startswith("[AUTO]") for asked in agent.asked[1:])
 
     asyncio.run(run())
@@ -360,13 +366,13 @@ def test_a_cancelled_turn_never_continues(tmp_path):
         live = make_session(tmp_path, agent)
         live.set_autonomy(60)
         assert live.start_turn("Design ligands for BRD4")
-        await wait_until(lambda: agent.asked == ["Design ligands for BRD4"])
+        await wait_until(lambda: agent.prompts == ["Design ligands for BRD4"])
         assert live.cancel()
         await idle(live)
         await asyncio.sleep(0.05)
 
         assert agent.cancelled
-        assert agent.asked == ["Design ligands for BRD4"]
+        assert agent.prompts == ["Design ligands for BRD4"]
         assert published(live, "cancelled")
         # Stop means stop: the budget cannot start it up again a minute later.
         assert not live.auto_on
@@ -428,7 +434,7 @@ def test_a_user_message_takes_priority_over_a_pending_continuation(tmp_path):
         await asyncio.sleep(0)
 
         assert pending.cancelled()
-        assert agent.asked == ["Design ligands for BRD4", "Use the other scaffold instead"]
+        assert agent.prompts == ["Design ligands for BRD4", "Use the other scaffold instead"]
 
     asyncio.run(run())
 
@@ -444,7 +450,7 @@ def test_two_turns_never_run_at_once(tmp_path):
         assert live.start_turn("and another")
         # A continuation that wakes while a turn runs stands down.
         await live._continue_after(0.0)
-        assert agent.asked == ["Design ligands for BRD4"]
+        assert agent.prompts == ["Design ligands for BRD4"]
 
         agent.hang = False
         live.cancel()
@@ -473,7 +479,7 @@ def test_a_message_sent_mid_turn_is_read_after_the_current_step(tmp_path):
         live.cancel()
         await idle(live)
         # Read mid-turn, so it does not start a turn of its own.
-        assert agent.asked == ["Design ligands for BRD4"]
+        assert agent.prompts == ["Design ligands for BRD4"]
 
     asyncio.run(run())
 
@@ -512,6 +518,6 @@ def test_stopping_the_budget_drops_the_queued_continuation(tmp_path):
         live.set_autonomy(0)
         assert live.auto_task is None
         await asyncio.sleep(0.05)
-        assert agent.asked == ["Design ligands for BRD4"]
+        assert agent.prompts == ["Design ligands for BRD4"]
 
     asyncio.run(run())

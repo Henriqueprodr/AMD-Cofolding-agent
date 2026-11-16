@@ -18,6 +18,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
+from conftest import asked_question  # noqa: E402
 from fastapi import WebSocketDisconnect  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from reinvent4_agent.web import server  # noqa: E402
@@ -53,6 +54,9 @@ class FakeAgent:
 
     async def chat(self, content: str) -> str:
         self.started.set()
+        # The gateway appends a standing note about how the work is to be
+        # divided; the question is what this double answers.
+        content = asked_question(content)
         self.backend.history.append({"role": "user", "content": content})
         if not content.startswith("quick"):
             try:

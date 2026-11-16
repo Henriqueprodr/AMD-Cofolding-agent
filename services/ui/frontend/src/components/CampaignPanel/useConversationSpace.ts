@@ -4,7 +4,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { jobFileUrl } from "../../lib/api";
 import { mergeRuns, runMolecules, type ConversationSpace } from "../../lib/chemicalSpace";
-import { CONDUCTOR } from "../../lib/fleet";
+import { CONDUCTOR, type PooledCandidate } from "../../lib/fleet";
 import { isActive, resultsFile, type JobSummary } from "../../lib/jobs";
 import { moleculesOf, TOTAL, type Molecules } from "../../lib/runAnalysis";
 import { parseRunResults } from "../../lib/runResults";
@@ -51,6 +51,25 @@ export function useConversationSpace(
   runs: readonly JobSummary[],
   agents: ReadonlyMap<string, string>,
 ): { space: ConversationSpace | null; loading: boolean } {
+  const read = useRunReads(runs);
+
+  const space = useMemo(() => {
+    const started = (job: JobSummary) => Date.parse(job.startedAt || job.createdAt || "") || 0;
+    const parts = [...runs]
+      .sort((a, b) => started(a) - started(b))
+      .flatMap((job) => {
+        const molecules = read.get(job.id)?.molecules;
+        return molecules ? [runMolecules(job.id, agents.get(job.id) ?? CONDUCTOR, molecules)] : [];
+      });
+    return parts.length ? mergeRuns(parts) : null;
+  }, [runs, agents, read]);
+
+  const loading = runs.some((job) => job.state !== "queued" && !read.has(job.id));
+  return { space, loading };
+}
+
+/** Each run's results file, read once and held for the page. */
+function useRunReads(runs: readonly JobSummary[]): ReadonlyMap<string, Entry> {
   const [read, setRead] = useState<ReadonlyMap<string, Entry>>(() => new Map(cache));
 
   useEffect(() => {
@@ -69,17 +88,48 @@ export function useConversationSpace(
     }
   }, [runs]);
 
-  const space = useMemo(() => {
-    const started = (job: JobSummary) => Date.parse(job.startedAt || job.createdAt || "") || 0;
-    const parts = [...runs]
-      .sort((a, b) => started(a) - started(b))
-      .flatMap((job) => {
-        const molecules = read.get(job.id)?.molecules;
-        return molecules ? [runMolecules(job.id, agents.get(job.id) ?? CONDUCTOR, molecules)] : [];
-      });
-    return parts.length ? mergeRuns(parts) : null;
-  }, [runs, agents, read]);
+  return read;
+}
 
-  const loading = runs.some((job) => job.state !== "queued" && !read.has(job.id));
-  return { space, loading };
+/**
+ * The best molecules of every run of the conversation, in the shape the
+ * pooled list takes.
+ *
+ * A campaign's molecules were only ever what a sub-agent posted back, so a
+ * conversation working alone had an empty Molecules view however many runs
+ * it had finished, and one with sub-agents left out everything the conductor
+ * ran itself. Read from the same results files the map is drawn from, so it
+ * costs nothing beyond what the Analysis view already fetched.
+ */
+export function useRunCandidates(
+  runs: readonly JobSummary[],
+  agents: ReadonlyMap<string, string>,
+  perRun = 50,
+): PooledCandidate[] {
+  const read = useRunReads(runs);
+  return useMemo(() => {
+    const found: PooledCandidate[] = [];
+    for (const job of runs) {
+      const molecules = read.get(job.id)?.molecules;
+      const totals = molecules?.values.get(TOTAL);
+      if (!molecules || !totals) continue;
+      const best = [...molecules.smiles.keys()]
+        .filter((i) => Number.isFinite(totals[i]))
+        .sort((a, b) => totals[b] - totals[a])
+        .slice(0, perRun);
+      for (const i of best) {
+        found.push({
+          smiles: molecules.smiles[i],
+          score: totals[i],
+          // Not a task's: this is the run itself, which the pooled list
+          // labels by the agent that started it.
+          taskId: job.id,
+          owner: agents.get(job.id) ?? CONDUCTOR,
+          jobId: job.id,
+          candidate: { smiles: molecules.smiles[i], score: totals[i] },
+        });
+      }
+    }
+    return found;
+  }, [runs, agents, read, perRun]);
 }

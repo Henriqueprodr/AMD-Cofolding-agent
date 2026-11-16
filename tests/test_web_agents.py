@@ -66,13 +66,23 @@ def test_the_setting_is_not_part_of_the_conversation(tmp_path):
     asyncio.run(run())
 
 
-def test_working_alone_adds_nothing_to_the_turn(tmp_path):
+def test_working_alone_adds_nothing_about_a_team(tmp_path):
+    """What is said at one is how to keep the campaign, not how to dispatch.
+
+    A line offering one sub-agent reads as a standing instruction to run
+    campaigns, which is why nothing was said here at all; the campaign note
+    took its place once a conversation working alone could keep one.
+    """
+
     async def run() -> None:
         agent = FakeAgent()
         live = make_session(tmp_path, agent)
         assert live.start_turn("optimise this series")
         await idle(live)
-        assert agent.asked == ["optimise this series"]
+        asked = agent.asked[0]
+        assert asked.startswith("optimise this series")
+        for phrase in ("Team size", "sub-agent at once", "enqueue_tasks"):
+            assert phrase not in asked, phrase
 
     asyncio.run(run())
 
@@ -120,13 +130,27 @@ def test_two_or_more_make_the_long_work_the_sub_agents(tmp_path):
     asyncio.run(run())
 
 
-def test_working_alone_withholds_the_campaign_tools(tmp_path):
-    """At one there are no sub-agents, so a campaign would have nobody to run it."""
+def test_working_alone_withholds_only_what_needs_somebody_to_dispatch_to(tmp_path):
+    """At one there are no sub-agents, so a queue would have nobody to take from it."""
 
     live = make_session(tmp_path, FakeAgent())
     live.apply_allowance()
-    assert set(live.agent.withheld) == web_sessions.FLEET_TOOLS
-    assert "no sub-agents" in live.agent.withheld["start_campaign"]
+    assert set(live.agent.withheld) == web_sessions.DISPATCH_TOOLS
+    assert "nobody to dispatch" in live.agent.withheld["enqueue_task"]
+
+
+def test_working_alone_keeps_the_campaign_itself(tmp_path):
+    """The campaign is the memory, and it needs no sub-agent.
+
+    Withholding it left a conversation working alone with nothing that
+    outlived its context: no plan, no record of what it had tried, no
+    trajectory, where a campaign of two agents showed a line of reasoning.
+    """
+
+    live = make_session(tmp_path, FakeAgent())
+    live.apply_allowance()
+    for tool in web_sessions.CAMPAIGN_TOOLS:
+        assert tool not in live.agent.withheld, tool
 
 
 def test_two_or_more_withhold_the_run_starters_instead(tmp_path):
@@ -137,7 +161,23 @@ def test_two_or_more_withhold_the_run_starters_instead(tmp_path):
         assert "enqueue_task" in live.agent.withheld["run_optimization"]
         # Back to one, and the agent has its own runs again.
         live.set_agents(1)
-        assert set(live.agent.withheld) == web_sessions.FLEET_TOOLS
+        assert set(live.agent.withheld) == web_sessions.DISPATCH_TOOLS
+
+    asyncio.run(run())
+
+
+def test_working_alone_is_told_to_keep_the_campaign(tmp_path):
+    """Having the tools is not enough: told nothing, the agent keeps no record."""
+
+    async def run() -> None:
+        agent = FakeAgent()
+        live = make_session(tmp_path, agent)
+        assert live.start_turn("optimise this series")
+        await idle(live)
+        for phrase in ("start_campaign", "start_own_task", "finish_own_task", "atlas_finding"):
+            assert phrase in agent.asked[0], phrase
+        # Not an offer of one sub-agent, which reads as an instruction to dispatch.
+        assert "Team size" not in agent.asked[0]
 
     asyncio.run(run())
 

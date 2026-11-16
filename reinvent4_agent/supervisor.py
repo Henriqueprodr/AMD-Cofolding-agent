@@ -592,6 +592,11 @@ DRIVER_DENIED_TOOLS = frozenset({
     "finalize_campaign",
     "conduct_campaign",
     "stop_conducting",
+    # A sub-agent already has a task, opened for it and reported through the
+    # lease it holds. Opening another one for itself would put work in the
+    # ledger that nothing is watching the deadline of.
+    "start_own_task",
+    "finish_own_task",
 })
 
 
@@ -649,6 +654,8 @@ DENIAL_REASONS: dict[str, str] = {
     "finalize_campaign": "Only the conducting agent finalises the campaign.",
     "conduct_campaign": "Only the conducting agent holds the pool.",
     "stop_conducting": "Only the conducting agent stops the pool.",
+    "start_own_task": "You already have a task; report on that one.",
+    "finish_own_task": "Report your task by finishing your turn, not with this.",
 }
 
 

@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from conftest import asked_question
 from reinvent4_agent.web import campaign
 from reinvent4_agent.web import sessions as web_sessions
 from reinvent4_agent.web.sessions import LiveSession, SessionManager, SessionStore
@@ -46,6 +47,11 @@ class FakeAgent:
         self.local_tools: dict[str, Any] = {}
         self.resets = 0
         self.backend = FakeBackend()
+
+    @property
+    def prompts(self) -> list[str]:
+        """What was asked, without the standing note on every turn."""
+        return [asked_question(one) for one in self.asked]
 
     async def chat(self, content: str) -> str:
         self.asked.append(content)
@@ -199,7 +205,7 @@ def test_a_quiet_spell_is_counted_from_the_last_turn_not_from_the_last_wake(tmp_
         await settle(live)
         await stop(live)
 
-        assert agent.asked == ["Launch the JAK3 campaign"]
+        assert agent.prompts == ["Launch the JAK3 campaign"]
 
     asyncio.run(run())
 
@@ -235,7 +241,7 @@ def test_a_user_turn_takes_over_from_a_wake(tmp_path):
         await settle(live)
         await stop(live)
 
-        assert agent.asked[1] == "Try the morpholine series instead"
+        assert agent.prompts[1] == "Try the morpholine series instead"
 
     asyncio.run(run())
 
@@ -819,7 +825,7 @@ def test_a_long_history_is_condensed_before_the_users_own_turn(tmp_path):
         assert agent.resets == 1
         assert "condensed" in agent.asked[0]
         # The question itself still comes last, after the brief.
-        assert agent.asked[0].rstrip().endswith("Now check their ADMET")
+        assert agent.prompts[0].rstrip().endswith("Now check their ADMET")
 
     asyncio.run(run())
 

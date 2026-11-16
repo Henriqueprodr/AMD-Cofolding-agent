@@ -59,3 +59,23 @@ if "reinvent_plugins.components.component_results" not in sys.modules:
     _cr.ComponentResults = _ComponentResults
     sys.modules["reinvent_plugins.components.component_results"] = _cr
     reinvent_plugins.components.component_results = _cr
+
+
+# ---------------------------------------------------------------------------
+# What the user actually asked
+# ---------------------------------------------------------------------------
+
+#: The gateway appends a standing note to every turn saying how the work is
+#: to be divided -- how to keep the campaign when working alone, how to
+#: dispatch when there are sub-agents. It is not part of the question, so a
+#: test double that echoes what it was asked, or an assertion on it, reads
+#: past it.
+_STANDING_NOTES = ("\n\n[Working alone.", "\n\n[Team size:")
+
+
+def asked_question(content: str) -> str:
+    """*content* without the standing note the gateway appends."""
+
+    for note in _STANDING_NOTES:
+        content = content.split(note)[0]
+    return content

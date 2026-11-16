@@ -237,6 +237,105 @@ class TestEnqueueTask:
         assert ledger.enqueued[0]["priority"] == 2
 
 
+class TestWorkTheConductorDoesItself:
+    """Without these, a conversation with no sub-agents has an empty campaign.
+
+    enqueue_task gives work away. A conductor working alone -- or one that
+    runs something itself beside the tasks it hands out -- had no way to put
+    that work in the ledger, so its trajectory, its reports and its pooled
+    molecules were all empty however much it had done.
+    """
+
+    class Recording(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.owner = "a-host-name"
+            self.enqueued: list[dict[str, Any]] = []
+            self.claimed: list[tuple[str, str]] = []
+            self.posted: list[tuple[str, Any]] = []
+
+        def enqueue_task(self, campaign_id, **spec):
+            self.enqueued.append(spec)
+            return {"task_id": "own1", "spec": spec}
+
+        def claim_named(self, task_id, lease_seconds=None):
+            self.claimed.append((task_id, self.owner))
+            return {"task_id": task_id, "lease_owner": self.owner, "lease_expires_at": lease_seconds}
+
+        def post_result(self, task_id, outcome):
+            self.posted.append((task_id, outcome))
+            return {"task_id": task_id}
+
+    def _ledger(self, monkeypatch):
+        ledger = self.Recording()
+        monkeypatch.setattr(tools, "_store", lambda: ledger)
+        return ledger
+
+    def test_the_experiment_is_queued_and_taken_in_one_call(self, monkeypatch):
+        ledger = self._ledger(monkeypatch)
+
+        answer = tools.start_own_task("feed0001", "Cofold the top five", kind="analysis")
+
+        assert answer["task_id"] == "own1"
+        assert ledger.enqueued[0]["intent"] == "Cofold the top five"
+        assert ledger.enqueued[0]["kind"] == "analysis"
+        assert ledger.claimed == [("own1", tools.CONDUCTOR_OWNER)]
+
+    def test_it_is_taken_under_a_name_the_user_s_view_knows(self, monkeypatch):
+        """Not the host name a supervisor uses, or it would take an S-number."""
+        ledger = self._ledger(monkeypatch)
+
+        tools.start_own_task("feed0001", "Profile the pocket")
+
+        assert ledger.owner == tools.CONDUCTOR_OWNER
+
+    def test_it_holds_no_lease(self, monkeypatch):
+        """There is nobody to hand it back to, and a sweep would requeue live work."""
+        ledger = self._ledger(monkeypatch)
+
+        tools.start_own_task("feed0001", "Profile the pocket")
+
+        assert ledger.claimed[0] == ("own1", tools.CONDUCTOR_OWNER)
+
+    def test_the_lineage_reaches_the_ledger(self, monkeypatch):
+        ledger = self._ledger(monkeypatch)
+
+        tools.start_own_task("feed0001", "Follow it up", derived_from=["t1", "t2"], workstream="design")
+
+        assert ledger.enqueued[0]["derived_from"] == ["t1", "t2"]
+        assert ledger.enqueued[0]["workstream"] == "design"
+
+    def test_finishing_posts_the_molecules_and_the_runs(self, monkeypatch):
+        ledger = self._ledger(monkeypatch)
+
+        tools.finish_own_task(
+            "own1", "It worked.", summary="Five cofolded",
+            candidates=[{"smiles": "CCO", "total_score": 0.8}],
+            job_ids=["job-a", "job-b"],
+            objective_profile={"QED": 0.7},
+        )
+
+        task_id, outcome = ledger.posted[0]
+        assert task_id == "own1"
+        assert outcome.report == "It worked."
+        assert outcome.candidates == [{"smiles": "CCO", "total_score": 0.8}]
+        assert outcome.job_ids == ["job-a", "job-b"]
+        # The one its molecules came from, as a sub-agent's result carries it.
+        assert outcome.job_id == "job-a"
+        assert outcome.objective_profile == {"QED": 0.7}
+
+    def test_a_ledger_that_is_away_is_an_error_not_a_crash(self, monkeypatch):
+        class Dead(FakeStore):
+            def enqueue_task(self, campaign_id, **spec):
+                from reinvent4_agent.campaign_client import StoreUnavailable
+
+                raise StoreUnavailable("the ledger is not answering")
+
+        monkeypatch.setattr(tools, "_store", lambda: Dead())
+
+        assert "error" in tools.start_own_task("feed0001", "Anything")
+
+
 class TestEnqueueTasks:
 
     class Recording(FakeStore):

@@ -4,11 +4,13 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Theme } from "../../hooks/useTheme";
 import { useCampaigns } from "../../hooks/useCampaignJobs";
-import { agentLabels, pooledCandidates, taskOwners, type PooledCandidate } from "../../lib/fleet";
+import { agentLabels, bestBySmiles, campaignRuns, pooledCandidates, taskJobs, taskOwners, type PooledCandidate } from "../../lib/fleet";
 import { loadJobStructures, openRunStructure, runStructurePanel, type JobStructure } from "../../lib/jobStructures";
+import { useJobScope } from "../JobPicker/useJobScope";
 import { short } from "../RunAnalysis/plotUtils";
 import { Card, Placeholder } from "../RunAnalysis/shared";
 import { MoleculeTable, type MoleculeRow } from "../MoleculeTable/MoleculeTable";
+import { useRunCandidates } from "./useConversationSpace";
 import { shortId, useAgentPage } from "./shared";
 
 interface Props {
@@ -24,12 +26,15 @@ interface Row extends MoleculeRow {
 const SHOWN = 25;
 
 /**
- * The overview's Molecules: every molecule the sub-agents posted back, best
- * first, pooled across the conversation's campaigns; on a sub-agent's page,
- * only the ones of the task it is on, or of the task picked in the trajectory.
+ * The overview's Molecules: every molecule of the conversation, best first,
+ * pooled across its campaigns and its own runs; on a sub-agent's page, only
+ * the ones of the task it is on, or of the task picked in the trajectory.
  *
  * Pooled because this is the output the chemist came for, not one list per
- * agent; which agent found a molecule rides along.
+ * agent; which agent found a molecule rides along. The conversation's runs
+ * count as well as the sub-agents' reports: working alone the view was empty
+ * however many runs had finished, and with sub-agents it left out everything
+ * the conductor ran itself.
  */
 export function CampaignMolecules({ sessionId, theme, onOpenMolecule }: Props) {
   const { details, loading } = useCampaigns(sessionId);
@@ -42,7 +47,20 @@ export function CampaignMolecules({ sessionId, theme, onOpenMolecule }: Props) {
     return { tasks, results: details.flatMap((detail) => detail.results).filter((result) => ids.has(result.task_id)) };
   }, [details, page]);
   const finished = results.length;
-  const pooled = useMemo(() => pooledCandidates(results, taskOwners(tasks)), [results, tasks]);
+
+  const agents = useMemo(() => new Map([...campaignRuns(details, labels)].map(([jobId, run]) => [jobId, run.agent])), [details, labels]);
+  const { own } = useJobScope(sessionId);
+  const runs = useMemo(() => {
+    if (!page) return own;
+    const jobs = taskJobs(details, new Set(tasks.map((task) => task.task_id)));
+    return own.filter((run) => jobs.has(run.id));
+  }, [own, details, page, tasks]);
+  const fromRuns = useRunCandidates(runs, agents);
+
+  const posted = useMemo(() => pooledCandidates(results, taskOwners(tasks)), [results, tasks]);
+  // Reports first: a molecule a sub-agent put forward carries the fields it
+  // chose to report, which the run's own table does not have.
+  const pooled = useMemo(() => bestBySmiles([posted, fromRuns]), [posted, fromRuns]);
   const shown = useMemo(() => pooled.slice(0, all ? pooled.length : SHOWN), [pooled, all]);
   const complexes = useRunStructures(shown);
 
@@ -79,7 +97,13 @@ export function CampaignMolecules({ sessionId, theme, onOpenMolecule }: Props) {
         title="Best molecules"
         actions={
           <span className="text-faint text-[11px]">
-            {pooled.length} from {finished} finished {finished === 1 ? "task" : "tasks"}
+            {pooled.length} from{" "}
+            {[
+              finished > 0 && `${finished} finished ${finished === 1 ? "task" : "tasks"}`,
+              runs.length > 0 && `${runs.length} ${runs.length === 1 ? "run" : "runs"}`,
+            ]
+              .filter(Boolean)
+              .join(" and ") || "nothing yet"}
           </span>
         }
       >
@@ -89,7 +113,7 @@ export function CampaignMolecules({ sessionId, theme, onOpenMolecule }: Props) {
               ? "Reading the campaigns…"
               : page && !page.held.length
                 ? `${agent} is waiting for its next task. What it posted before is under its bubbles in the trajectory.`
-                : "Nothing posted yet. Molecules appear as sub-agents finish their runs."}
+                : "Nothing yet. Molecules appear as the conversation's runs produce them and as sub-agents report back."}
           </Placeholder>
         ) : (
           <MoleculeTable<Row>

@@ -7,22 +7,28 @@ import {
   agentLabels,
   agentPage,
   agentSummaries,
+  bestBySmiles,
   campaignProgress,
   campaignRuns,
   campaignStanding,
+  CONDUCTOR,
+  CONDUCTOR_OWNER,
   jobBubbles,
   knownAgent,
   objectiveProgress,
   pooledCandidates,
   reportBody,
+  taskAgent,
   taskJobs,
   taskOwners,
   taskPhase,
   taskReports,
   teamLoad,
   ttpIdOf,
+  UNCLAIMED,
   workingAgents,
   type OwnRun,
+  type PooledCandidate,
 } from "./fleet";
 
 const T0 = Date.parse("2026-11-08T10:00:00Z");
@@ -469,6 +475,53 @@ describe("agentLabels", () => {
     ]);
     expect(labels.get("early")).toBe("S1");
     expect(labels.get("late")).toBe("S2");
+  });
+
+  it("does not give the conductor an S-number of its own", () => {
+    // Working alone it owns every task, and the trajectory would read as a
+    // team of one stranger rather than as the agent being talked to.
+    const labels = agentLabels([
+      { tasks: [task("a", { claimed_at: minutes(5), ran_by: CONDUCTOR_OWNER }), task("b", { claimed_at: minutes(9), ran_by: "sub" })] },
+    ]);
+    expect([...labels]).toEqual([["sub", "S1"]]);
+  });
+});
+
+describe("taskAgent", () => {
+  it("labels a task the conductor ran itself C, beside the sub-agents", () => {
+    expect(taskAgent(task("a", { ran_by: CONDUCTOR_OWNER }), new Map())).toBe(CONDUCTOR);
+  });
+
+  it("labels one nobody has claimed S", () => {
+    expect(taskAgent(task("a", {}), new Map())).toBe(UNCLAIMED);
+  });
+});
+
+describe("bestBySmiles", () => {
+  const one = (smiles: string, score: number | null, taskId: string): PooledCandidate => ({
+    smiles,
+    score,
+    taskId,
+    owner: null,
+    jobId: null,
+    candidate: { smiles },
+  });
+
+  it("merges what the sub-agents posted with what the runs produced", () => {
+    // Working alone the Molecules view was empty however many runs had
+    // finished; with sub-agents it left out everything the conductor ran.
+    const pooled = bestBySmiles([[one("CCO", 0.4, "posted")], [one("CCN", 0.9, "run")]]);
+    expect(pooled.map((c) => c.smiles)).toEqual(["CCN", "CCO"]);
+  });
+
+  it("keeps one entry per molecule, with the better score", () => {
+    const pooled = bestBySmiles([[one("CCO", 0.4, "posted")], [one("CCO", 0.8, "run")]]);
+    expect(pooled).toHaveLength(1);
+    expect(pooled[0]).toMatchObject({ score: 0.8, taskId: "run" });
+  });
+
+  it("caps the pool", () => {
+    expect(bestBySmiles([[one("CCO", 0.4, "a"), one("CCN", 0.9, "b")]], 1).map((c) => c.smiles)).toEqual(["CCN"]);
   });
 });
 

@@ -686,6 +686,22 @@ class ClaimRequest(BaseModel):
     lease_seconds: float = Field(default=DEFAULT_LEASE_SECONDS, gt=0)
 
 
+class TaskClaim(BaseModel):
+    """Taking one named task, rather than whatever is next in the queue."""
+
+    model_config = {"extra": "forbid"}
+
+    owner: str = Field(description="Who is taking it")
+    lease_seconds: Optional[float] = Field(
+        default=None, gt=0,
+        description="How long before the lease expires and the task is "
+                    "requeued. Omit for a holder that is not a pool member: "
+                    "a conductor working its own task in its own process has "
+                    "nobody to hand it back to, and a swept lease would "
+                    "requeue work that is being done.",
+    )
+
+
 class SessionAttach(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -1837,6 +1853,44 @@ def claim_task(body: ClaimRequest) -> Any:
         ).fetchone()
 
     logger.info("task %s claimed by %s", claimed["task_id"], body.owner)
+    return _task_row(claimed)
+
+
+@app.post("/tasks/{task_id}/claim")
+def claim_named_task(task_id: str, body: TaskClaim) -> dict[str, Any]:
+    """Take one named task.
+
+    ``/tasks/claim`` takes whatever is next, which is what a pool wants. A
+    conductor working on its own takes the task it just wrote, so that the
+    work it does itself is in the ledger beside the work it hands out: one
+    trajectory, one set of reports, one pool of molecules, whether or not
+    there are sub-agents.
+    """
+
+    with _write() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No task {task_id}")
+        if row["state"] != "queued":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task {task_id} is {row['state']}, not queued",
+            )
+
+        expires = time.time() + body.lease_seconds if body.lease_seconds else None
+        conn.execute(
+            "UPDATE tasks SET state = 'claimed', lease_owner = ?, claimed_by = ?, "
+            "lease_expires_at = ?, claimed_at = ?, attempts = attempts + 1 "
+            "WHERE task_id = ?",
+            (body.owner, body.owner, expires, _now_iso(), task_id),
+        )
+        _emit(conn, "task_claimed", row["campaign_id"], task_id,
+              owner=body.owner, lease_seconds=body.lease_seconds)
+        claimed = conn.execute(
+            "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+
+    logger.info("task %s claimed by name by %s", task_id, body.owner)
     return _task_row(claimed)
 
 

@@ -298,6 +298,134 @@ def enqueue_tasks(campaign_id: str, tasks: list[dict[str, Any]]) -> dict[str, An
     }
 
 
+#: Who a task the conductor is doing itself belongs to. A reserved name
+#: rather than the host name a supervisor uses, so the UI can tell the
+#: conductor's own work from a sub-agent's and label it "C".
+CONDUCTOR_OWNER = "conductor"
+
+
+def start_own_task(
+    campaign_id: str,
+    intent: str,
+    kind: str = "design",
+    title: Optional[str] = None,
+    context: Optional[str] = None,
+    deliverable: Optional[str] = None,
+    derived_from: Optional[list[str]] = None,
+    workstream: Optional[str] = None,
+) -> dict[str, Any]:
+    """Record an experiment you are about to run yourself, and take it.
+
+    ``enqueue_task`` gives work away; this keeps it. Use it before starting a
+    run or a line of work of your own, so that what you do is in the ledger
+    beside what sub-agents do: one trajectory the user can read, one set of
+    reports, one pool of molecules, whether or not there are sub-agents.
+
+    Working alone this is how a campaign has anything in it at all. Pair it
+    with ``finish_own_task`` when the work is done -- a task left open shows
+    as still running.
+
+    Parameters
+    ----------
+    campaign_id:
+        Campaign to record it under.
+    intent:
+        What the experiment is, in prose. The same field ``enqueue_task``
+        hands to a sub-agent, except that here you are the one doing it.
+    kind:
+        ``design`` for a run, or ``research``, ``analysis``,
+        ``retrosynthesis``, ``question``. Nothing is withheld on the strength
+        of it -- you already have the tools -- but it is what the user's view
+        of the campaign groups and colours the work by.
+    title:
+        A few words naming it, which is what the trajectory labels it.
+    context:
+        What the experiment rests on, for whoever reads the campaign later.
+    deliverable:
+        What you mean to come back with.
+    derived_from:
+        Ids of the tasks whose results led to this one, yours or a
+        sub-agent's. Without them the campaign is a heap of experiments
+        rather than a line of reasoning.
+    workstream:
+        Id of the plan's workstream this works on.
+
+    Returns
+    -------
+    dict
+        ``{"task_id": ...}``, to pass to ``finish_own_task``.
+    """
+
+    spec = task_spec(
+        intent, kind=kind, title=title, context=context,
+        deliverable=deliverable, derived_from=derived_from, workstream=workstream,
+    )
+
+    def take() -> dict[str, Any]:
+        store = _store()
+        store.owner = CONDUCTOR_OWNER
+        task = store.enqueue_task(campaign_id, **spec)
+        task_id = task["task_id"]
+        # No lease: the conductor is not a pool member, and a swept lease
+        # would requeue work that is being done for a sub-agent to redo.
+        store.claim_named(task_id)
+        return {"task_id": task_id, "title": spec.get("title"), "kind": spec["kind"]}
+
+    return _guard(f"Could not record your own task on campaign {campaign_id}", take)
+
+
+def finish_own_task(
+    task_id: str,
+    report: str,
+    summary: Optional[str] = None,
+    candidates: Optional[list[dict[str, Any]]] = None,
+    job_ids: Optional[list[str]] = None,
+    objective_profile: Optional[dict[str, float]] = None,
+) -> dict[str, Any]:
+    """Close an experiment you ran yourself, with what it found.
+
+    The counterpart of ``start_own_task``. What you post here is what the
+    campaign's reports, its pooled molecules and its objective progress are
+    computed from, so a result posted is a result the user can see in the
+    Campaign tab without reading the conversation back.
+
+    Parameters
+    ----------
+    task_id:
+        From ``start_own_task``.
+    report:
+        What happened and what it means, in prose. The account the campaign
+        keeps of this experiment.
+    summary:
+        One line, for the trajectory.
+    candidates:
+        The molecules it put forward, each ``{"smiles", "total_score",
+        "components"}`` as a sub-agent reports them. These are what the
+        campaign's Molecules view pools.
+    job_ids:
+        Every run the experiment started.
+    objective_profile:
+        Objective name to the value reached, for the campaign's progress.
+    """
+
+    def post() -> dict[str, Any]:
+        from reinvent4_agent.campaign_client import TaskOutcome
+
+        store = _store()
+        store.owner = CONDUCTOR_OWNER
+        ids = list(job_ids or [])
+        return store.post_result(task_id, TaskOutcome(
+            objective_profile=objective_profile or {},
+            candidates=candidates or [],
+            job_id=ids[0] if ids else None,
+            summary=summary,
+            report=report,
+            job_ids=ids,
+        ))
+
+    return _guard(f"Could not post your result for task {task_id}", post)
+
+
 def _run_outlook(campaign_id: str, specs: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """How many of a batch's design tasks can start a run now, or None.
 

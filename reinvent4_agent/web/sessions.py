@@ -127,23 +127,36 @@ COMPACT_ABOVE_TOKENS = 100_000
 #: model's reasoning and its answer all land on top of the history.
 COMPACT_FRACTION = 0.7
 
-#: Opening a campaign, dispatching to it and holding its pool.  Withheld
-#: below two sub-agents, where a campaign would be a queue nobody can take
-#: work from: sub-agent mode exists only when the user has switched it on.
-FLEET_TOOLS = frozenset({
-    "start_campaign",
+#: Handing work to sub-agents and holding the pool that does it.  Withheld
+#: below two sub-agents, where each of these is a queue nobody can take work
+#: from: sub-agent mode exists only when the user has switched it on.
+DISPATCH_TOOLS = frozenset({
     "enqueue_task",
     "enqueue_tasks",
-    "set_campaign_plan",
     "conduct_campaign",
     "stop_conducting",
     "set_concurrency",
     "cancel_supervisor",
-    "close_campaign",
-    "finalize_campaign",
     "take_proposals",
     "drop_proposals",
 })
+
+#: Keeping the campaign itself: its goal, its plan, the experiments the agent
+#: runs and what they found.  None of it needs a sub-agent, and withholding
+#: it left a conversation working alone with no memory that outlives its
+#: context, no report of what it had tried and no trajectory -- the user saw
+#: a list of runs where a campaign of two agents showed a line of reasoning.
+CAMPAIGN_TOOLS = frozenset({
+    "start_campaign",
+    "set_campaign_plan",
+    "start_own_task",
+    "finish_own_task",
+    "close_campaign",
+    "finalize_campaign",
+})
+
+#: Everything the fleet surface covers, for callers that mean all of it.
+FLEET_TOOLS = DISPATCH_TOOLS | CAMPAIGN_TOOLS
 
 #: What the conductor gives up once it has sub-agents.  Starting a run *is*
 #: the task, and at two or more the tasks are theirs.  Left the choice, a
@@ -163,8 +176,25 @@ _DELEGATE_INSTEAD = (
 )
 _WORK_ALONE_INSTEAD = (
     "This conversation has no sub-agents, so there is nobody to dispatch "
-    "to. Do the work yourself, or ask the user to allow sub-agents beside "
-    "the message box."
+    "to. Do the work yourself and record it with start_own_task and "
+    "finish_own_task, or ask the user to allow sub-agents beside the "
+    "message box."
+)
+
+#: Said on every turn of a conversation with no sub-agents. The campaign is
+#: the memory: a conversation that kept none had nothing left once its
+#: context was compacted past the work, and the user had a list of runs
+#: where a campaign of two agents showed a line of reasoning.
+_WORKING_ALONE = (
+    "[Working alone. Keep a campaign anyway: open one with start_campaign "
+    "for a goal that will take more than a couple of runs, and set out its "
+    "workstreams with set_campaign_plan. Record each experiment you run "
+    "with start_own_task before you start it and finish_own_task when it is "
+    "done, with the molecules it put forward and the runs it started, and "
+    "name in derived_from the earlier tasks it followed from. Write what "
+    "you settle to the atlas with atlas_finding. This is what survives your "
+    "context being compacted, and it is what the user reads in the Campaign "
+    "tab. There is nobody to dispatch to, so do the work yourself.]"
 )
 
 #: Run states, as job metadata spells them.
@@ -691,18 +721,24 @@ class LiveSession:
         if self.agents_allowed > 1:
             self.agent.withheld = {name: _DELEGATE_INSTEAD for name in RUN_STARTERS}
         else:
-            self.agent.withheld = {name: _WORK_ALONE_INSTEAD for name in FLEET_TOOLS}
+            # Only what needs somebody to dispatch to. The campaign itself --
+            # its goal, its plan, the experiments the agent runs and what
+            # they found -- is what gives a conversation working alone the
+            # memory, the reports and the trajectory a campaign of two has.
+            self.agent.withheld = {name: _WORK_ALONE_INSTEAD for name in DISPATCH_TOOLS}
 
     def _with_allowance(self, content: str) -> str:
-        """*content* with the sub-agent allowance appended, when there is one.
+        """*content* with how the work is to be divided appended.
 
-        Only above one: at one there is nothing to say, and a line on every
-        turn saying the agent may run one sub-agent would read as a standing
-        instruction to run campaigns.
+        At one there is nobody to divide it with, so what is said is how to
+        keep the campaign rather than how to dispatch: a line offering one
+        sub-agent would read as a standing instruction to run campaigns.
         """
 
-        if self.agents_allowed <= 1 or not content.strip():
+        if not content.strip():
             return content
+        if self.agents_allowed <= 1:
+            return f"{content}\n\n{_WORKING_ALONE}"
         n = self.agents_allowed
         # half as many again, rounded up, is the target queue depth
         target_q = (n * 3 + 1) // 2

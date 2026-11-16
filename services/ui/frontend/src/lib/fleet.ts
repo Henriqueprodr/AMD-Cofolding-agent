@@ -150,6 +150,16 @@ export const CONDUCTOR = "C";
 /** On a task nobody has claimed yet: a sub-agent's, but not yet anyone's. */
 export const UNCLAIMED = "S";
 
+/**
+ * The owner the conductor takes its own tasks under.
+ *
+ * A reserved name rather than the host name a supervisor uses, so an
+ * experiment the agent ran itself is labelled C beside the sub-agents'
+ * rather than taking an S-number of its own. Working alone, every task is
+ * one of these.
+ */
+export const CONDUCTOR_OWNER = "conductor";
+
 /** The sub-agent that ran a task, or holds it now. */
 export function ranBy(task: Pick<FleetTask, "lease_owner" | "ran_by">): string | null {
   return task.ran_by || task.lease_owner || null;
@@ -173,9 +183,14 @@ export function agentLabels(campaigns: readonly (Pick<CampaignDetail, "tasks"> &
   for (const detail of campaigns) {
     for (const task of detail.tasks) {
       const owner = ranBy(task);
-      if (owner) seen(owner, task.claimed_at || task.created_at);
+      // The conductor is not one of the sub-agents and must not take an
+      // S-number: working alone it owns every task, and the trajectory would
+      // read as a team of one stranger.
+      if (owner && owner !== CONDUCTOR_OWNER) seen(owner, task.claimed_at || task.created_at);
     }
-    for (const supervisor of detail.supervisors ?? []) seen(supervisor.owner, supervisor.first_seen_at);
+    for (const supervisor of detail.supervisors ?? []) {
+      if (supervisor.owner !== CONDUCTOR_OWNER) seen(supervisor.owner, supervisor.first_seen_at);
+    }
   }
   const order = [...first].sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]));
   return new Map(order.map(([owner], i) => [owner, `S${i + 1}`]));
@@ -184,6 +199,7 @@ export function agentLabels(campaigns: readonly (Pick<CampaignDetail, "tasks"> &
 /** The label a task's work goes under. */
 export function taskAgent(task: Pick<FleetTask, "lease_owner" | "ran_by">, labels: ReadonlyMap<string, string>): string {
   const owner = ranBy(task);
+  if (owner === CONDUCTOR_OWNER) return CONDUCTOR;
   return (owner && labels.get(owner)) || UNCLAIMED;
 }
 
@@ -537,23 +553,38 @@ export function pooledCandidates(
   owners: ReadonlyMap<string, string> = new Map(),
   limit = 200,
 ): PooledCandidate[] {
-  const best = new Map<string, PooledCandidate>();
+  const found: PooledCandidate[] = [];
   for (const result of results) {
     for (const candidate of result.candidates ?? []) {
       const smiles = typeof candidate?.smiles === "string" ? candidate.smiles.trim() : "";
       if (!smiles) continue;
-      const entry: PooledCandidate = {
+      found.push({
         smiles,
         score: scoreOf(candidate),
         taskId: result.task_id,
         owner: owners.get(result.task_id) ?? null,
         jobId: (typeof candidate.job_id === "string" && candidate.job_id) || result.job_id || null,
         candidate,
-      };
-      const seen = best.get(smiles);
-      // The same molecule found twice keeps the better score, and with it the
-      // task that scored it that way.
-      if (!seen || (entry.score ?? -Infinity) > (seen.score ?? -Infinity)) best.set(smiles, entry);
+      });
+    }
+  }
+  return bestBySmiles([found], limit);
+}
+
+/**
+ * One entry per molecule, best score first.
+ *
+ * Takes several lists so what the sub-agents posted and what the
+ * conversation's own runs produced come out as one pool rather than two:
+ * the same molecule found twice keeps the better score, and with it the
+ * task or run that scored it that way.
+ */
+export function bestBySmiles(pools: readonly (readonly PooledCandidate[])[], limit = 200): PooledCandidate[] {
+  const best = new Map<string, PooledCandidate>();
+  for (const pool of pools) {
+    for (const entry of pool) {
+      const seen = best.get(entry.smiles);
+      if (!seen || (entry.score ?? -Infinity) > (seen.score ?? -Infinity)) best.set(entry.smiles, entry);
     }
   }
   return [...best.values()]

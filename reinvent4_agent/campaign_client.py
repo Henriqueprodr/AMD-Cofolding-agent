@@ -120,6 +120,20 @@ class CampaignStoreClient:
             body["lease_seconds"] = lease_seconds
         return self._call("POST", "/tasks/claim", **body)
 
+    def claim_named(
+        self, task_id: str, lease_seconds: Optional[float] = None
+    ) -> dict[str, Any]:
+        """Take one named task, rather than whatever is next in the queue.
+
+        Without a lease the task is held until a result is posted: a holder
+        that is not a pool member has nobody to hand it back to.
+        """
+
+        body: dict[str, Any] = {"owner": self.owner}
+        if lease_seconds:
+            body["lease_seconds"] = lease_seconds
+        return self._call("POST", f"/tasks/{task_id}/claim", **body)
+
     def heartbeat(
         self,
         task_id: str,

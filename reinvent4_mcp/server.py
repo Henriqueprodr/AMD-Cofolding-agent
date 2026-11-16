@@ -1850,6 +1850,86 @@ def enqueue_tasks(
 
 
 # ---------------------------------------------------------------------------
+# Tools: work the conductor does itself
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def start_own_task(
+    campaign_id: Annotated[str, Field(description="Campaign to record it under")],
+    intent: Annotated[str, Field(description="What the experiment is, in prose")],
+    kind: Annotated[
+        str,
+        Field(default="design", description="design, research, analysis, retrosynthesis or question"),
+    ] = "design",
+    title: Annotated[str, Field(default="", description="A few words naming it, for the trajectory")] = "",
+    context: Annotated[str, Field(default="", description="What it rests on")] = "",
+    deliverable: Annotated[str, Field(default="", description="What you mean to come back with")] = "",
+    derived_from: Annotated[
+        list[str],
+        Field(default_factory=list, description="Task ids whose results led to this one"),
+    ] = [],
+    workstream: Annotated[str, Field(default="", description="Workstream of the plan this works on")] = "",
+) -> str:
+    """Record an experiment you are about to run yourself, and take it.
+
+    ``enqueue_task`` gives work away; this keeps it. Call it before starting
+    a run or a line of work of your own, so what you do is in the ledger
+    beside what sub-agents do: one trajectory, one set of reports, one pool
+    of molecules, whether or not there are sub-agents.
+
+    Working alone this is how a campaign has anything in it. Close it with
+    ``finish_own_task`` -- a task left open shows as still running.
+    """
+
+    from reinvent4_mcp.tools.campaign import start_own_task as _impl
+
+    return json.dumps(
+        _impl(
+            campaign_id, intent, kind=kind, title=title or None,
+            context=context or None, deliverable=deliverable or None,
+            derived_from=derived_from or None, workstream=workstream or None,
+        ),
+        indent=2, default=_json_default,
+    )
+
+
+@mcp.tool()
+def finish_own_task(
+    task_id: Annotated[str, Field(description="From start_own_task")],
+    report: Annotated[str, Field(description="What happened and what it means, in prose")],
+    summary: Annotated[str, Field(default="", description="One line, for the trajectory")] = "",
+    candidates: Annotated[
+        list[dict[str, Any]],
+        Field(default_factory=list, description="Molecules it put forward: {smiles, total_score, components} each"),
+    ] = [],
+    job_ids: Annotated[
+        list[str],
+        Field(default_factory=list, description="Every run the experiment started"),
+    ] = [],
+    objective_profile: Annotated[
+        dict[str, float],
+        Field(default_factory=dict, description="Objective name to the value reached"),
+    ] = {},
+) -> str:
+    """Close an experiment you ran yourself, with what it found.
+
+    What you post is what the campaign's reports, its pooled molecules and
+    its objective progress are computed from, so the user can read the
+    result in the Campaign tab without reading the conversation back.
+    """
+
+    from reinvent4_mcp.tools.campaign import finish_own_task as _impl
+
+    return json.dumps(
+        _impl(
+            task_id, report, summary=summary or None, candidates=candidates or None,
+            job_ids=job_ids or None, objective_profile=objective_profile or None,
+        ),
+        indent=2, default=_json_default,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool: get_task_reports
 # ---------------------------------------------------------------------------
 
