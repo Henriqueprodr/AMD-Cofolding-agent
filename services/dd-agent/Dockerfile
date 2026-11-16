@@ -28,10 +28,11 @@ COPY reinvent4_mcp/ /app/reinvent4_mcp/
 COPY reinvent4_agent/ /app/reinvent4_agent/
 COPY reinvent4_mcp_config.yaml /app/reinvent4_mcp_config.yaml
 
-# rdkit is not a declared dependency of either package: it is used in one
-# guarded place, to validate Mol2Mol seed SMILES before a job is dispatched.
-# Worth ~120 MB here against the 11 GiB removed, since without it that check
-# degrades to a warning and a bad seed only fails later, inside the RL run.
+# rdkit is not a declared dependency of either package, but the agent image
+# cannot do without it: scaffold derivation, R-group decomposition, matched
+# molecular pairs and clustering are all RDKit work and return an error
+# without it, and Mol2Mol seed validation degrades to a warning so a bad seed
+# only fails later, inside the RL run. ~120 MB against the 11 GiB removed.
 # The [web] extra adds dd-web, the gateway the web UI talks to.
 RUN pip install --no-cache-dir /app/reinvent4_mcp "/app/reinvent4_agent[web]" "rdkit>=2024.3.1"
 

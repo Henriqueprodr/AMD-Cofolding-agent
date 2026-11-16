@@ -45,6 +45,22 @@ def detect_tool_versions() -> dict[str, str]:
             versions[name] = getattr(m, "__version__", "?")
         except Exception:  # noqa: BLE001
             pass
+
+    # fpocket is a binary, not a module, so the loop above cannot see it and
+    # /health looked identical with and without it -- an image built before
+    # the Dockerfile grew the fpocket layer answers every subpocket request
+    # with an empty list and still reports itself well. Imported here rather
+    # than at module scope because site.fpocket imports this module.
+    try:
+        from .site.fpocket import _get_version, fpocket_available  # noqa: PLC0415
+
+        if fpocket_available():
+            versions["fpocket"] = _get_version() or "?"
+        else:
+            versions["fpocket"] = "absent"
+    except Exception:  # noqa: BLE001
+        pass
+
     return versions
 
 # ---------------------------------------------------------------------------

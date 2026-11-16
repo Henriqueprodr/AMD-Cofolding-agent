@@ -90,6 +90,11 @@ spec:
                 configMapKeyRef:
                   name: dd-agentic-config
                   key: REINVENT4_AGENT_LOG_DIR
+            - name: REINVENT4_AGENT_MAX_TOKENS
+              valueFrom:
+                configMapKeyRef:
+                  name: dd-agentic-config
+                  key: REINVENT4_AGENT_MAX_TOKENS
             # Driver only, no Reviewer. Set here rather than read from the
             # ConfigMap, whose value is "true" for the interactive agent --
             # pointing at it would hand every supervisor a Reviewer that

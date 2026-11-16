@@ -58,6 +58,10 @@ AGENT_ENV=(
     --env REINVENT4_AGENT_MULTI_AGENT=false
     --env REINVENT4_AGENT_NO_VERIFY_SSL=false
     --env "CAMPAIGN_STORE_URL=${CAMPAIGN_STORE_URL:-http://$SESSION_NODE:8087}"
+    # Slurm can place two supervisors on one node, where a hostname is no
+    # longer an identity: both would claim under the same name and the ledger
+    # would show one of them, holding the other's tasks.
+    --env "SUPERVISOR_ID=$(hostname)-$SLURM_JOB_ID"
     # The rest of the service URLs come from here, applied by supervisor.main().
     --env DD_SERVICE_REGISTRY=/tmp/service-registry.json
 )

@@ -242,8 +242,8 @@ supplied alongside — which is why only the supervisor tier has
 `hf-overrides`. Adding them to the conductor would fight the shipped weights
 rather than extend them.
 
-The conductor's 32768 was not enough in practice: a Pareto front with the
-molecules behind each point sent ~42k tokens of tool results, and since vLLM
+The conductor's 32768 was not enough in practice: the best results with the
+molecules behind each one sent ~42k tokens of tool results, and since vLLM
 derives `max_tokens` as `max-model-len` minus the prompt, the request failed
 with `max_tokens must be at least 1, got -72257`. Those payloads were
 narrowed to ~8k, so the bump is headroom rather than the fix.
@@ -857,8 +857,8 @@ the runner now.
 ### The fleet's ledger: campaign-store
 
 `dd-agentic-campaign-store` is the control plane for a conductor-led fleet: the
-queue of weight vectors still to try, who is holding which task and until when,
-what each supervisor achieved, and the Pareto front over those results. It is a
+queue of tasks still to run, who is holding which task and until when, and what
+each supervisor achieved. It is a
 FastAPI service over a SQLite file on `/shared`, so a conductor that restarts
 rebuilds its loop by reading the ledger rather than from memory.
 
@@ -869,15 +869,14 @@ wall-clock budget) and a **task** is one supervisor run — which is what
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /campaigns` | Open a sweep: goal, base TTP, the objectives the front is computed over, dispatch and grace windows |
+| `POST /campaigns` | Open a campaign: goal, optional base TTP and objectives, dispatch and grace windows |
 | `POST /campaigns/{id}/tasks` | Enqueue one weight vector |
 | `POST /tasks/claim` | A supervisor takes the oldest queued task on a lease; `204` when idle |
 | `POST /tasks/{id}/heartbeat` | Extend the lease |
 | `POST /tasks/{id}/result` | Post the achieved objective profile and candidates |
 | `POST /tasks/{id}/fail` | Report a failure, requeued unless `requeue: false` |
-| `GET /campaigns/{id}/pareto` | The non-dominated front, plus results excluded for missing an objective |
 | `GET /campaigns/{id}/events?since=N` | The conductor's completion feed, polled by last event id |
-| `GET /campaigns/{id}/status` | The aggregate the REPL prints: task counts, in-flight supervisors with their weight vectors, the front, and time left in each window |
+| `GET /campaigns/{id}/status` | The aggregate the REPL prints: task counts, in-flight supervisors with their weight vectors, the result count, and time left in each window |
 | `POST /campaigns/{id}/close` / `finalize` | Enter the drain window; then close the ledger |
 
 Three properties are load-bearing and worth knowing before changing anything:
@@ -955,8 +954,8 @@ Two decisions are worth knowing because they are easy to undo by accident:
   agent finishes without starting a run the supervisor normally starts one
   itself, which is a faithful substitute only while every task is de novo. An
   intent may well have asked for a different prior, and a substituted run
-  would post into the same Pareto front while measuring something else, so the
-  task fails and is retried instead. That guard is what caught an agent
+  would report a result for an experiment nobody asked for, so the task fails
+  and is retried instead. That guard is what caught an agent
   calling `run_optimization` on two *other* tasks' TTPs: the TTP store is
   shared, so every agent can see all N sibling variants, and nothing scopes it
   to its own.
@@ -998,8 +997,8 @@ pods` in exactly that case.
 
 ### The conductor
 
-`dd-agentic-conductor` opens a campaign, keeps `N` supervisors busy, reviews
-the Pareto front to decide what to try next, and closes the books when the
+`dd-agentic-conductor` opens a campaign, keeps `N` supervisors busy, reads
+what came back to decide what to try next, and closes the books when the
 clock runs out. It is the agent image again, kept interactive with `sleep
 infinity` so the REPL is reachable by `kubectl exec`, with the loop started per
 campaign:
@@ -1029,19 +1028,18 @@ the easiest way to get a campaign wrong, because an objective the TTP does not
 have fails every task that references it — and the mistake surfaces minutes
 later as a task failure rather than as a typo.
 
-It also exposes thirteen MCP tools so a conductor agent can do the same
+It also exposes twelve MCP tools so a conductor agent can do the same
 conversationally: `start_campaign`, `get_campaign_state`, `list_campaigns`,
 `enqueue_task`, `list_supervisors`, `get_supervisor_result`,
-`get_pareto_front`, `get_campaign_files`, `set_concurrency`,
-`cancel_supervisor`, `get_pool_capacity`, `close_campaign` and
-`finalize_campaign`.
+`get_campaign_files`, `set_concurrency`, `cancel_supervisor`,
+`get_pool_capacity`, `close_campaign` and `finalize_campaign`.
 
 `get_campaign_files` is the one that is not about steering: it joins the
 ledger's task-to-job mapping to the runner's working directories, so "where
 are the results" is answerable without knowing the layout. It reports tasks
 newest first and carries no scores, so position in that list says nothing
-about which run was any good — `get_pareto_front` ranks tasks and
-`get_top_candidates` ranks molecules within one job.
+about which run was any good — `get_supervisor_result` says what one achieved
+and `get_top_candidates` ranks molecules within one job.
 
 **Its TTP mount is writable, and the tool restriction beside it is half of
 one decision.** Defining the base TTP is the first step of a campaign on a new
@@ -1116,14 +1114,12 @@ Three things about how the loop behaves:
   idle supervisor handed work while Boltz is saturated only moves the wait,
   and a quiet scorer is no use with nothing alive to dispatch to.
 
-The weight vectors come from a two-phase proposer. With no results it seeds the
-extremes — a balanced vector plus one per objective emphasised — because
-bounding the front early is what makes later refinement meaningful; refining
-around a single lucky point first would just explore one corner. With a front,
-it perturbs front members one objective at a time, since the front is by
-definition the set of trade-offs nothing else beats. It never re-proposes a
-vector already in the ledger, and an exhausted sweep dispatches nothing rather
-than paying twice for the same point.
+What to try next is the conductor model's decision
+([`reinvent4_agent/proposing.py`](../reinvent4_agent/proposing.py)): it is
+handed the goal, every task dispatched so far and what came back, and answers
+with tasks in prose. A proposer that cannot decide dispatches nothing rather
+than falling back to a mechanical sweep, because a sweep running in place of an
+unreachable model would spend GPU measuring something nobody asked for.
 
 `replicas: 1`, and that one matters: two conductors would each top the pool up
 to `N` and the campaign would quietly run at `2N`. That is the one way to
@@ -1602,10 +1598,10 @@ symptoms point at memory:
   `Solubility` at 99% and `logD` at 99%, while every non-ADMET component sat
   at 0%. A failure confined to the objectives sharing one service is a
   capacity problem, not a scoring one.
-- **The Pareto front comes back empty with everything ineligible.** A result
-  needs every declared objective to reach the front, so a dead scorer takes
-  all six results off it at once. `get_pareto_front`'s `ineligible` list names
-  the missing objectives — read that before concluding the run found nothing.
+- **Every result is missing the same objectives.** A profile carries only the
+  objectives its scorer reported, so a dead scorer takes the same objective
+  out of every result at once — read the profiles before concluding the run
+  found nothing.
 - **The results CSV goes ragged and readers drop rows silently.** The header
   is written from the first batch; a scorer that fails during step 1 reports
   no metadata, then reports some later, and from that point every row is

@@ -124,10 +124,23 @@ PY
 # the agent's tools dial, this carries the ones the scoring components dial
 # from inside an RL job. Generated from the checkout's template so there is one
 # place to edit, with the two things only this node knows substituted in.
+# Where REINVENT runs execute: "slurm" submits each as its own small-g job
+# with a Boltz of its own (run.sbatch), "local" keeps them on this node's GCD 4
+# behind the one shared Boltz. The run limit follows, since on this node it
+# is what one GCD holds and on Slurm it is what the campaign may queue.
+RUN_BACKEND=${RUN_BACKEND:-slurm}
+case "$RUN_BACKEND" in
+slurm) MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-16} ;;
+local) MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-4} ;;
+*)     echo "RUN_BACKEND must be slurm or local"; exit 1 ;;
+esac
+RUN_RELAY_DIR=$DATA_DIR/run-relay-$JOB
+RUN_JOB_NAME=${RUN_JOB_NAME:-dd-run}
+
 MCP_CONFIG=$DATA_DIR/reinvent4_mcp_config.session.yaml
 sed -e "s|http://localhost:|http://$NODE:|g" \
     -e "/^runner:/,\$ s|enabled: false|enabled: true|" \
-    -e "s|max_concurrent_jobs: 2|max_concurrent_jobs: ${MAX_CONCURRENT_JOBS:-4}|" \
+    -e "s|max_concurrent_jobs: 2|max_concurrent_jobs: $MAX_CONCURRENT_JOBS|" \
     "$REPO/services/singularity/reinvent4_mcp_config.singularity.yaml" > "$MCP_CONFIG.part"
 grep -q "http://$NODE:8086" "$MCP_CONFIG.part" || { echo "config generation missed the runner URL"; exit 1; }
 mv "$MCP_CONFIG.part" "$MCP_CONFIG"
@@ -247,6 +260,166 @@ pool_relay() {
 pool_relay >> "$LOGS/pool-relay.log" 2>&1 &
 RELAY_PID=$!
 
+# --- The run relay ----------------------------------------------------------
+# The runner is in a container too, so it hands each run over as a file:
+# submit/<run> to start one, stop/<run> to checkpoint and stop it. This loop
+# submits run.sbatch, follows the Slurm job, and writes what it sees to the
+# run's slurm.json, which is all the runner reads.
+run_state() {  # run_dir slurm_id state exit_code error
+    python3 - "$@" <<'PY'
+import json, pathlib, sys, time
+run_dir, sid, state, code, error = sys.argv[1:6]
+record = {"slurm_id": sid or None, "state": state, "at": int(time.time()),
+          "exit_code": int(code) if code.lstrip("-").isdigit() else None}
+if error:
+    record["error"] = error
+path = pathlib.Path(run_dir) / "slurm.json"
+part = path.with_suffix(".part")
+part.write_text(json.dumps(record))
+part.replace(path)
+PY
+}
+run_relay() {
+    local f id dir sid left state code
+    mkdir -p "$RUN_RELAY_DIR"/{submit,stop,active}
+
+    # Runs an earlier session handed over are followed too. Their relay died
+    # with that session, so their slurm.json still says what it last saw --
+    # RUNNING, say -- and the runner, which adopts them on that word, would
+    # hold their slots forever. Every one of them has ended by now (no run
+    # outlives its session), so the poll below only has to ask sacct how.
+    python3 - "$DATA_DIR/jobs" "$RUN_RELAY_DIR/active" <<'PY'
+import json, pathlib, sys
+jobs, active = map(pathlib.Path, sys.argv[1:3])
+unfinished = {"PENDING", "CONFIGURING", "REQUEUED", "RESIZING", "SUSPENDED", "RUNNING", "COMPLETING"}
+for path in jobs.glob("job_*/slurm.json"):
+    try:
+        seen = json.loads(path.read_text())
+    except (OSError, ValueError):
+        continue
+    sid, run = str(seen.get("slurm_id") or ""), path.parent.name[len("job_"):]
+    if seen.get("state") in unfinished and sid.isdigit() and not (active / run).exists():
+        (active / run).write_text(sid + "\n")
+        print(f"relay: following run {run} (Slurm {sid}) from an earlier session")
+PY
+
+    # Build a sid->run-id reverse map so the batched squeue/sacct responses
+    # can be matched back to runs. Declared outside the loop so bash does not
+    # re-declare it on every iteration (harmless, but noisy with set -x).
+    declare -A SID_TO_RUN
+
+    while true; do
+        # --- submit new runs -------------------------------------------------
+        left=$(squeue --noheader --jobs "$JOB" --format %L 2>/dev/null)
+        [[ $left =~ ^[0-9:-]+$ ]] || left=""
+        for f in "$RUN_RELAY_DIR"/submit/*; do
+            [[ -e $f ]] || break
+            id=$(basename "$f"); dir=$DATA_DIR/jobs/job_$id
+            # Nothing a run scores against outlives this session, so neither
+            # may the run. The gpus-per-node and remaining args are in
+            # run.sbatch's own #SBATCH lines; the relay only overrides time.
+            # A run that uses Boltz needs 2 GCDs (one for REINVENT, one for
+            # its private Boltz); a purely CPU-scored run only needs 1.
+            if grep -q 'service = "boltz"' "$dir/config.toml" 2>/dev/null; then
+                run_gpus=2
+            else
+                run_gpus=1
+            fi
+            sid=$(sbatch --parsable --job-name "$RUN_JOB_NAME" \
+                         ${SLURM_ACCOUNT:+--account "$SLURM_ACCOUNT"} \
+                         ${left:+--time "$left"} \
+                         --gpus-per-node=$run_gpus \
+                         --output "$dir/slurm-%j.out" \
+                         --export "ALL,RUN_ID=$id,SESSION_ENV=$SESSION_ENV" \
+                         "$REPO/services/lumi/run.sbatch" 2>&1)
+            if [[ $sid =~ ^[0-9]+$ ]]; then
+                run_state "$dir" "$sid" PENDING "" ""
+                echo "$sid" > "$RUN_RELAY_DIR/active/$id"
+                SID_TO_RUN[$sid]=$id
+                echo "relay: run $id is Slurm job $sid"
+            else
+                run_state "$dir" "" SUBMIT_FAILED "" "sbatch refused the run: $sid"
+                echo "relay: sbatch failed for run $id: $sid"
+            fi
+            rm -f "$f"
+        done
+
+        # --- forward stop requests -------------------------------------------
+        for f in "$RUN_RELAY_DIR"/stop/*; do
+            [[ -e $f ]] || break
+            id=$(basename "$f"); sid=$(cat "$RUN_RELAY_DIR/active/$id" 2>/dev/null)
+            if [[ -n $sid ]]; then
+                # One squeue for the state so we know whether to hard-cancel or
+                # checkpoint-stop; this is rare so a single call is fine.
+                state=$(squeue --noheader --jobs "$sid" --format %T 2>/dev/null)
+                if [[ $state == PENDING || $state == CONFIGURING ]]; then
+                    scancel "$sid" && echo "relay: cancelled run $id before it started"
+                else
+                    scancel --signal=USR1 --batch "$sid" && echo "relay: asked run $id to checkpoint and stop"
+                fi
+            fi
+            rm -f "$f"
+        done
+
+        # --- poll active runs in one batched call ----------------------------
+        # Rebuilding the map each tick covers runs adopted after a restart.
+        SID_TO_RUN=()
+        for f in "$RUN_RELAY_DIR"/active/*; do
+            [[ -e $f ]] || break
+            sid=$(cat "$f"); SID_TO_RUN[$sid]=$(basename "$f")
+        done
+
+        if [[ ${#SID_TO_RUN[@]} -gt 0 ]]; then
+            ids_csv=$(IFS=,; echo "${!SID_TO_RUN[*]}")
+
+            # One squeue for all active jobs; outputs "<sid> <state>" lines.
+            # Emptied every pass: declaring it again keeps last pass's entries,
+            # and a run that left the queue would read as still in it forever.
+            declare -A LIVE_STATE
+            LIVE_STATE=()
+            while read -r s st; do
+                LIVE_STATE[$s]=$st
+            done < <(squeue --noheader --jobs "$ids_csv" --format "%i %T" 2>/dev/null)
+
+            # Jobs not in squeue output have left the queue; collect them for
+            # one batched sacct call.
+            finished_ids=()
+            for sid in "${!SID_TO_RUN[@]}"; do
+                id=${SID_TO_RUN[$sid]}; dir=$DATA_DIR/jobs/job_$id
+                if [[ -n ${LIVE_STATE[$sid]:-} ]]; then
+                    run_state "$dir" "$sid" "${LIVE_STATE[$sid]}" "" ""
+                else
+                    finished_ids+=("$sid")
+                fi
+            done
+
+            # One sacct call for all finished jobs.
+            if [[ ${#finished_ids[@]} -gt 0 ]]; then
+                fin_csv=$(IFS=,; echo "${finished_ids[*]}")
+                while IFS='|' read -r sid_col st_raw code_raw; do
+                    sid=${sid_col%%[^0-9]*}; [[ -n $sid ]] || continue
+                    id=${SID_TO_RUN[$sid]:-}; [[ -n $id ]] || continue
+                    dir=$DATA_DIR/jobs/job_$id
+                    state=${st_raw%% *}; code=${code_raw%%:*}
+                    # An squeue that missed a live run must not end it here.
+                    case $state in PENDING|CONFIGURING|REQUEUED|RESIZING|SUSPENDED|RUNNING|COMPLETING) continue ;; esac
+                    run_state "$dir" "$sid" "$state" "$code" ""
+                    echo "relay: run $id (Slurm $sid) ended $state, exit $code"
+                    rm -f "$RUN_RELAY_DIR/active/$id"
+                done < <(sacct --noheader --parsable2 --allocations \
+                              --jobs "$fin_csv" --format JobID,State,ExitCode 2>/dev/null)
+            fi
+        fi
+
+        sleep "${RUN_RELAY_SECONDS:-10}"
+    done
+}
+RUN_RELAY_PID=
+if [[ $RUN_BACKEND == slurm ]]; then
+    run_relay >> "$LOGS/run-relay.log" 2>&1 &
+    RUN_RELAY_PID=$!
+fi
+
 # --- The two vLLM tiers -----------------------------------------------------
 # Serving both at once rather than swapping: the conductor's turn and its
 # supervisors' turns overlap by design, and a swap would serialise them.
@@ -269,8 +442,15 @@ SUP_PID=$(serve "$SUPERVISOR_MODEL" "$SUPERVISOR_GPUS" "$SUPERVISOR_PORT" 0.0.0.
 # and a shared job table is what keeps the pool from oversubscribing this GCD.
 AGENT_SIF=$REPO/services/singularity/dd-agent-amd.sif
 SITE=/opt/venv/lib/python3.12/site-packages
-mkdir -p "$DATA_DIR"/{shared,jobs,logs,tb_logs,ttps,agent_logs}
+mkdir -p "$DATA_DIR"/{shared,jobs,logs,tb_logs,ttps,agent_logs} "$RUN_RELAY_DIR"
+RELAY_FLAGS=()
+[[ $RUN_BACKEND == slurm ]] && RELAY_FLAGS=(--env REINVENT_RUN_RELAY=/run-relay --bind "$RUN_RELAY_DIR:/run-relay")
+PRIORS_DIR=${PRIORS_DIR:-$REPO/priors}
+RUNNER_PRIOR_BIND=()
+[[ -d $PRIORS_DIR ]] && RUNNER_PRIOR_BIND=(--bind "$PRIORS_DIR:/app/REINVENT4/priors")
 singularity exec \
+    "${RELAY_FLAGS[@]}" \
+    "${RUNNER_PRIOR_BIND[@]}" \
     --env ROCR_VISIBLE_DEVICES=$REINVENT_GPU \
     --env REINVENT4_ROOT=/app/REINVENT4 \
     --env REINVENT4_MCP_CONFIG=/app/reinvent4_mcp_config.singularity.yaml \
@@ -297,8 +477,9 @@ STACK=$!
 # Supervisors outlive this script unless they are cancelled: they are separate
 # jobs, and the session they joined is gone the moment this exits.
 cleanup() {
-    kill "$RELAY_PID" 2>/dev/null
+    kill "$RELAY_PID" $RUN_RELAY_PID 2>/dev/null
     scancel --name "$SUPERVISOR_JOB_NAME" --user "$USER" 2>/dev/null
+    scancel --name "$RUN_JOB_NAME" --user "$USER" 2>/dev/null
     kill "$STACK" "$RUNNER_PID" "$CHAT_PID" "$SUP_PID" 2>/dev/null
     pkill -f "vllm serve" 2>/dev/null
     wait

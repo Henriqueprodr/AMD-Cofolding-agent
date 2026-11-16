@@ -14,8 +14,8 @@ resources:
   # REINVENT4 job lifecycle and scoring behind REST, so the agent needs
   # neither REINVENT4 nor a GPU once runner.enabled is set.
   - runner/reinvent-runner.yaml
-  # Control-plane ledger: the queue of weight vectors, who holds which task,
-  # what came back, and the Pareto front over it.
+  # Control-plane ledger: the task queue, who holds which task, and what
+  # came back.
   - campaign-store/campaign-store.yaml
   # The worker pool that drains that queue. Ships at replicas: 0 -- a campaign
   # starts by scaling it to N.

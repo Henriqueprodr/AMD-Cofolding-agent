@@ -2,10 +2,10 @@
 
 One conductor hands out work; N supervisors claim it, run a full RL campaign
 each, and post back what they achieved. This service is the only thing that
-knows the truth about that: which weight vectors are queued, who is holding
-which task and until when, what came back, and which results are on the Pareto
-front. Everything else is a client, so a conductor that restarts rebuilds its
-loop by reading the ledger rather than from memory.
+knows the truth about that: which tasks are queued, who is holding which task
+and until when, and what came back. Everything else is a client, so a
+conductor that restarts rebuilds its loop by reading the ledger rather than
+from memory.
 
 A note on vocabulary, because the codebase already uses the word differently:
 here a **campaign** is the whole sweep (one goal, N supervisors, a wall-clock
@@ -35,10 +35,6 @@ Design notes:
   task, so the behaviour is a function of the requests made and a test does not
   have to wait on a timer.
 
-* **The front is computed, not stored.** Pareto membership changes every time a
-  result arrives, so caching it would mean invalidating it correctly. Campaigns
-  hold tens of tasks, not millions, and the objective count is single digits.
-
 Env:
     CAMPAIGN_STORE_DB       SQLite path (default /shared/campaign-store/campaigns.db)
     CAMPAIGN_STORE_PORT     listen port (default 8087)
@@ -50,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -60,7 +57,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Iterator, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -80,6 +77,36 @@ DEFAULT_PRESENCE_TTL_SECONDS = float(os.getenv("PRESENCE_TTL_SECONDS", "120"))
 # Campaign states: `dispatching` accepts new tasks, `draining` is the plan's
 # post-T window where the queue is closed but claimed tasks run on.
 TaskState = Literal["queued", "claimed", "done", "failed", "abandoned"]
+
+# What a task asks for. `design` is the original one -- an RL run against a
+# therapeutic target profile -- and the supervisor still treats it specially,
+# because the profile and the weight vector are the experiment. The rest are
+# ordinary work a drug-design agent does with its tools, and the supervisor
+# runs them by handing the brief to an agent and reading back what it found.
+#
+# A closed list rather than free text: the kind decides which path the
+# supervisor takes, and an unrecognised one would be run as the wrong thing.
+TaskKind = Literal[
+    "design", "research", "analysis", "retrosynthesis", "question", "lead",
+]
+
+# A follow-up a sub-agent proposed: `open` until the conductor or the floor
+# takes it as a task, or drops it.
+ProposalState = Literal["open", "taken", "dropped"]
+
+# How sure the agent recording a finding is of it. The conductor reads these
+# to know what it may build on and what still has to be settled, so a guess
+# has to be sayable as a guess rather than withheld.
+Confidence = Literal["high", "medium", "low"]
+
+# What a note does to the finding it hangs off. Agreement is worth recording
+# too: two sub-agents reaching the same number independently is a stronger
+# fact than one, and nothing else in the ledger can say so.
+Stance = Literal["supports", "disputes", "extends"]
+
+#: Priority of a task the conductor's floor filled a free slot with. Below
+#: the default 0, so whatever the conductor dispatches itself is claimed first.
+FLOOR_PRIORITY = -1
 
 # A task not yet finished one way or another, so it still owes the campaign an
 # answer. Spelled as SQL because it appears in three IN clauses.
@@ -107,7 +134,10 @@ CREATE TABLE IF NOT EXISTS campaigns (
     -- predate the column belong to nobody either. The store never reads it;
     -- it is here so a chat window can ask "which of these are mine" without
     -- the answer living in a browser that will be closed.
-    session_id        TEXT
+    session_id        TEXT,
+    -- When a conductor last said it holds the campaign. Null for one that
+    -- never had a conductor; see CONDUCTED_WITHIN_SECONDS.
+    conducted_at      REAL
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -139,7 +169,9 @@ CREATE TABLE IF NOT EXISTS results (
     objective_profile TEXT NOT NULL,
     candidates        TEXT NOT NULL,
     summary           TEXT,
-    posted_at         TEXT NOT NULL
+    posted_at         TEXT NOT NULL,
+    report            TEXT,
+    job_ids           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -168,7 +200,76 @@ CREATE TABLE IF NOT EXISTS supervisors (
     last_seen_at      TEXT NOT NULL,
     expires_at        REAL NOT NULL
 );
+
+-- Next tasks a sub-agent proposed at the end of its report. Kept apart from
+-- the queue: a sub-agent sees one task, so what it proposes is a candidate
+-- for the conductor to rank against the whole campaign, not an order.
+CREATE TABLE IF NOT EXISTS proposals (
+    proposal_id       TEXT PRIMARY KEY,
+    campaign_id       TEXT NOT NULL REFERENCES campaigns(campaign_id),
+    from_task_id      TEXT,
+    spec              TEXT NOT NULL,
+    state             TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    task_id           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS proposals_open ON proposals (campaign_id, state, created_at);
+
+-- What the campaign has learnt, as opposed to what it has run. A report is
+-- addressed to the conductor and read once; this is addressed to whoever
+-- works the campaign next, including the sub-agent that will redo the search
+-- somebody already did. Append-only: a finding that turns out wrong is
+-- superseded by the one that corrects it, because knowing the campaign
+-- believed it for two hours is part of the record.
+CREATE TABLE IF NOT EXISTS findings (
+    finding_id        TEXT PRIMARY KEY,
+    campaign_id       TEXT NOT NULL REFERENCES campaigns(campaign_id),
+    -- Workstream id from the plan, so the atlas and the coverage view cut the
+    -- campaign the same way. Free text: a finding may land before the plan.
+    branch            TEXT NOT NULL,
+    claim             TEXT NOT NULL,
+    detail            TEXT,
+    evidence          TEXT NOT NULL,
+    confidence        TEXT NOT NULL,
+    tags              TEXT NOT NULL,
+    author            TEXT NOT NULL,
+    task_id           TEXT,
+    created_at        TEXT NOT NULL,
+    supersedes        TEXT,
+    superseded_by     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS findings_branch
+    ON findings (campaign_id, branch, created_at);
+
+CREATE TABLE IF NOT EXISTS finding_notes (
+    note_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_id        TEXT NOT NULL REFERENCES findings(finding_id),
+    campaign_id       TEXT NOT NULL,
+    body              TEXT NOT NULL,
+    stance            TEXT NOT NULL,
+    author            TEXT NOT NULL,
+    task_id           TEXT,
+    created_at        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS finding_notes_feed ON finding_notes (finding_id, note_id);
 """
+
+
+def _branch_key(name: str) -> str:
+    """One spelling per branch of the atlas.
+
+    Branches are free text because a finding can land before there is a plan,
+    and free text is how a memory fragments: 'ADMET', 'admet' and 'admet '
+    are three branches to anyone reading and one to everyone writing. Case
+    and spacing carry no meaning here, so they are not kept -- on the way in
+    and on the way out, or a workstream whose plan spells it differently
+    would never meet its own findings.
+    """
+
+    return " ".join(name.split()).lower()
 
 
 def _now_iso() -> str:
@@ -216,7 +317,27 @@ def _connect() -> sqlite3.Connection:
 _ADDED_COLUMNS = [
     ("campaigns", "session_id", "TEXT"),
     ("tasks", "job_id", "TEXT"),
+    ("results", "report", "TEXT"),
+    ("results", "job_ids", "TEXT"),
+    ("campaigns", "conducted_at", "REAL"),
+    # The workstreams the conductor split the goal into, as JSON.
+    ("campaigns", "plan", "TEXT"),
+    # A lead's campaign: the campaign and the task whose sub-agent conducts it.
+    ("campaigns", "parent_campaign_id", "TEXT"),
+    ("campaigns", "parent_task_id", "TEXT"),
+    # Kept after the task finishes, unlike lease_owner: who ran it is what
+    # says how long each sub-agent waited between two tasks.
+    ("tasks", "claimed_by", "TEXT"),
 ]
+
+#: How long a campaign's tasks stay claimable after its conductor last said
+#: it was holding the campaign. Several of its ticks, so one slow pass does
+#: not cost the campaign its supervisors.
+CONDUCTED_WITHIN_SECONDS = float(os.getenv("CAMPAIGN_CONDUCTED_WITHIN_SECONDS", "300"))
+
+#: Longest report kept. The writer is a model, and a runaway one should cost
+#: the ledger a truncated report rather than the conductor its context.
+MAX_REPORT_CHARS = int(os.getenv("MAX_REPORT_CHARS", "20000"))
 
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:
@@ -333,54 +454,6 @@ def _sweep_expired_leases(conn: sqlite3.Connection, campaign_id: Optional[str] =
 
 
 # ---------------------------------------------------------------------------
-# Pareto front
-# ---------------------------------------------------------------------------
-
-def _dominates(a: dict[str, float], b: dict[str, float], objectives: list[str]) -> bool:
-    """True when `a` is at least as good everywhere and better somewhere.
-
-    Objective values are post-transform REINVENT scores, so higher is better on
-    every axis and no per-objective direction is needed.
-    """
-
-    return all(a[o] >= b[o] for o in objectives) and any(a[o] > b[o] for o in objectives)
-
-
-def pareto_front(
-    results: list[dict[str, Any]], objectives: list[str]
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split results into the non-dominated front and everything else.
-
-    Results that do not report every campaign objective are returned as
-    ineligible rather than silently dropped or defaulted to zero -- a missing
-    objective usually means a scorer failed, and treating that as "scored 0"
-    would quietly park a broken run at the bottom of the front instead of
-    telling someone.
-    """
-
-    eligible: list[dict[str, Any]] = []
-    ineligible: list[dict[str, Any]] = []
-
-    for result in results:
-        profile = result["objective_profile"]
-        missing = [o for o in objectives if not isinstance(profile.get(o), (int, float))]
-        if missing:
-            ineligible.append({**result, "missing_objectives": missing})
-        else:
-            eligible.append(result)
-
-    front = [
-        candidate for candidate in eligible
-        if not any(
-            _dominates(other["objective_profile"], candidate["objective_profile"], objectives)
-            for other in eligible
-            if other is not candidate
-        )
-    ]
-    return front, ineligible
-
-
-# ---------------------------------------------------------------------------
 # Request/response models
 # ---------------------------------------------------------------------------
 
@@ -399,11 +472,10 @@ class CampaignCreate(BaseModel):
     )
     objectives: list[str] = Field(
         default_factory=list,
-        description="Objective names the Pareto front is computed over. Fixed "
-                    "at creation so the front's dimensions cannot drift "
-                    "mid-campaign. Empty when tasks bring their own TTPs and "
-                    "therefore their own objectives -- there is no shared "
-                    "front then, and a result is read in its own terms",
+        description="Objective names every result is reported on. Fixed at "
+                    "creation so results stay comparable mid-campaign. Empty "
+                    "when tasks bring their own TTPs and therefore their own "
+                    "objectives, and a result is read in its own terms",
     )
     concurrency: int = Field(default=1, ge=1, description="Supervisors to hold in flight")
     dispatch_seconds: Optional[float] = Field(
@@ -414,11 +486,135 @@ class CampaignCreate(BaseModel):
         default=0.0, ge=0,
         description="Drain window after T, during which claimed tasks finish",
     )
+    parent_campaign_id: Optional[str] = Field(
+        default=None,
+        description="For a lead's campaign: the campaign it is a workstream of. "
+                    "Its tasks are drawn from the parent's pool, so the "
+                    "parent's counts include them.",
+    )
+    parent_task_id: Optional[str] = Field(
+        default=None, description="The parent campaign's task whose sub-agent leads this one",
+    )
+
+
+class Workstream(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    id: str = Field(min_length=1, max_length=40, description="Short handle tasks name it by")
+    name: str = Field(min_length=1, max_length=120)
+    question: Optional[str] = Field(
+        default=None, description="What this workstream has to settle for the goal",
+    )
+    share: Optional[float] = Field(
+        default=None, gt=0, le=1,
+        description="Rough share of the team it should have; unset means even",
+    )
+    status: Literal["open", "settled", "dropped"] = "open"
+
+
+class PlanUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    workstreams: list[Workstream] = Field(min_length=1, max_length=40)
+
+
+class FindingPost(BaseModel):
+    """Something the campaign now knows, worth the next agent's while."""
+
+    model_config = {"extra": "forbid"}
+
+    branch: str = Field(
+        min_length=1, max_length=40,
+        description="Workstream id this belongs under, the same handle tasks "
+                    "name. Findings are read a branch at a time, so one "
+                    "filed in the wrong place is one nobody will see.",
+    )
+
+    @field_validator("branch")
+    @classmethod
+    def _fold(cls, value: str) -> str:
+        return _branch_key(value)
+    claim: str = Field(
+        min_length=1, max_length=400,
+        description="The finding itself in one sentence, stated so it can be "
+                    "disagreed with: what is true, not what was done.",
+    )
+    detail: Optional[str] = Field(
+        default=None, max_length=4000,
+        description="The numbers, conditions and caveats behind the claim",
+    )
+    evidence: list[str] = Field(
+        default_factory=list, max_length=20,
+        description="Where it came from: a DOI, a ChEMBL id, a job id, a PDB "
+                    "code. A claim with no evidence is an opinion, and the "
+                    "agent reading it has no way to check yours.",
+    )
+    confidence: Confidence = "medium"
+    tags: list[str] = Field(
+        default_factory=list, max_length=12,
+        description="Handles to find it by later: a gene, a scaffold, an "
+                    "assay, a liability.",
+    )
+    author: str = Field(min_length=1, description="Supervisor or conductor recording it")
+    task_id: Optional[str] = None
+    supersedes: Optional[str] = Field(
+        default=None,
+        description="Finding this one corrects. The old one stays readable "
+                    "and stops counting as current.",
+    )
+
+
+class NotePost(BaseModel):
+    """A second opinion on a finding somebody else recorded."""
+
+    model_config = {"extra": "forbid"}
+
+    body: str = Field(min_length=1, max_length=2000)
+    stance: Stance = "extends"
+    author: str = Field(min_length=1)
+    task_id: Optional[str] = None
+
+
+class FollowUp(BaseModel):
+    """A next task a sub-agent would run, as it proposed it."""
+
+    model_config = {"extra": "ignore"}
+
+    intent: str = Field(min_length=1)
+    title: Optional[str] = Field(default=None, max_length=120)
+    kind: TaskKind = "research"
+    rationale: Optional[str] = None
+    workstream: Optional[str] = None
 
 
 class TaskCreate(BaseModel):
     model_config = {"extra": "forbid"}
 
+    kind: TaskKind = Field(
+        default="design",
+        description="What sort of work this is. `design` runs RL against a "
+                    "profile and is what every task was before there were "
+                    "kinds; the others hand the brief to an agent with the "
+                    "full tool set and post back what it reports.",
+    )
+    title: Optional[str] = Field(
+        default=None, max_length=120,
+        description="A few words naming the task, for the person watching "
+                    "the team: what a bubble on the timeline is labelled.",
+    )
+    context: Optional[str] = Field(
+        default=None,
+        description="What the sub-agent needs to know and would otherwise "
+                    "have to rediscover: the target, what earlier tasks "
+                    "found, constraints the user stated. A sub-agent sees "
+                    "nothing of the conversation that dispatched it.",
+    )
+    deliverable: Optional[str] = Field(
+        default=None,
+        description="What the conductor wants back, so the report answers "
+                    "the question that was asked rather than the one the "
+                    "sub-agent found most interesting.",
+    )
     weight_overrides: dict[str, float] = Field(default_factory=dict)
     transform_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
     fidelity_tier: Literal["exploration", "validation"] = "exploration"
@@ -449,6 +645,31 @@ class TaskCreate(BaseModel):
                     "what to do by `intent` and should not be second-guessing "
                     "why it was asked.",
     )
+    workstream: Optional[str] = Field(
+        default=None, max_length=40,
+        description="Id of the plan's workstream this task belongs to",
+    )
+    priority: int = Field(
+        default=0, ge=-10, le=10,
+        description="Higher is claimed first; equal priorities go oldest first",
+    )
+    concurrency: Optional[int] = Field(
+        default=None, ge=1, le=64,
+        description="For a lead: how many sub-agents its workstream may hold",
+    )
+
+
+class TaskBatch(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    tasks: list[TaskCreate] = Field(min_length=1, max_length=200)
+
+
+class ProposalDecision(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    proposal_ids: list[str] = Field(min_length=1, max_length=200)
+    priority: int = Field(default=0, ge=-10, le=10)
 
 
 class ConcurrencyUpdate(BaseModel):
@@ -491,12 +712,28 @@ class ResultPost(BaseModel):
 
     owner: str
     objective_profile: dict[str, float] = Field(
-        description="Achieved value per objective, the coordinates of this task "
-                    "on the Pareto front",
+        default_factory=dict,
+        description="Achieved value per objective. Empty for work that "
+                    "scores nothing, such as a literature search.",
     )
     candidates: list[dict[str, Any]] = Field(default_factory=list)
     job_id: Optional[str] = None
     summary: Optional[str] = None
+    report: Optional[str] = Field(
+        default=None,
+        description="The sub-agent's own account of the task, for the "
+                    "conductor that dispatched it: what it did, what it "
+                    "found, and what it would do next.",
+    )
+    job_ids: list[str] = Field(
+        default_factory=list,
+        description="Every run the task started, `job_id` being the one its "
+                    "molecules came from. A research task may start none.",
+    )
+    follow_ups: list[FollowUp] = Field(
+        default_factory=list, max_length=5,
+        description="Next tasks the sub-agent would run, kept as proposals",
+    )
 
 
 class FailurePost(BaseModel):
@@ -548,6 +785,10 @@ def _campaign_row(row: sqlite3.Row) -> dict[str, Any]:
         "hard_stop_at": row["hard_stop_at"],
         "finalized_at": row["finalized_at"],
         "session_id": row["session_id"],
+        "conducted_at": row["conducted_at"],
+        "plan": json.loads(row["plan"]) if row["plan"] else None,
+        "parent_campaign_id": row["parent_campaign_id"],
+        "parent_task_id": row["parent_task_id"],
     }
 
 
@@ -582,17 +823,36 @@ def _task_row(row: sqlite3.Row) -> dict[str, Any]:
         "finished_at": row["finished_at"],
         "error": row["error"],
         "job_id": row["job_id"],
+        "claimed_by": row["claimed_by"],
+    }
+
+
+def _proposal_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "proposal_id": row["proposal_id"],
+        "campaign_id": row["campaign_id"],
+        "from_task_id": row["from_task_id"],
+        "spec": json.loads(row["spec"]),
+        "state": row["state"],
+        "created_at": row["created_at"],
+        "task_id": row["task_id"],
     }
 
 
 def _result_row(row: sqlite3.Row) -> dict[str, Any]:
+    job_ids = json.loads(row["job_ids"]) if row["job_ids"] else []
+    # Results posted before job_ids existed name their one run in job_id.
+    if not job_ids and row["job_id"]:
+        job_ids = [row["job_id"]]
     return {
         "task_id": row["task_id"],
         "campaign_id": row["campaign_id"],
         "job_id": row["job_id"],
+        "job_ids": job_ids,
         "objective_profile": json.loads(row["objective_profile"]),
         "candidates": json.loads(row["candidates"]),
         "summary": row["summary"],
+        "report": row["report"],
         "posted_at": row["posted_at"],
     }
 
@@ -675,10 +935,13 @@ def create_campaign(body: CampaignCreate) -> dict[str, Any]:
     hard_stop_at = dispatch_until + body.grace_seconds if dispatch_until else None
 
     with _write() as conn:
+        if body.parent_campaign_id:
+            _get_campaign(conn, body.parent_campaign_id)
         conn.execute(
             "INSERT INTO campaigns (campaign_id, goal, base_ttp_id, objectives, "
-            "concurrency, state, created_at, dispatch_until, hard_stop_at) "
-            "VALUES (?, ?, ?, ?, ?, 'dispatching', ?, ?, ?)",
+            "concurrency, state, created_at, dispatch_until, hard_stop_at, "
+            "parent_campaign_id, parent_task_id) "
+            "VALUES (?, ?, ?, ?, ?, 'dispatching', ?, ?, ?, ?, ?)",
             (
                 # Empty string rather than NULL for the absent TTP: the
                 # column was declared NOT NULL and SQLite cannot relax that
@@ -688,9 +951,14 @@ def create_campaign(body: CampaignCreate) -> dict[str, Any]:
                 campaign_id, body.goal, body.base_ttp_id or "",
                 json.dumps(body.objectives), body.concurrency,
                 _now_iso(), dispatch_until, hard_stop_at,
+                body.parent_campaign_id, body.parent_task_id,
             ),
         )
         _emit(conn, "campaign_created", campaign_id, goal=body.goal,
+              concurrency=body.concurrency)
+        if body.parent_campaign_id:
+            _emit(conn, "lead_campaign_opened", body.parent_campaign_id,
+                  body.parent_task_id, campaign_id=campaign_id, goal=body.goal,
               concurrency=body.concurrency)
         row = _get_campaign(conn, campaign_id)
 
@@ -811,6 +1079,23 @@ def close_campaign(campaign_id: str) -> dict[str, Any]:
         return _campaign_row(_get_campaign(conn, campaign_id))
 
 
+@app.post("/campaigns/{campaign_id}/conducted")
+def campaign_conducted(campaign_id: str) -> dict[str, Any]:
+    """A conductor saying it holds this campaign now; its loop says so every pass.
+
+    Not inferred from reads of the status: the chat window reads that too,
+    and a browser left open must not keep a campaign nobody conducts alive.
+    """
+
+    with _write() as conn:
+        _get_campaign(conn, campaign_id)
+        conn.execute(
+            "UPDATE campaigns SET conducted_at = ? WHERE campaign_id = ?",
+            (time.time(), campaign_id),
+        )
+        return _campaign_row(_get_campaign(conn, campaign_id))
+
+
 @app.post("/campaigns/{campaign_id}/concurrency")
 def set_concurrency(campaign_id: str, body: ConcurrencyUpdate) -> dict[str, Any]:
     """Change how many supervisors the campaign wants in flight.
@@ -874,68 +1159,613 @@ def finalize_campaign(campaign_id: str) -> dict[str, Any]:
 
     with _write() as conn:
         _get_campaign(conn, campaign_id)
-        conn.execute(
-            "UPDATE tasks SET state = 'abandoned', finished_at = ?, "
-            "error = 'campaign finalized', lease_owner = NULL, "
-            "lease_expires_at = NULL "
-            f"WHERE campaign_id = ? AND state IN {OPEN_TASK_STATES}",
-            (_now_iso(), campaign_id),
-        )
-        conn.execute(
-            "UPDATE campaigns SET state = 'finalized', finalized_at = ? "
-            "WHERE campaign_id = ?",
-            (_now_iso(), campaign_id),
-        )
-        _emit(conn, "campaign_finalized", campaign_id)
+        # Its leads' campaigns end with it: their sub-agents were its team.
+        for member in _team(conn, campaign_id):
+            conn.execute(
+                "UPDATE tasks SET state = 'abandoned', finished_at = ?, "
+                "error = 'campaign finalized', lease_owner = NULL, "
+                "lease_expires_at = NULL "
+                f"WHERE campaign_id = ? AND state IN {OPEN_TASK_STATES}",
+                (_now_iso(), member),
+            )
+            already = conn.execute(
+                "SELECT state FROM campaigns WHERE campaign_id = ?", (member,)
+            ).fetchone()["state"] == "finalized"
+            # A lead finalized on its own already emitted its event; finalizing
+            # the campaign above it must not announce the same ending twice.
+            if not already:
+                conn.execute(
+                    "UPDATE campaigns SET state = 'finalized', finalized_at = ? "
+                    "WHERE campaign_id = ?",
+                    (_now_iso(), member),
+                )
+                _emit(conn, "campaign_finalized", member)
         return _campaign_row(_get_campaign(conn, campaign_id))
 
 
 # -- tasks ------------------------------------------------------------------
 
+def _open_for_dispatch(conn: sqlite3.Connection, campaign_id: str) -> sqlite3.Row:
+    campaign = _get_campaign(conn, campaign_id)
+    if campaign["state"] != "dispatching":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Campaign {campaign_id} is {campaign['state']}; "
+                   "the queue is closed to new tasks",
+        )
+    return campaign
+
+
+def _insert_task(
+    conn: sqlite3.Connection, campaign_id: str, body: TaskCreate, known: set[str],
+) -> sqlite3.Row:
+    """Queue one task of a campaign already checked to be dispatching.
+
+    *known* is the campaign's task ids, grown by each insert so a batch may
+    derive a task from one queued earlier in the same batch.
+    """
+
+    # A lineage edge pointing at a task that does not exist, or at one in
+    # another campaign, is worse than no edge: it is drawn, believed, and
+    # wrong. Refuse it here, where the ids can still be checked.
+    unknown = [ref for ref in body.derived_from if ref not in known]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"derived_from names {', '.join(unknown)}, which "
+                   f"{'is' if len(unknown) == 1 else 'are'} not a task "
+                   f"of campaign {campaign_id}",
+        )
+
+    task_id = _new_id()
+    conn.execute(
+        "INSERT INTO tasks (task_id, campaign_id, spec, state, created_at) "
+        "VALUES (?, ?, ?, 'queued', ?)",
+        (task_id, campaign_id, body.model_dump_json(), _now_iso()),
+    )
+    known.add(task_id)
+    _emit(conn, "task_enqueued", campaign_id, task_id,
+          task_kind=body.kind, title=body.title,
+          weight_overrides=body.weight_overrides,
+          derived_from=body.derived_from,
+          fidelity_tier=body.fidelity_tier,
+          workstream=body.workstream, priority=body.priority)
+    return conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+
+
+def _task_ids(conn: sqlite3.Connection, campaign_id: str) -> set[str]:
+    return {
+        row["task_id"] for row in conn.execute(
+            "SELECT task_id FROM tasks WHERE campaign_id = ?", (campaign_id,)
+        )
+    }
+
+
 @app.post("/campaigns/{campaign_id}/tasks", status_code=201)
 def enqueue_task(campaign_id: str, body: TaskCreate) -> dict[str, Any]:
     with _write() as conn:
-        campaign = _get_campaign(conn, campaign_id)
-        if campaign["state"] != "dispatching":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Campaign {campaign_id} is {campaign['state']}; "
-                       "the queue is closed to new tasks",
-            )
-
-        # A lineage edge pointing at a task that does not exist, or at one in
-        # another campaign, is worse than no edge: it is drawn, believed, and
-        # wrong. Refuse it here, where the ids can still be checked.
-        if body.derived_from:
-            known = {
-                row["task_id"] for row in conn.execute(
-                    "SELECT task_id FROM tasks WHERE campaign_id = ?", (campaign_id,)
-                )
-            }
-            unknown = [ref for ref in body.derived_from if ref not in known]
-            if unknown:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"derived_from names {', '.join(unknown)}, which "
-                           f"{'is' if len(unknown) == 1 else 'are'} not a task "
-                           f"of campaign {campaign_id}",
-                )
-
-        task_id = _new_id()
-        conn.execute(
-            "INSERT INTO tasks (task_id, campaign_id, spec, state, created_at) "
-            "VALUES (?, ?, ?, 'queued', ?)",
-            (task_id, campaign_id, body.model_dump_json(), _now_iso()),
-        )
-        _emit(conn, "task_enqueued", campaign_id, task_id,
-              weight_overrides=body.weight_overrides,
-              derived_from=body.derived_from,
-              fidelity_tier=body.fidelity_tier)
-        row = conn.execute(
-            "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
-        ).fetchone()
-
+        _open_for_dispatch(conn, campaign_id)
+        row = _insert_task(conn, campaign_id, body, _task_ids(conn, campaign_id))
     return _task_row(row)
+
+
+@app.post("/campaigns/{campaign_id}/tasks/batch", status_code=201)
+def enqueue_tasks(campaign_id: str, body: TaskBatch) -> list[dict[str, Any]]:
+    """Queue several tasks at once, all or none.
+
+    One transaction: a batch refused halfway would leave the conductor
+    guessing which of its tasks exist.
+    """
+
+    with _write() as conn:
+        _open_for_dispatch(conn, campaign_id)
+        known = _task_ids(conn, campaign_id)
+        rows = [_insert_task(conn, campaign_id, task, known) for task in body.tasks]
+    return [_task_row(row) for row in rows]
+
+
+# -- the plan ------------------------------------------------------------------
+
+@app.put("/campaigns/{campaign_id}/plan")
+def set_plan(campaign_id: str, body: PlanUpdate) -> dict[str, Any]:
+    """The workstreams the goal is split into. Replaces the previous plan."""
+
+    ids = [stream.id for stream in body.workstreams]
+    if len(set(ids)) != len(ids):
+        raise HTTPException(status_code=400, detail="workstream ids must be unique")
+    plan = {"workstreams": [stream.model_dump() for stream in body.workstreams]}
+    with _write() as conn:
+        _get_campaign(conn, campaign_id)
+        conn.execute(
+            "UPDATE campaigns SET plan = ? WHERE campaign_id = ?",
+            (json.dumps(plan), campaign_id),
+        )
+        _emit(conn, "plan_set", campaign_id, workstreams=ids)
+        return _campaign_row(_get_campaign(conn, campaign_id))
+
+
+def _team(conn: sqlite3.Connection, campaign_id: str) -> list[str]:
+    """The campaign and every lead's campaign below it."""
+
+    return [
+        row["campaign_id"] for row in conn.execute(
+            "WITH RECURSIVE team(campaign_id) AS ("
+            " SELECT ? UNION"
+            " SELECT c.campaign_id FROM campaigns c JOIN team t"
+            " ON c.parent_campaign_id = t.campaign_id)"
+            " SELECT campaign_id FROM team",
+            (campaign_id,),
+        )
+    ]
+
+
+@app.get("/campaigns/{campaign_id}/coverage")
+def coverage(campaign_id: str) -> dict[str, Any]:
+    """How the work spreads over the plan: per workstream, what is queued,
+    running and done, and the latest finding.
+
+    The view a conductor of many sub-agents decides from instead of rereading
+    every report: a workstream nobody is working is a gap, one holding most
+    of the team is a bet.
+    """
+
+    with _read() as conn:
+        campaign = _campaign_row(_get_campaign(conn, campaign_id))
+        rows = conn.execute(
+            "SELECT t.task_id, t.state, t.spec, r.summary, r.posted_at "
+            "FROM tasks t LEFT JOIN results r USING (task_id) "
+            "WHERE t.campaign_id = ? ORDER BY t.created_at",
+            (campaign_id,),
+        ).fetchall()
+        open_proposals = conn.execute(
+            "SELECT spec FROM proposals WHERE campaign_id = ? AND state = 'open'",
+            (campaign_id,),
+        ).fetchall()
+
+    streams = (campaign["plan"] or {}).get("workstreams") or []
+    by_id: dict[str, dict[str, Any]] = {
+        stream["id"]: {**stream, "counts": {}, "latest": None, "proposals": 0}
+        for stream in streams
+    }
+    unplanned = {"id": None, "name": "Not in the plan", "counts": {}, "latest": None, "proposals": 0}
+    for row in rows:
+        spec = json.loads(row["spec"])
+        entry = by_id.get(spec.get("workstream") or "", unplanned)
+        entry["counts"][row["state"]] = entry["counts"].get(row["state"], 0) + 1
+        if row["summary"] and (entry["latest"] is None or row["posted_at"] > entry["latest"]["posted_at"]):
+            entry["latest"] = {"task_id": row["task_id"], "summary": row["summary"], "posted_at": row["posted_at"]}
+    for row in open_proposals:
+        spec = json.loads(row["spec"])
+        by_id.get(spec.get("workstream") or "", unplanned)["proposals"] += 1
+
+    workstreams = list(by_id.values())
+    if unplanned["counts"] or unplanned["proposals"]:
+        workstreams.append(unplanned)
+    for entry in workstreams:
+        counts = entry["counts"]
+        entry["active"] = counts.get("queued", 0) + counts.get("claimed", 0)
+    gaps = [
+        entry["id"] for entry in workstreams
+        if entry["id"] and entry.get("status", "open") == "open" and not entry["active"]
+    ]
+    return {
+        "campaign_id": campaign_id,
+        "goal": campaign["goal"],
+        "has_plan": bool(streams),
+        "workstreams": workstreams,
+        "gaps": gaps,
+        "open_proposals": len(open_proposals),
+    }
+
+
+# -- proposals -----------------------------------------------------------------
+
+@app.get("/campaigns/{campaign_id}/proposals")
+def list_proposals(campaign_id: str, state: Optional[ProposalState] = "open") -> list[dict[str, Any]]:
+    with _read() as conn:
+        _get_campaign(conn, campaign_id)
+        sql = "SELECT * FROM proposals WHERE campaign_id = ?"
+        args: list[Any] = [campaign_id]
+        if state:
+            sql += " AND state = ?"
+            args.append(state)
+        rows = conn.execute(sql + " ORDER BY created_at", args).fetchall()
+    return [_proposal_row(row) for row in rows]
+
+
+def _open_proposals(
+    conn: sqlite3.Connection, campaign_id: str, ids: list[str],
+) -> list[sqlite3.Row]:
+    rows = [
+        conn.execute(
+            "SELECT * FROM proposals WHERE proposal_id = ? AND campaign_id = ?",
+            (proposal_id, campaign_id),
+        ).fetchone()
+        for proposal_id in ids
+    ]
+    missing = [pid for pid, row in zip(ids, rows) if row is None]
+    if missing:
+        raise HTTPException(status_code=404, detail=f"No proposal {', '.join(missing)} in campaign {campaign_id}")
+    closed = [row["proposal_id"] for row in rows if row["state"] != "open"]
+    if closed:
+        raise HTTPException(status_code=409, detail=f"Proposal {', '.join(closed)} is no longer open")
+    return rows
+
+
+@app.post("/campaigns/{campaign_id}/proposals/take", status_code=201)
+def take_proposals(campaign_id: str, body: ProposalDecision) -> list[dict[str, Any]]:
+    """Queue proposals as tasks, each derived from the task that proposed it."""
+
+    with _write() as conn:
+        _open_for_dispatch(conn, campaign_id)
+        known = _task_ids(conn, campaign_id)
+        rows = []
+        for proposal in _open_proposals(conn, campaign_id, body.proposal_ids):
+            spec = json.loads(proposal["spec"])
+            source = proposal["from_task_id"]
+            task = TaskCreate(
+                kind=spec.get("kind") or "research",
+                title=spec.get("title"),
+                intent=spec["intent"],
+                rationale=spec.get("rationale"),
+                workstream=spec.get("workstream"),
+                derived_from=[source] if source in known else [],
+                priority=body.priority,
+            )
+            row = _insert_task(conn, campaign_id, task, known)
+            conn.execute(
+                "UPDATE proposals SET state = 'taken', task_id = ? WHERE proposal_id = ?",
+                (row["task_id"], proposal["proposal_id"]),
+            )
+            rows.append(row)
+    return [_task_row(row) for row in rows]
+
+
+@app.post("/campaigns/{campaign_id}/proposals/drop")
+def drop_proposals(campaign_id: str, body: ProposalDecision) -> dict[str, Any]:
+    with _write() as conn:
+        _get_campaign(conn, campaign_id)
+        for proposal in _open_proposals(conn, campaign_id, body.proposal_ids):
+            conn.execute(
+                "UPDATE proposals SET state = 'dropped' WHERE proposal_id = ?",
+                (proposal["proposal_id"],),
+            )
+    return {"dropped": body.proposal_ids}
+
+
+# -- the atlas: what the campaign knows ----------------------------------------
+
+def _finding_row(row: sqlite3.Row, notes: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+    return {
+        "finding_id": row["finding_id"],
+        "campaign_id": row["campaign_id"],
+        "branch": row["branch"],
+        "claim": row["claim"],
+        "detail": row["detail"],
+        "evidence": json.loads(row["evidence"]),
+        "confidence": row["confidence"],
+        "tags": json.loads(row["tags"]),
+        "author": row["author"],
+        "task_id": row["task_id"],
+        "created_at": row["created_at"],
+        "supersedes": row["supersedes"],
+        "superseded_by": row["superseded_by"],
+        "notes": notes if notes is not None else [],
+    }
+
+
+def _note_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "note_id": row["note_id"],
+        "finding_id": row["finding_id"],
+        "body": row["body"],
+        "stance": row["stance"],
+        "author": row["author"],
+        "task_id": row["task_id"],
+        "created_at": row["created_at"],
+    }
+
+
+def _notes_for(
+    conn: sqlite3.Connection, finding_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Every note on these findings, in one query rather than one per finding."""
+
+    if not finding_ids:
+        return {}
+    marks = ",".join("?" * len(finding_ids))
+    rows = conn.execute(
+        f"SELECT * FROM finding_notes WHERE finding_id IN ({marks}) ORDER BY note_id",
+        finding_ids,
+    ).fetchall()
+    notes: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        notes.setdefault(row["finding_id"], []).append(_note_row(row))
+    return notes
+
+
+@app.post("/campaigns/{campaign_id}/findings", status_code=201)
+def record_finding(campaign_id: str, body: FindingPost) -> dict[str, Any]:
+    """Record something the campaign now knows.
+
+    Superseding is the only way to take a finding back, and it is checked
+    here: the superseded finding has to belong to this campaign, so one
+    campaign cannot rewrite another's record.
+    """
+
+    with _write() as conn:
+        _get_campaign(conn, campaign_id)
+        if body.supersedes:
+            old = conn.execute(
+                "SELECT finding_id FROM findings WHERE finding_id = ? AND campaign_id = ?",
+                (body.supersedes, campaign_id),
+            ).fetchone()
+            if old is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No finding {body.supersedes} in campaign {campaign_id}",
+                )
+        finding_id = _new_id()
+        created_at = _now_iso()
+        conn.execute(
+            "INSERT INTO findings (finding_id, campaign_id, branch, claim, detail, "
+            "evidence, confidence, tags, author, task_id, created_at, supersedes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                finding_id, campaign_id, body.branch, body.claim, body.detail,
+                json.dumps(body.evidence), body.confidence, json.dumps(body.tags),
+                body.author, body.task_id, created_at, body.supersedes,
+            ),
+        )
+        if body.supersedes:
+            conn.execute(
+                "UPDATE findings SET superseded_by = ? WHERE finding_id = ?",
+                (finding_id, body.supersedes),
+            )
+        _emit(
+            conn, "finding_recorded", campaign_id, task_id=body.task_id,
+            finding_id=finding_id, branch=body.branch, claim=body.claim,
+        )
+        row = conn.execute(
+            "SELECT * FROM findings WHERE finding_id = ?", (finding_id,)
+        ).fetchone()
+    return _finding_row(row)
+
+
+@app.post("/campaigns/{campaign_id}/findings/{finding_id}/notes", status_code=201)
+def note_finding(campaign_id: str, finding_id: str, body: NotePost) -> dict[str, Any]:
+    """Hang a second opinion off a finding, without overwriting it."""
+
+    with _write() as conn:
+        _get_campaign(conn, campaign_id)
+        found = conn.execute(
+            "SELECT finding_id FROM findings WHERE finding_id = ? AND campaign_id = ?",
+            (finding_id, campaign_id),
+        ).fetchone()
+        if found is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No finding {finding_id} in campaign {campaign_id}",
+            )
+        cursor = conn.execute(
+            "INSERT INTO finding_notes (finding_id, campaign_id, body, stance, "
+            "author, task_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                finding_id, campaign_id, body.body, body.stance,
+                body.author, body.task_id, _now_iso(),
+            ),
+        )
+        _emit(
+            conn, "finding_noted", campaign_id, task_id=body.task_id,
+            finding_id=finding_id, stance=body.stance,
+        )
+        row = conn.execute(
+            "SELECT * FROM finding_notes WHERE note_id = ?", (cursor.lastrowid,)
+        ).fetchone()
+    return _note_row(row)
+
+
+@app.get("/campaigns/{campaign_id}/findings")
+def list_findings(
+    campaign_id: str,
+    branch: Optional[str] = None,
+    q: Optional[str] = None,
+    tag: Optional[str] = None,
+    limit: int = 50,
+    include_superseded: bool = False,
+) -> dict[str, Any]:
+    """Findings, narrowed by branch, by words or by tag.
+
+    ``q`` matches a finding that contains every word somewhere in its claim,
+    detail or tags. LIKE rather than a full-text index: a campaign records
+    hundreds of findings, not millions, and an index is a schema to migrate
+    and keep in step for a scan that takes a millisecond.
+    """
+
+    limit = max(1, min(limit, 200))
+    sql = "SELECT * FROM findings WHERE campaign_id = ?"
+    args: list[Any] = [campaign_id]
+    if branch:
+        sql += " AND branch = ?"
+        args.append(_branch_key(branch))
+    if not include_superseded:
+        sql += " AND superseded_by IS NULL"
+    if tag:
+        sql += " AND lower(tags) LIKE ?"
+        args.append(f'%"{tag.lower()}"%')
+    for word in (q or "").split():
+        sql += " AND lower(claim || ' ' || COALESCE(detail, '') || ' ' || tags) LIKE ?"
+        args.append(f"%{word.lower()}%")
+
+    with _read() as conn:
+        _get_campaign(conn, campaign_id)
+        rows = conn.execute(
+            sql + " ORDER BY created_at DESC LIMIT ?", args + [limit]
+        ).fetchall()
+        notes = _notes_for(conn, [row["finding_id"] for row in rows])
+    return {
+        "campaign_id": campaign_id,
+        "branch": branch,
+        "findings": [
+            _finding_row(row, notes.get(row["finding_id"], [])) for row in rows
+        ],
+    }
+
+
+@app.get("/campaigns/{campaign_id}/atlas")
+def atlas(campaign_id: str) -> dict[str, Any]:
+    """The map: which branches hold what, without the findings themselves.
+
+    Branches come from the plan, so one the plan names but nobody has filed
+    anything under still shows -- an empty branch is the most useful thing
+    here, being the part of the goal the campaign knows nothing about.
+    """
+
+    with _read() as conn:
+        campaign = _campaign_row(_get_campaign(conn, campaign_id))
+        rows = conn.execute(
+            "SELECT * FROM findings WHERE campaign_id = ? AND superseded_by IS NULL "
+            "ORDER BY created_at",
+            (campaign_id,),
+        ).fetchall()
+        disputed = {
+            row["finding_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT finding_id FROM finding_notes "
+                "WHERE campaign_id = ? AND stance = 'disputes'",
+                (campaign_id,),
+            ).fetchall()
+        }
+
+    streams = (campaign["plan"] or {}).get("workstreams") or []
+    by_branch: dict[str, dict[str, Any]] = {
+        _branch_key(stream["id"]): {
+            "branch": _branch_key(stream["id"]), "name": stream["name"],
+            "in_plan": True,
+            "findings": 0, "disputed": 0, "latest": None, "tags": [],
+        }
+        for stream in streams
+    }
+    seen: dict[str, set[str]] = {}
+    for row in rows:
+        entry = by_branch.setdefault(row["branch"], {
+            "branch": row["branch"], "name": row["branch"], "in_plan": False,
+            "findings": 0, "disputed": 0, "latest": None, "tags": [],
+        })
+        entry["findings"] += 1
+        if row["finding_id"] in disputed:
+            entry["disputed"] += 1
+        # Rows arrive oldest first, so the last to overwrite this is the newest.
+        entry["latest"] = {
+            "finding_id": row["finding_id"],
+            "claim": row["claim"],
+            "confidence": row["confidence"],
+            "created_at": row["created_at"],
+        }
+        seen.setdefault(row["branch"], set()).update(json.loads(row["tags"]))
+    for branch, tags in seen.items():
+        by_branch[branch]["tags"] = sorted(tags)[:12]
+
+    branches = list(by_branch.values())
+    return {
+        "campaign_id": campaign_id,
+        "goal": campaign["goal"],
+        "findings": len(rows),
+        "branches": branches,
+        "empty_branches": [b["branch"] for b in branches if not b["findings"]],
+    }
+
+
+# -- how well the team is used -------------------------------------------------
+
+def _epoch(stamp: Optional[str]) -> Optional[float]:
+    if not stamp:
+        return None
+    try:
+        then = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return then.timestamp()
+
+
+@app.get("/campaigns/{campaign_id}/metrics")
+def metrics(campaign_id: str) -> dict[str, Any]:
+    """Whether the team is kept busy, measured rather than assumed.
+
+    ``utilisation`` is the share of the slots' time spent holding a task,
+    from the first claim until now (or until the campaign finalized), over
+    the campaign and its leads' campaigns. ``handoff_seconds`` is how long a
+    sub-agent waited between finishing one task and claiming its next: the
+    ping-pong, timed.
+    """
+
+    with _write() as conn:
+        campaign = _get_campaign(conn, campaign_id)
+        _sweep_expired_leases(conn)
+        team = _team(conn, campaign_id)
+        marks = ",".join("?" * len(team))
+        rows = conn.execute(
+            f"SELECT task_id, state, claimed_at, finished_at, claimed_by FROM tasks "
+            f"WHERE campaign_id IN ({marks})",
+            team,
+        ).fetchall()
+
+    end = _epoch(campaign["finalized_at"]) or time.time()
+    claims = [(row, _epoch(row["claimed_at"])) for row in rows]
+    started = [at for _, at in claims if at is not None]
+    first = min(started) if started else None
+    busy = 0.0
+    for row, at in claims:
+        if at is None:
+            continue
+        stop = _epoch(row["finished_at"]) or (end if row["state"] == "claimed" else None)
+        if stop is not None:
+            busy += max(0.0, min(stop, end) - at)
+    slots = max(int(campaign["concurrency"] or 1), 1)
+    span = (end - first) if first is not None else 0.0
+    utilisation = round(min(1.0, busy / (slots * span)), 3) if span > 0 else None
+
+    by_owner: dict[str, list[tuple[float, Optional[float]]]] = {}
+    for row, at in claims:
+        if at is not None and row["claimed_by"]:
+            by_owner.setdefault(row["claimed_by"], []).append((at, _epoch(row["finished_at"])))
+    handoffs: list[float] = []
+    for spans in by_owner.values():
+        spans.sort()
+        for (_, done), (nxt, _) in zip(spans, spans[1:]):
+            if done is not None:
+                handoffs.append(max(0.0, nxt - done))
+    handoffs.sort()
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["state"]] = counts.get(row["state"], 0) + 1
+    running = counts.get("claimed", 0)
+    return {
+        "campaign_id": campaign_id,
+        "team": team,
+        "concurrency": slots,
+        "running": running,
+        "queued": counts.get("queued", 0),
+        "free_slots": max(0, slots - running),
+        "backlog_target": backlog_target(slots),
+        "utilisation": utilisation,
+        "busy_seconds": round(busy, 1),
+        "handoffs": len(handoffs),
+        "handoff_seconds": {
+            "median": round(handoffs[len(handoffs) // 2], 1) if handoffs else None,
+            "max": round(handoffs[-1], 1) if handoffs else None,
+        },
+    }
+
+
+def backlog_target(concurrency: int) -> int:
+    """Tasks to keep queued beyond the running ones, so a sub-agent that
+    finishes claims its next at once instead of waiting on the conductor.
+    Half the team, at least one."""
+
+    return max(1, math.ceil(concurrency / 2))
 
 
 @app.get("/campaigns/{campaign_id}/tasks")
@@ -970,19 +1800,34 @@ def claim_task(body: ClaimRequest) -> Any:
         )
         args: list[Any] = []
         if body.campaign_id:
-            sql += " AND t.campaign_id = ?"
-            args.append(body.campaign_id)
+            # Its leads' campaigns draw on the same pool.
+            team = _team(conn, body.campaign_id)
+            sql += f" AND t.campaign_id IN ({','.join('?' * len(team))})"
+            args.extend(team)
+        else:
+            # A campaign whose conductor has gone quiet -- its conversation's
+            # session ended, its gateway restarted -- keeps its queue, but a
+            # supervisor working any campaign must not take from it: the
+            # oldest task first would otherwise hand the next session's pool
+            # to work nobody is reading. One that never had a conductor, a
+            # campaign fed from the command line, is claimable as it was.
+            sql += " AND (c.conducted_at IS NULL OR c.conducted_at >= ?)"
+            args.append(time.time() - CONDUCTED_WITHIN_SECONDS)
 
-        row = conn.execute(sql + " ORDER BY t.created_at LIMIT 1", args).fetchone()
+        row = conn.execute(
+            sql + " ORDER BY COALESCE(json_extract(t.spec, '$.priority'), 0) DESC, "
+            "t.created_at LIMIT 1",
+            args,
+        ).fetchone()
         if row is None:
             return Response(status_code=204)
 
         expires = time.time() + body.lease_seconds
         conn.execute(
-            "UPDATE tasks SET state = 'claimed', lease_owner = ?, "
+            "UPDATE tasks SET state = 'claimed', lease_owner = ?, claimed_by = ?, "
             "lease_expires_at = ?, claimed_at = ?, attempts = attempts + 1 "
             "WHERE task_id = ?",
-            (body.owner, expires, _now_iso(), row["task_id"]),
+            (body.owner, body.owner, expires, _now_iso(), row["task_id"]),
         )
         _emit(conn, "task_claimed", row["campaign_id"], row["task_id"],
               owner=body.owner, lease_seconds=body.lease_seconds)
@@ -1115,16 +1960,24 @@ def list_supervisors(campaign_id: Optional[str] = None) -> dict[str, Any]:
 
 @app.post("/tasks/{task_id}/result")
 def post_result(task_id: str, body: ResultPost) -> dict[str, Any]:
+    report = body.report
+    if report and len(report) > MAX_REPORT_CHARS:
+        report = report[:MAX_REPORT_CHARS] + "\n\n[report truncated by the ledger]"
+    job_ids = list(dict.fromkeys(
+        [*body.job_ids, *([body.job_id] if body.job_id else [])]
+    ))
+
     with _write() as conn:
         task = _owned_task(conn, task_id, body.owner)
+        spec = json.loads(task["spec"])
         conn.execute(
             "INSERT OR REPLACE INTO results (task_id, campaign_id, job_id, "
-            "objective_profile, candidates, summary, posted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "objective_profile, candidates, summary, posted_at, report, job_ids) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id, task["campaign_id"], body.job_id,
                 json.dumps(body.objective_profile), json.dumps(body.candidates),
-                body.summary, _now_iso(),
+                body.summary, _now_iso(), report, json.dumps(job_ids),
             ),
         )
         conn.execute(
@@ -1132,9 +1985,22 @@ def post_result(task_id: str, body: ResultPost) -> dict[str, Any]:
             "lease_expires_at = NULL WHERE task_id = ?",
             (_now_iso(), task_id),
         )
+        for follow_up in body.follow_ups:
+            proposal = follow_up.model_dump()
+            # Unless it says otherwise, a next step continues its task's workstream.
+            proposal["workstream"] = proposal.get("workstream") or spec.get("workstream")
+            conn.execute(
+                "INSERT INTO proposals (proposal_id, campaign_id, from_task_id, spec, "
+                "state, created_at) VALUES (?, ?, ?, ?, 'open', ?)",
+                (_new_id(), task["campaign_id"], task_id, json.dumps(proposal), _now_iso()),
+        )
         _emit(conn, "task_done", task["campaign_id"], task_id,
               owner=body.owner, objective_profile=body.objective_profile,
-              n_candidates=len(body.candidates))
+              n_candidates=len(body.candidates),
+              task_kind=spec.get("kind") or "design", title=spec.get("title"),
+              summary=body.summary, job_ids=job_ids,
+              workstream=spec.get("workstream"),
+              n_follow_ups=len(body.follow_ups))
         row = conn.execute(
             "SELECT * FROM results WHERE task_id = ?", (task_id,)
         ).fetchone()
@@ -1177,7 +2043,7 @@ def fail_task(task_id: str, body: FailurePost) -> dict[str, Any]:
     return _task_row(row)
 
 
-# -- results, front, events -------------------------------------------------
+# -- results, events --------------------------------------------------------
 
 # Scorer columns that say whether an objective's value means anything, as
 # opposed to re-expressing it. Kept beside the objectives they qualify: an
@@ -1225,11 +2091,15 @@ def _scored_candidate(
     """
 
     components = candidate.get("components") or {}
-    return {
+    scored = {
         "smiles": candidate.get("smiles"),
         "total_score": candidate.get("total_score"),
         "components": _objective_scores(components, objectives),
     }
+    # The run that scored it: eight characters, and how its complex is found.
+    if candidate.get("job_id"):
+        scored["job_id"] = candidate["job_id"]
+    return scored
 
 
 @app.get("/campaigns/{campaign_id}/results")
@@ -1278,61 +2148,6 @@ def list_results(campaign_id: str, full: bool = False) -> list[dict[str, Any]]:
             ),
         })
     return narrowed
-
-
-def _front_entry(result: dict[str, Any], objectives: list[str]) -> dict[str, Any]:
-    """One front member as coordinates, not molecules.
-
-    The front answers "which trade-offs are worth looking at"; the molecules
-    behind a point are a follow-up question, answered by the result endpoint
-    for that one task. Returning them inline made this response ~42k tokens
-    for a three-member front -- larger on its own than the conductor model's
-    32768-token context, so asking about the front failed outright with
-    "max_tokens must be at least 1, got -72257".
-
-    The profile is also narrowed to the campaign's declared objectives. A
-    stored profile can carry a scorer's per-molecule diagnostics alongside
-    them, and those are not axes of the front.
-    """
-
-    profile = result["objective_profile"]
-    return {
-        "task_id": result["task_id"],
-        "job_id": result["job_id"],
-        "objective_profile": {
-            name: profile[name] for name in objectives if name in profile
-        },
-        "n_candidates": len(result.get("candidates") or []),
-        "summary": result.get("summary"),
-        "posted_at": result.get("posted_at"),
-    }
-
-
-@app.get("/campaigns/{campaign_id}/pareto")
-def get_pareto(campaign_id: str) -> dict[str, Any]:
-    with _read() as conn:
-        campaign = _get_campaign(conn, campaign_id)
-        objectives = json.loads(campaign["objectives"])
-        rows = conn.execute(
-            "SELECT * FROM results WHERE campaign_id = ?", (campaign_id,)
-        ).fetchall()
-
-    front, ineligible = pareto_front([_result_row(r) for r in rows], objectives)
-    return {
-        "campaign_id": campaign_id,
-        "objectives": objectives,
-        "n_results": len(rows),
-        "front": [_front_entry(r, objectives) for r in front],
-        "ineligible": [
-            {**_front_entry(r, objectives),
-             "missing_objectives": r.get("missing_objectives")}
-            for r in ineligible
-        ],
-        "molecules_hint": (
-            "Use get_supervisor_result(campaign_id, task_id) for the molecules "
-            "behind a point."
-        ),
-    }
 
 
 @app.get("/campaigns/{campaign_id}/events")
@@ -1397,26 +2212,36 @@ def campaign_status(campaign_id: str) -> dict[str, Any]:
                 (campaign_id,),
             )
         ]
-        results = [
-            _result_row(r) for r in conn.execute(
-                "SELECT * FROM results WHERE campaign_id = ?", (campaign_id,)
-            )
-        ]
+        n_results = conn.execute(
+            "SELECT COUNT(*) FROM results WHERE campaign_id = ?", (campaign_id,)
+        ).fetchone()[0]
+        team = _team(conn, campaign_id)
+        team_counts = dict(counts)
+        if len(team) > 1:
+            marks = ",".join("?" * (len(team) - 1))
+            for row in conn.execute(
+                f"SELECT state, COUNT(*) AS n FROM tasks WHERE campaign_id IN ({marks}) "
+                "GROUP BY state",
+                team[1:],
+            ):
+                team_counts[row["state"]] = team_counts.get(row["state"], 0) + row["n"]
+        open_proposals = conn.execute(
+            "SELECT COUNT(*) FROM proposals WHERE campaign_id = ? AND state = 'open'",
+            (campaign_id,),
+        ).fetchone()[0]
 
-    objectives = json.loads(campaign["objectives"])
-    front, ineligible = pareto_front(results, objectives)
     now = time.time()
 
     return {
         "campaign": _campaign_row(campaign),
         "task_counts": counts,
+        # With the leads' campaigns: what the shared pool is actually holding.
+        "team_counts": team_counts,
+        "team": team,
+        "backlog_target": backlog_target(int(campaign["concurrency"] or 1)),
+        "open_proposals": open_proposals,
         "in_flight": in_flight,
-        "n_results": len(results),
-        "front": [
-            {"task_id": r["task_id"], "objective_profile": r["objective_profile"]}
-            for r in front
-        ],
-        "n_ineligible": len(ineligible),
+        "n_results": n_results,
         "window": {
             "dispatch_remaining": (
                 round(campaign["dispatch_until"] - now, 1)

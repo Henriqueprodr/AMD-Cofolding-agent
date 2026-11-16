@@ -82,6 +82,11 @@ spec:
                 configMapKeyRef:
                   name: dd-agentic-config
                   key: REINVENT4_AGENT_MULTI_AGENT
+            - name: REINVENT4_AGENT_MAX_TOKENS
+              valueFrom:
+                configMapKeyRef:
+                  name: dd-agentic-config
+                  key: REINVENT4_AGENT_MAX_TOKENS
             - name: REINVENT4_AGENT_LOG_DIR
               valueFrom:
                 configMapKeyRef:

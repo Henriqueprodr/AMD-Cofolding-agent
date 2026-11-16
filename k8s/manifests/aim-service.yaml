@@ -42,8 +42,8 @@ spec:
       # 4096), so unlike the supervisor tier below this needs no hf-overrides
       # -- the weights are configured for it.
       #
-      # 32768 was not enough. Asking this endpoint for a Pareto front with
-      # the molecules behind each point sent ~42k tokens of tool results and
+      # 32768 was not enough. Asking this endpoint for the best results with
+      # the molecules behind each one sent ~42k tokens of tool results and
       # failed with "max_tokens must be at least 1, got -72257", because
       # vLLM derives max_tokens as max-model-len minus the prompt. The
       # payloads were narrowed to ~8k for that, so this is headroom rather

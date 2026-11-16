@@ -212,6 +212,25 @@ for row in "${INSTANCES[@]}"; do
     # Loading in-process costs little on CPU and cannot deadlock.
     if [ "${name}" = "admet-predictor" ]; then
         opts+=(--env "PRED_LOADER_WORKERS=${PRED_LOADER_WORKERS:-0}")
+        # The image bakes a single flat 7-endpoint model set and a core.py that
+        # hardcodes those seven. The dual-stack bundle below carries its own
+        # manifest per set, so it needs the manifest-driven core from this
+        # checkout as well as the weights -- binding one without the other
+        # leaves the service reading a layout its code does not understand.
+        ADMET_MODELS="${ADMET_MODELS:-${ROOT_DIR}/models/admet}"
+        ADMET_PKG="${ROOT_DIR}/admet-predictor/src/admet_predictor"
+        if [ -d "${ADMET_MODELS}" ] && [ -d "${ADMET_PKG}" ]; then
+            opts+=(--bind "${ADMET_MODELS}:/app/models")
+            opts+=(--bind "${ADMET_PKG}:${ADMET_SITE_PACKAGES:-/usr/local/lib/python3.12/site-packages}/admet_predictor")
+            opts+=(--env "MODELS_DIR=/app/models")
+        fi
+    fi
+    # These two bake app.py and little else that moves, so bind the checkout's
+    # copy over it as the profiler and campaign-store do. Without it a one-line
+    # route or /health fix needs a full image rebuild, and until that rebuild
+    # lands the service keeps answering from whatever was baked.
+    if [ "${name}" = "posebusters" ] || [ "${name}" = "admet-predictor" ]; then
+        opts+=(--bind "${ROOT_DIR}/services/${name}/app.py:/app/app.py")
     fi
     # The ledger is a SQLite file, so it has to outlive the instance. The app
     # itself is bound over the baked-in copy for the same reason the profiler
@@ -237,9 +256,28 @@ for row in "${INSTANCES[@]}"; do
         fi
     fi
     # The image installs the profiler package at build time; bind the checkout
-    # over it so profiler fixes deploy without a rebuild.
+    # over it so profiler fixes deploy without a rebuild. The app is bound for
+    # the same reason: the baked copy predates the v2 /profile_complex route,
+    # so binding only the package leaves the route unregistered and every
+    # profile_complex_interaction call answers 404 while the library it would
+    # have called sits there working.
     if [ "${name}" = "interaction-profiler" ]; then
         opts+=(--bind "${ROOT_DIR}/interaction-profiler/src/interaction_profiler:/opt/conda/lib/python3.11/site-packages/interaction_profiler")
+        opts+=(--bind "${ROOT_DIR}/services/interaction-profiler/app.py:/app/app.py")
+        # Images built before the .def gained fpocket, requests and freesasa
+        # lack all three, and LUMI cannot rebuild them (no --fakeroot). None is
+        # a hard import, so the service starts and characterize_site_profile
+        # answers with an empty pocket profile. Installed outside the image
+        # (requests via pip, fpocket and freesasa from conda-forge), they are
+        # bound at their own path because freesasa is linked in from its env.
+        IP_DEPS="${IP_DEPS:-${ROOT_DIR}/data/interaction-profiler-deps}"
+        if [ -d "${IP_DEPS}/site-packages" ]; then
+            opts+=(--bind "${IP_DEPS}:${IP_DEPS}")
+            opts+=(--env "PYTHONPATH=${IP_DEPS}/site-packages")
+            if [ -x "${IP_DEPS}/fpocket/bin/fpocket" ]; then
+                opts+=(--env "FPOCKET_BIN=${IP_DEPS}/fpocket/bin/fpocket")
+            fi
+        fi
     fi
     if [ "${kind}" = "gpu" ]; then
         opts+=(${GPU_FLAG})
@@ -308,6 +346,15 @@ AGENT_BINDS=(
 if [ -n "${REINVENT4_WEB_MODEL_CONTROL:-}" ] && [ -d "${REINVENT4_WEB_MODEL_CONTROL}" ]; then
     AGENT_BINDS+=(--bind "${REINVENT4_WEB_MODEL_CONTROL}:${REINVENT4_WEB_MODEL_CONTROL}")
 fi
+# The image bakes only reinvent.prior and mol2mol_medium_similarity.prior, so
+# libinvent/linkinvent campaigns failed on a missing prior file. This directory
+# holds those two plus the LibInvent/LinkInvent priors, and is bound over the
+# baked one so a new prior is a download rather than an image rebuild. It must
+# carry the baked priors too: binding a directory hides what the image had there.
+PRIORS_DIR="${PRIORS_DIR:-${ROOT_DIR}/priors}"
+if [ -d "${PRIORS_DIR}" ]; then
+    AGENT_BINDS+=(--bind "${PRIORS_DIR}:/app/REINVENT4/priors")
+fi
 # DEV_SOURCE=1 runs the agent and MCP server from this checkout instead of the
 # copies baked into the image, so Python edits need a restart, not a rebuild.
 # Dependency changes (pyproject.toml) still need build.sh.
@@ -353,6 +400,17 @@ done
 # directory, so it has to exist on both sides of the boundary.
 if [ -n "${SUPERVISOR_POOL_CONTROL:-}" ] && [ -d "${SUPERVISOR_POOL_CONTROL}" ]; then
     AGENT_BINDS+=(--bind "${SUPERVISOR_POOL_CONTROL}")
+fi
+# Service discovery, for the same reason. The variable is forwarded above, but
+# it names a host path, and a path is not a file: without this bind the
+# gateway looks where it was told, finds nothing, and apply_registry fills in
+# no URL at all. The tools then fall back to their Compose hostnames, which
+# resolve nowhere under Slurm -- so structure preparation, synthesis planning,
+# interaction profiling and pose validation all fail with a DNS error while
+# the scorers, whose URLs come from the MCP config bound above, keep working.
+# That split is what makes the symptom look like "some services are down".
+if [ -n "${DD_SERVICE_REGISTRY:-}" ] && [ -f "${DD_SERVICE_REGISTRY}" ]; then
+    AGENT_BINDS+=(--bind "${DD_SERVICE_REGISTRY}:${DD_SERVICE_REGISTRY}:ro")
 fi
 
 if [ "${WEB}" -eq 1 ]; then

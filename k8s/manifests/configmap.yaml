@@ -14,6 +14,12 @@ data:
   # shows which model each tier is on.
   CONDUCTOR_AGENT_MODEL: "openai/gpt-oss-120b"
   CONDUCTOR_AGENT_BASE_URL: http://dd-agentic-aim-conductor/v1
+  # One reply, not the window (see "Context size" in k8s/README.md): the
+  # window is a serving argument on the AIMService, and the agent reads it
+  # back from /v1/models. 4096 is too small for a turn that both reasons and
+  # calls several tools; the backend lowers this again when a long prompt
+  # leaves less room, so it is a ceiling rather than a reservation.
+  REINVENT4_AGENT_MAX_TOKENS: "16384"
   REINVENT4_AGENT_NO_VERIFY_SSL: "false"
   REINVENT4_AGENT_MULTI_AGENT: "true"
   REINVENT4_AGENT_LOG_DIR: /logs

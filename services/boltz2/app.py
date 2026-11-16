@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import fcntl
 import hashlib
 import json
@@ -14,6 +15,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,10 +47,119 @@ MAX_TOTAL_ATOMS = 128
 STANDARD_AA = set("ACDEFGHIKLMNPQRSTVWY")
 
 # GPU predictions are serialized (FIFO) so concurrent /score calls cannot
-# run two predictions on one GPU and OOM/corrupt each other. Concurrency is
-# env-tunable and can be raised only when memory is proven sufficient.
+# race on the same GPU and OOM/corrupt each other.  One semaphore slot per
+# /score call; sharding below runs multiple boltz subprocesses concurrently
+# WITHIN a single held slot, each pinned to its own GCD.
 BOLTZ_MAX_CONCURRENCY = int(os.getenv("BOLTZ_MAX_CONCURRENCY", "1"))
 _predict_sem = asyncio.Semaphore(BOLTZ_MAX_CONCURRENCY)
+
+# ---------------------------------------------------------------------------
+# Multi-GCD slot detection
+# ---------------------------------------------------------------------------
+# At container startup we pick the GCDs a scoring batch may be split across:
+# the ones this process is allowed to open, minus any that are already busy.
+# Each contributes one slot, and a slot is named by its *physical* GCD id
+# because that is what ROCR_VISIBLE_DEVICES means to a subprocess -- rocm-smi
+# and ROCR disagree about numbering, so mixing the two puts work on another
+# tenant's die.  BOLTZ_GCD_SLOTS overrides the count (testing, or when
+# rocm-smi is unavailable).  Minimum is always 1.
+
+_BOLTZ_VRAM_HEADROOM_GB = float(os.getenv("BOLTZ_VRAM_HEADROOM_GB", "35.0"))
+
+
+def _visible_gcd_ids() -> list[int]:
+    """Physical GCD ids this process may open, in the order ROCR exposes them.
+
+    Empty when no visibility variable is set, which means "everything the
+    driver reports".
+    """
+    for var in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        raw = os.getenv(var, "").strip()
+        if not raw:
+            continue
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if parts and all(p.isdigit() for p in parts):
+            return [int(p) for p in parts]
+    return []
+
+
+def _query_free_vram_per_gcd() -> dict[int, float]:
+    """Return {physical_gcd_id: free_vram_gb} for every GCD rocm-smi reports.
+
+    rocm-smi reads the driver, so it lists every GCD on the node whatever
+    ROCR_VISIBLE_DEVICES says: on a session node it answers for all eight
+    while the process can open one.  Callers must intersect this with
+    :func:`_visible_gcd_ids`.
+    """
+    try:
+        r = subprocess.run(
+            ["rocm-smi", "--showmeminfo", "vram"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.info("rocm-smi not available (%s); slot detection skipped", exc)
+        return {}
+    # Parse lines like:
+    #   GPU[0]  : VRAM Total Memory (B): 68702699520
+    #   GPU[0]  : VRAM Total Used Memory (B): 34767187968
+    total: dict[int, int] = {}
+    used: dict[int, int] = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        for label, store in (("VRAM Total Memory (B):", total), ("VRAM Total Used Memory (B):", used)):
+            if label in line:
+                try:
+                    gcd = int(line.split("[")[1].split("]")[0])
+                    store[gcd] = int(line.split(label)[-1].strip())
+                except (IndexError, ValueError):
+                    pass
+    return {
+        g: (total.get(g, 0) - used.get(g, 0)) / (1024 ** 3)
+        for g in total
+    }
+
+
+def _detect_slot_gcds() -> list[int]:
+    """Physical GCDs a batch may be split across, one slot each.
+
+    A GCD qualifies when this process may open it and it has at least
+    _BOLTZ_VRAM_HEADROOM_GB free.  Returning the ids rather than a count
+    keeps the pinning honest: shard *k* sets ROCR_VISIBLE_DEVICES to the
+    id at position *k*, not to *k* itself.
+    """
+    visible = _visible_gcd_ids()
+    free = _query_free_vram_per_gcd()
+    override = os.getenv("BOLTZ_GCD_SLOTS", "").strip()
+
+    # Without a visibility variable the process gets whatever the driver
+    # reports, so rocm-smi's own list is the candidate set.
+    candidates = visible or sorted(free)
+
+    if override.isdigit():
+        n = max(1, int(override))
+        slots = candidates[:n] if candidates else list(range(n))
+        logger.info("BOLTZ_GCD_SLOTS override: %d slot(s) on GCDs %s", len(slots), slots)
+        return slots
+
+    if not free:
+        logger.info("VRAM query unavailable; using 1 Boltz slot")
+        return candidates[:1] or [0]
+
+    headroom = _BOLTZ_VRAM_HEADROOM_GB
+    slots = [g for g in candidates if free.get(g, 0.0) >= headroom]
+    if not slots:
+        slots = candidates[:1] or [0]
+    logger.info(
+        "GCD free VRAM: %s — visible %s, %.0f GB threshold → %d slot(s) on GCDs %s",
+        {g: f"{gb:.1f} GB" for g, gb in sorted(free.items())},
+        visible or "all",
+        headroom, len(slots), slots,
+    )
+    return slots
+
+
+_BOLTZ_SLOT_GCDS: list[int] = _detect_slot_gcds()
+_N_BOLTZ_SLOTS: int = len(_BOLTZ_SLOT_GCDS)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -578,25 +689,38 @@ class PredictionCancelled(Exception):
 
 
 class _PredictionHandle:
-    """Shared between the request coroutine and the worker thread.
+    """Shared between the request coroutine and the worker thread(s).
 
     ``asyncio.to_thread`` tasks cannot be interrupted by ``task.cancel()`` --
     the thread stays blocked in ``proc.communicate()`` and boltz runs to
-    completion. To actually stop on client disconnect we hand the request
-    coroutine a reference to the live subprocess so it can kill the whole
-    process group directly.
+    completion. To stop on client disconnect, the request coroutine calls
+    ``kill_all()`` which kills every live subprocess across all GCD slots.
     """
 
     def __init__(self) -> None:
-        self.proc: Optional[subprocess.Popen] = None
         self.cancelled: bool = False
+        self._procs: list[subprocess.Popen] = []
+        self._lock = threading.Lock()
+
+    def register_proc(self, proc: subprocess.Popen) -> None:
+        """Register a subprocess so ``kill_all`` can reach it."""
+        with self._lock:
+            self._procs.append(proc)
+
+    def kill_all(self) -> None:
+        """Kill every registered subprocess (best-effort)."""
+        with self._lock:
+            for p in self._procs:
+                _kill_process_group(p)
 
 
 def _run_predict(
     cmd: list[str],
     handle: Optional[_PredictionHandle] = None,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> subprocess.CompletedProcess:
-    logger.info("Running: %s", " ".join(cmd))
+    env = {**os.environ, **(extra_env or {})} if extra_env else None
+    logger.info("Running%s: %s", f" (env: {extra_env})" if extra_env else "", " ".join(cmd))
     # Launch in its own session/process group so the whole tree (boltz + any
     # children it spawns) can be killed as a unit on timeout/cancellation,
     # rather than leaking an orphan that keeps holding GPU memory.
@@ -606,9 +730,10 @@ def _run_predict(
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
+        env=env,
     )
     if handle is not None:
-        handle.proc = proc
+        handle.register_proc(proc)
         # Disconnect may have arrived between acquiring the semaphore and
         # launching the subprocess; honour it immediately.
         if handle.cancelled:
@@ -942,14 +1067,103 @@ async def score(request: ScoreRequest, http_request: Request) -> ScoreResponse:
             if await http_request.is_disconnected():
                 logger.warning("Client disconnected — killing prediction")
                 handle.cancelled = True
-                if handle.proc is not None:
-                    _kill_process_group(handle.proc)
+                handle.kill_all()
                 try:
                     await task
                 except Exception:
                     pass
                 raise HTTPException(status_code=499, detail="Client disconnected")
         return task.result()
+
+
+def _run_prediction_shard(
+    *,
+    shard_id: str,
+    gcd_idx: int,
+    params: ScoreParams,
+    shard_smiles: list[str],
+    shard_indices: list[int],
+    n_total: int,
+    handle: Optional[_PredictionHandle],
+    protein_sequence: str,
+    effective_msa_path: Optional[str],
+    use_server_flag: bool,
+    msa_free: bool,
+    template_dict: Optional[dict],
+) -> ScoreResponse:
+    """Run boltz predict for one GCD shard and map results to n_total positions.
+
+    Each shard processes a subset of the batch on a specific GCD (via
+    ROCR_VISIBLE_DEVICES in the subprocess env). Returns a ScoreResponse
+    sized to n_total with non-None values only at the original positions
+    this shard owns; the caller merges across shards.
+    """
+    batch_dir = SHARED_DIR / "batches" / shard_id
+    out_dir = SHARED_DIR / "predictions" / f"out_{shard_id}"
+
+    _write_batch_yamls(
+        batch_dir,
+        shard_smiles,
+        protein_sequence,
+        effective_msa_path,
+        msa_free=msa_free,
+        template_dict=template_dict,
+    )
+
+    cmd = _build_predict_cmd(batch_dir, out_dir, params, use_server_flag)
+    # Pin this subprocess to its GCD so shards don't collide on one die.
+    # ROCR reads this against the driver's numbering, not against the set the
+    # parent was given, so it has to be the physical id.
+    result = _run_predict(cmd, handle, extra_env={"ROCR_VISIBLE_DEVICES": str(gcd_idx)})
+
+    if result.returncode != 0:
+        logger.error("shard %s boltz predict failed:\nstdout: %s\nstderr: %s",
+                     shard_id, result.stdout, result.stderr)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "boltz predict failed",
+                "detail": result.stderr[-2000:] if result.stderr else "",
+            },
+        )
+
+    predictions_dir = _find_results_dir(out_dir, batch_dir)
+    if predictions_dir is None:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Prediction output directory not found",
+                "detail": f"Expected results under {out_dir}",
+            },
+        )
+
+    shard_response = _assemble_response(
+        predictions_dir,
+        len(shard_smiles),
+        params.affinity_mode,
+        params.output_format,
+    )
+
+    # Remap shard-local indices back to the full n_total positions.
+    scores: list[Optional[float]] = [None] * n_total
+    for shard_idx, orig_idx in enumerate(shard_indices):
+        scores[orig_idx] = shard_response.scores[shard_idx]
+
+    metadata: dict[str, Any] = {}
+    for key, values in shard_response.metadata.items():
+        full: list[Any] = [None] * n_total
+        for shard_idx, orig_idx in enumerate(shard_indices):
+            full[orig_idx] = values[shard_idx]
+        metadata[key] = full
+
+    artifacts: dict[str, Any] = {}
+    if "structures" in shard_response.artifacts:
+        structs: list[Optional[str]] = [None] * n_total
+        for shard_idx, orig_idx in enumerate(shard_indices):
+            structs[orig_idx] = shard_response.artifacts["structures"][shard_idx]
+        artifacts["structures"] = structs
+
+    return ScoreResponse(scores=scores, metadata=metadata, artifacts=artifacts)
 
 
 def _run_prediction(
@@ -1110,6 +1324,76 @@ def _run_prediction(
                         artifacts={"structures": [None] * n_total},
                     )
 
+        note = msa_note or seq_note
+
+        # --- Multi-slot: shard the batch across GCDs concurrently ----------
+        if _N_BOLTZ_SLOTS > 1:
+            # Interleave-split: slot k takes positions k, k+N, k+2N, ...
+            # so each slot gets a balanced mix of heavy/light molecules.
+            shards = [
+                (k, valid_smiles[k::_N_BOLTZ_SLOTS], valid_indices[k::_N_BOLTZ_SLOTS])
+                for k in range(_N_BOLTZ_SLOTS)
+                if valid_smiles[k::_N_BOLTZ_SLOTS]  # skip empty trailing slots
+            ]
+            logger.info(
+                "Sharding %d valid molecules across %d GCD slot(s)",
+                len(valid_smiles), len(shards),
+            )
+
+            def _run_shard(args: tuple) -> ScoreResponse:
+                k, s_smiles, s_indices = args
+                return _run_prediction_shard(
+                    shard_id=f"{batch_id}_s{k}",
+                    gcd_idx=_BOLTZ_SLOT_GCDS[k],
+                    params=params,
+                    shard_smiles=s_smiles,
+                    shard_indices=s_indices,
+                    n_total=n_total,
+                    handle=handle,
+                    protein_sequence=protein_sequence,
+                    effective_msa_path=effective_msa_path,
+                    use_server_flag=use_server_flag,
+                    msa_free=msa_free,
+                    template_dict=template_dict,
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(shards)) as pool:
+                sub_responses = list(pool.map(_run_shard, shards))
+
+            # Merge: each sub-response carries None except at its own positions.
+            merged_scores: list[Optional[float]] = [None] * n_total
+            merged_meta: dict[str, list] = {"skip_reason": skip_reasons}
+            merged_structs: list[Optional[str]] = [None] * n_total
+            has_structs = False
+            for resp in sub_responses:
+                for i, s in enumerate(resp.scores):
+                    if s is not None:
+                        merged_scores[i] = s
+                for key, values in resp.metadata.items():
+                    if key == "skip_reason":
+                        continue
+                    if key not in merged_meta:
+                        merged_meta[key] = [None] * n_total
+                    for i, v in enumerate(values):
+                        if v is not None:
+                            merged_meta[key][i] = v
+                if "structures" in resp.artifacts:
+                    has_structs = True
+                    for i, st in enumerate(resp.artifacts["structures"]):
+                        if st is not None:
+                            merged_structs[i] = st
+            if note:
+                merged_meta["msa_note"] = [note] * n_total
+            merged_artifacts: dict[str, Any] = (
+                {"structures": merged_structs} if has_structs else {}
+            )
+            return ScoreResponse(
+                scores=merged_scores,
+                metadata=merged_meta,
+                artifacts=merged_artifacts,
+            )
+
+        # --- Single-slot path (original) ------------------------------------
         _write_batch_yamls(
             batch_dir,
             valid_smiles,
@@ -1165,7 +1449,6 @@ def _run_prediction(
         # the reason is visible downstream (scorer surfaces it; agent can warn
         # the user). These two notes are mutually exclusive (msa_note only when
         # running MSA-free; seq_note only when an MSA file is used).
-        note = msa_note or seq_note
         if note:
             metadata["msa_note"] = [note] * n_total
 
@@ -1576,8 +1859,7 @@ async def predict_structure(
                     "Client disconnected; stopping structure prediction"
                 )
                 handle.cancelled = True
-                if handle.proc is not None:
-                    _kill_process_group(handle.proc)
+                handle.kill_all()
                 try:
                     await task
                 except Exception:

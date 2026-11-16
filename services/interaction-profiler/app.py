@@ -324,8 +324,14 @@ def create_app():
             "v2_complex_result": ComplexResult.model_json_schema(),
         }
 
+    # No return annotation here or on /profile: the module uses postponed
+    # annotations, so a ``-> JSONResponse`` arrives at FastAPI as the string
+    # "JSONResponse", which it cannot resolve because the name is imported
+    # into this function rather than the module. The handlers still work --
+    # returning a Response skips serialisation -- but /openapi.json 500s,
+    # which is how the missing v2 route stayed invisible for two weeks.
     @app.post("/analyze")
-    def analyze(req: AnalyzeRequest) -> JSONResponse:
+    def analyze(req: AnalyzeRequest):
         t0 = time.time()
         try:
             result = _profile_specs(req.molecules, req.options, req.batch_id)
@@ -338,7 +344,7 @@ def create_app():
         return JSONResponse(content=result.model_dump(mode="json", exclude_none=False))
 
     @app.post("/profile")
-    def profile(req: ProfileRequest) -> JSONResponse:
+    def profile(req: ProfileRequest):
         """Single-molecule convenience: returns the per-ligand result list."""
         try:
             result = _profile_specs([req.molecule], req.options, req.molecule.name)

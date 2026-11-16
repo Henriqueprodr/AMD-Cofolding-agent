@@ -100,6 +100,24 @@ class TLJobRequest(BaseModel):
     output_model_file: str = "tl_model.model"
 
 
+class TomlJobRequest(BaseModel):
+    """Arguments of ``JobManager.submit_toml``.
+
+    The generation modes (libinvent, linkinvent, mol2mol) build their own TOML
+    rather than a scorer config, so they submit the built file instead of the
+    arguments to build one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    toml_str: str
+    job_name: str = "generation"
+    extra_files: Optional[dict[str, str]] = None
+    max_steps: int = 0
+    model: str = "generation"
+    ttp_id: Optional[str] = None
+
+
 class ScoreRequest(BaseModel):
     """Arguments of ``score_molecules``.
 
@@ -178,6 +196,7 @@ def health() -> dict[str, Any]:
         "reinvent_error": detail,
         "active_jobs": len(active),
         "max_concurrent_jobs": config.jobs.max_concurrent_jobs,
+        "run_window": _manager().run_window(),
         "working_dir": config.jobs.working_dir,
     }
 
@@ -196,6 +215,12 @@ def create_job(request: JobRequest) -> dict[str, Any]:
 def create_tl_job(request: TLJobRequest) -> dict[str, Any]:
     """Start a transfer-learning job. Shares the slots with RL."""
     return _manager().create_and_start_tl(**request.model_dump())
+
+
+@app.post("/toml-jobs")
+def create_toml_job(request: TomlJobRequest) -> dict[str, Any]:
+    """Start a generation job from a pre-built TOML. Shares the slots with RL."""
+    return _manager().submit_toml(**request.model_dump())
 
 
 @app.get("/jobs")
