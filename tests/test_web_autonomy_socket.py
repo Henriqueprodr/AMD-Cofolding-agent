@@ -153,6 +153,7 @@ def test_an_automatic_turn_opens_a_marked_turn_with_no_user_message(agents):
         events = client.get(f"/api/sessions/{session_id}/events").json()["events"]
         assert [e["type"] for e in events] == [
             "user_message",
+            "campaign",
             "status",
             "assistant_message",
             "status",

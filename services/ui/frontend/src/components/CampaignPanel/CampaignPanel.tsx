@@ -46,10 +46,11 @@ export function CampaignPanel({ sessionId, log = null, theme, onOpenMolecule, on
   const labels = useMemo(() => agentLabels(details), [details]);
   const focused = useFocusedTask();
   const openAgent = useFocusedAgent();
+  const memory = useMemo(() => campaignView(log), [log]);
 
   const steps = useMemo(
-    () => history(details.map((detail) => ({ ...detail, events: events.get(detail.campaign.campaign_id) })), labels, campaignView(log)?.findings ?? []),
-    [details, events, labels, log],
+    () => history(details.map((detail) => ({ ...detail, events: events.get(detail.campaign.campaign_id) })), labels, memory?.findings ?? []),
+    [details, events, labels, memory],
   );
   const written = useMemo(
     () =>
@@ -128,6 +129,19 @@ export function CampaignPanel({ sessionId, log = null, theme, onOpenMolecule, on
           onOpenRun={showRun}
         />
       ))}
+      {memory && (
+        <Card title="Memory">
+          <div className="space-y-2 text-[11px] leading-relaxed">
+            {memory.goal && <p><span className="text-faint mr-1.5 font-medium uppercase tracking-wide">Goal</span>{memory.goal}</p>}
+            {memory.next && <p><span className="text-faint mr-1.5 font-medium uppercase tracking-wide">Next</span>{memory.next}</p>}
+            {memory.findings.length > 0 && (
+              <ul className="border-subtle space-y-1 border-t pt-2">
+                {memory.findings.map((finding, index) => <li key={`${finding.ts}-${index}`} className="text-muted">• {finding.text}</li>)}
+              </ul>
+            )}
+          </div>
+        </Card>
+      )}
       {written.length > 0 && (
         <Card title="Reports" actions={<span className="text-faint text-[11px]">{written.length}</span>}>
           <ul className="flex flex-col gap-1.5">

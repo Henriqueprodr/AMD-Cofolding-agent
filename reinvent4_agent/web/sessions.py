@@ -186,9 +186,11 @@ _WORK_ALONE_INSTEAD = (
 #: context was compacted past the work, and the user had a list of runs
 #: where a campaign of two agents showed a line of reasoning.
 _WORKING_ALONE = (
-    "[Working alone. Keep a campaign anyway: open one with start_campaign "
-    "for a goal that will take more than a couple of runs, and set out its "
-    "workstreams with set_campaign_plan. Record each experiment you run "
+    "[Working alone. Keep every substantive turn in the campaign opened for "
+    "this conversation. It is opened automatically, so do not call "
+    "start_campaign and create a duplicate. Set out its workstreams with "
+    "set_campaign_plan once its id is stated. Record "
+    "each experiment you run "
     "with start_own_task before you start it and finish_own_task when it is "
     "done, with the molecules it put forward and the runs it started, and "
     "name in derived_from the earlier tasks it followed from. Write what "
@@ -485,6 +487,10 @@ class LiveSession:
     #: nothing watches runs (the tests, the CLI), and then the agent is simply
     #: never waiting for one.
     observe: Callable[[LiveSession], Awaitable[None]] | None = None
+    #: Opens or restores the one-agent campaign associated with this session.
+    #: Kept injectable so local and CLI sessions do not depend on the ledger.
+    bootstrap_campaign: Callable[[str, str], Awaitable[str | None]] | None = None
+    campaign_bootstrap_task: asyncio.Task[str | None] | None = None
     #: Last state seen of each run this conversation launched.
     runs_seen: dict[str, str] = field(default_factory=dict)
     #: Problems already reported, so a plateau is news once.
@@ -652,6 +658,12 @@ class LiveSession:
             self.meta["title"] = first_line[:_TITLE_CHARS]
             self.meta["auto_title"] = True
         self.publish({"type": "user_message", "content": content, **effort_field})
+        if campaign_log.is_empty(self.campaign) and content.strip():
+            # Always give the overview a durable goal. Findings and next steps
+            # stay with the agent because they require scientific judgement.
+            self.campaign = campaign_log.apply(self.campaign, {"goal": content})
+            self.store.save_campaign(self.id, self.campaign)
+            self.publish({"type": "campaign", "campaign": self.campaign})
         self._begin(sent)
         return True
 
@@ -1083,6 +1095,7 @@ class LiveSession:
     async def _run_turn(self, content: str) -> None:
         unfinished = done = failed = False
         try:
+            content = await self._with_solo_campaign(content)
             answer = await self.agent.chat(content)
             spoken = spoken_answer(answer)
             self._title_from_answer(spoken)
@@ -1129,6 +1142,60 @@ class LiveSession:
                     self.auto_idle_delay if checked else self.auto_delay,
                     reason="idle" if checked else "confirm",
                 )
+
+    async def _with_solo_campaign(self, content: str) -> str:
+        """Ensure a one-agent conversation has a durable campaign ledger."""
+
+        if self.agents_allowed > 1:
+            return content
+        campaign_id = next(iter(self.campaigns_open or self.campaigns_seen), None)
+        if campaign_id is None and self.bootstrap_campaign is not None:
+            if self.campaign_bootstrap_task is None:
+                self.campaign_bootstrap_task = asyncio.create_task(
+                    self.bootstrap_campaign(
+                        self.id,
+                        str(self.campaign.get("goal") or self.meta.get("title") or "Campaign"),
+                    )
+                )
+                self.campaign_bootstrap_task.add_done_callback(
+                    self._campaign_bootstrapped
+                )
+            return (
+                f"{content}\n\n[The campaign for this conversation is being "
+                "opened automatically. Do not call start_campaign and create "
+                "a duplicate. Keep immediate memory with campaign_log; its id "
+                "will be stated on the next turn.]"
+            )
+        if campaign_id is None:
+            return content
+        self.campaigns_seen.setdefault(campaign_id, 0)
+        self.campaigns_open.add(campaign_id)
+        return (
+            f"{content}\n\n[The campaign for this conversation is already open: "
+            f"{campaign_id}. Use this id for set_campaign_plan, start_own_task "
+            "and atlas_finding; do not open a duplicate.]"
+        )
+
+    def _campaign_bootstrapped(
+        self, task: asyncio.Task[str | None]
+    ) -> None:
+        """Remember a campaign opened beside the model turn."""
+
+        self.campaign_bootstrap_task = None
+        try:
+            campaign_id = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning(
+                "could not open the single-agent campaign for session %s: %s",
+                self.id,
+                exc,
+            )
+            return
+        if campaign_id:
+            self.campaigns_seen.setdefault(campaign_id, 0)
+            self.campaigns_open.add(campaign_id)
 
     def _retry_delay(self) -> float:
         """Wait before picking a failed turn up, longer each time it fails."""
@@ -1178,6 +1245,7 @@ JobAlerts = Callable[[], Awaitable[list[dict[str, Any]]]]
 #: happened in each since: ``{campaign id: {"events": [...],
 #: "last_event_id": int, "idle": int, "queued": int}}``.
 CampaignNews = Callable[[dict[str, int]], Awaitable[dict[str, dict[str, Any]]]]
+CampaignBootstrap = Callable[[str, str], Awaitable[str | None]]
 
 
 class SessionManager:
@@ -1190,6 +1258,7 @@ class SessionManager:
         self._run_states: RunStates | None = None
         self._job_alerts: JobAlerts | None = None
         self._campaign_news: CampaignNews | None = None
+        self._campaign_bootstrap: CampaignBootstrap | None = None
         self._watcher: asyncio.Task[None] | None = None
         self.watch_interval = WATCH_INTERVAL_S
 
@@ -1205,6 +1274,7 @@ class SessionManager:
         live.install_tools()
         if self._run_states is not None:
             live.observe = self._observe
+        live.bootstrap_campaign = self._campaign_bootstrap
 
     # -- watching runs ---------------------------------------------------------
 
@@ -1213,6 +1283,7 @@ class SessionManager:
         run_states: RunStates,
         job_alerts: JobAlerts,
         campaign_news: CampaignNews | None = None,
+        campaign_bootstrap: CampaignBootstrap | None = None,
     ) -> None:
         """Follow the runs of conversations working on their own, without the model.
 
@@ -1224,8 +1295,10 @@ class SessionManager:
         self._run_states = run_states
         self._job_alerts = job_alerts
         self._campaign_news = campaign_news
+        self._campaign_bootstrap = campaign_bootstrap
         for live in self._live.values():
             live.observe = self._observe
+            live.bootstrap_campaign = campaign_bootstrap
         if self._watcher is None:
             self._watcher = asyncio.create_task(self._watch_loop())
 

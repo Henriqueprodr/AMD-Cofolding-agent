@@ -182,6 +182,52 @@ def test_working_alone_is_told_to_keep_the_campaign(tmp_path):
     asyncio.run(run())
 
 
+def test_working_alone_bootstraps_one_campaign_without_blocking_the_turn(tmp_path):
+    async def run() -> None:
+        agent = FakeAgent()
+        live = make_session(tmp_path, agent)
+        calls: list[tuple[str, str]] = []
+
+        async def bootstrap(session_id: str, goal: str) -> str:
+            calls.append((session_id, goal))
+            return "feed0001"
+
+        live.bootstrap_campaign = bootstrap
+        assert live.start_turn("optimise this series")
+        await idle(live)
+        if live.campaign_bootstrap_task is not None:
+            await live.campaign_bootstrap_task
+            await asyncio.sleep(0)
+
+        assert calls == [(live.id, "optimise this series")]
+        assert "being opened automatically" in agent.asked[0]
+        assert live.campaign["goal"] == "optimise this series"
+        assert "feed0001" in live.campaigns_open
+
+    asyncio.run(run())
+
+
+def test_single_agent_campaign_bootstrap_is_reused(tmp_path):
+    async def run() -> None:
+        agent = FakeAgent()
+        live = make_session(tmp_path, agent)
+        calls = 0
+
+        async def bootstrap(_session_id: str, _goal: str) -> str:
+            nonlocal calls
+            calls += 1
+            return "feed0001"
+
+        live.bootstrap_campaign = bootstrap
+        live.start_turn("first")
+        await idle(live)
+        live.start_turn("second")
+        await idle(live)
+        assert calls == 1
+
+    asyncio.run(run())
+
+
 def test_the_allowance_names_the_tools_a_campaign_is_run_with(tmp_path):
     """A number alone leaves the agent to guess how sub-agents are reached."""
 

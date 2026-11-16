@@ -6,7 +6,7 @@ import type { SessionSummary } from "../types/api";
 import { runsKnown } from "./useSessions";
 
 const session = (id: string, runs?: SessionSummary["runs"]): SessionSummary =>
-  ({ id, title: id, created_at: "", updated_at: "", ...(runs ? { runs } : {}) }) as SessionSummary;
+  ({ id, title: id, created: "", updated: "", turns: 0, busy: false, ...(runs ? { runs } : {}) });
 
 describe("runsKnown", () => {
   it("waits while the first read is in flight", () => {
@@ -22,7 +22,7 @@ describe("runsKnown", () => {
   });
 
   it("says so when a conversation carries its runs", () => {
-    expect(runsKnown([session("a", { jobs: [] })], true)).toBe(true);
+    expect(runsKnown([session("a", { running: 0, total: 0, jobs: [] })], true)).toBe(true);
   });
 
   it("says a gateway too old to carry them does not", () => {

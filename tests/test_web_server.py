@@ -269,7 +269,7 @@ def test_a_second_question_during_a_turn_is_kept_and_answered(agents):
         assert echoed["content"] == "and another"
         assert echoed["interjected"] is True
         events = client.get(f"/api/sessions/{session_id}/events").json()["events"]
-        assert [e["type"] for e in events] == ["user_message", "status", "user_message"]
+        assert [e["type"] for e in events] == ["user_message", "campaign", "status", "user_message"]
         # The fake never looks at its inbox, so the next turn answers it.
         ws.send_json({"type": "cancel"})
         receive_until(ws, "cancelled")

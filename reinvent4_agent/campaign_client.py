@@ -78,15 +78,21 @@ def _detail(response: requests.Response) -> str:
 class CampaignStoreClient:
     """The ledger's HTTP surface. Blocking; async callers use a thread."""
 
-    def __init__(self, base_url: str = STORE_URL, owner: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        base_url: str = STORE_URL,
+        owner: Optional[str] = None,
+        timeout: float = STORE_TIMEOUT_SECONDS,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.owner = owner or supervisor_id()
+        self.timeout = timeout
 
     def _call(self, method: str, path: str, **json_body: Any) -> Any:
         url = f"{self.base_url}{path}"
         try:
             response = requests.request(
-                method, url, json=json_body or None, timeout=STORE_TIMEOUT_SECONDS
+                method, url, json=json_body or None, timeout=self.timeout
             )
         except requests.RequestException as exc:
             raise StoreUnavailable(f"{url} is unreachable: {exc}") from exc

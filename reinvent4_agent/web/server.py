@@ -497,10 +497,43 @@ def create_app(config: WebConfig | None = None) -> FastAPI:
 
         return await asyncio.to_thread(read_all)
 
+    async def bootstrap_campaign(session_id: str, goal: str) -> str | None:
+        """Return this conversation's campaign, creating it when needed."""
+
+        def ensure() -> str | None:
+            from reinvent4_agent.campaign_client import CampaignStoreClient
+
+            # This runs before the model turn. A missing ledger must not delay
+            # chat/cancellation for the normal ten-second API timeout; the
+            # next turn retries and same-cluster stores answer well inside it.
+            ledger = CampaignStoreClient(timeout=0.25)
+            existing = ledger.campaigns(session_id=session_id)
+            if existing:
+                # A restored conversation must continue its original ledger,
+                # not create a second overview after a gateway restart.
+                open_campaigns = [
+                    campaign
+                    for campaign in existing
+                    if campaign.get("state") not in {"finalized", "cancelled"}
+                ]
+                campaign = max(
+                    open_campaigns or existing,
+                    key=lambda item: str(item.get("created_at") or ""),
+                )
+                return str(campaign.get("campaign_id") or "") or None
+            created = ledger.create_campaign(goal=goal, concurrency=1)
+            campaign_id = str(created.get("campaign_id") or "")
+            if not campaign_id:
+                return None
+            ledger.attach_session(campaign_id, session_id)
+            return campaign_id
+
+        return await asyncio.to_thread(ensure)
+
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI):
         await gateway.start()
-        sessions.watch(session_runs, job_alerts, campaign_news)
+        sessions.watch(session_runs, job_alerts, campaign_news, bootstrap_campaign)
         try:
             yield
         finally:
