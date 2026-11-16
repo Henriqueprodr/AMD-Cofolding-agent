@@ -2,19 +2,17 @@
 // SPDX-License-Identifier: MIT
 
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { useCampaignJobs } from "../../hooks/useCampaignJobs";
-import { useJobOwners, useRunsKnown, useSessionRuns } from "../../hooks/useSessions";
 import type { Theme } from "../../hooks/useTheme";
-import { callTool, jobFileUrl } from "../../lib/api";
-import { conversationJobs, errorSummary, isActive, parseJobs, resultsFile, toolError, type JobSummary } from "../../lib/jobs";
-import { scopedJob } from "../../lib/jobScope";
+import { jobFileUrl } from "../../lib/api";
+import { errorSummary, isActive, resultsFile } from "../../lib/jobs";
+import { useJobScope } from "../JobPicker/useJobScope";
 import { openRunStructure, rowMetrics, rowMolecule, runStructurePanel } from "../../lib/jobStructures";
 import type { MoleculeContext } from "../../lib/moleculePage";
 import { countMask, goalOf, heading, moleculesOf, selectionMask, spreads, stepStats, topByWeight, TOTAL, type Endpoint, type Goal, type Molecules, type Ranges, type StepStats, type TransformLike } from "../../lib/runAnalysis";
 import { parseRunResults, type RunTable } from "../../lib/runResults";
 import { loadTtp } from "../../lib/scoreWhy";
 import { objectivesOf } from "../../lib/ttp";
-import { useFocusedRun } from "../../lib/workbenchBus";
+import { usePanelShown } from "../../hooks/panelShownContext";
 import { SelectionTable } from "./SelectionTable";
 import { endpointColours } from "./plotUtils";
 import { Card, PickMenu } from "./shared";
@@ -64,40 +62,12 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
  * violins AND a region of the map) that the table below lists.
  */
 export function RunAnalysis({ sessionId, theme, onOpenMolecule }: Props) {
-  const [jobs, setJobs] = useState<JobSummary[] | null>(null);
-  const [listError, setListError] = useState<string | null>(null);
+  const { job: scoped, runs, error: listError } = useJobScope(sessionId ?? null);
+  const onScreen = usePanelShown();
   const [tick, setTick] = useState(0);
-  const focused = useFocusedRun();
-  const sessionRuns = useSessionRuns(sessionId);
-  const owners = useJobOwners();
-  const known = useRunsKnown();
-  const campaignJobs = useCampaignJobs(sessionId);
-
-  const scoped = useMemo(() => {
-    // Until the list says who launched what, no job: the newest of all is often another conversation's.
-    if (!jobs || known === null) return null;
-    return scopedJob(jobs, known ? conversationJobs(jobs, sessionRuns, focused, owners, sessionId, campaignJobs).own : jobs, focused);
-  }, [jobs, known, sessionRuns, focused, owners, sessionId, campaignJobs]);
   const job = scoped?.type === "optimization" ? scoped : null;
   const runId = job?.id ?? null;
   const running = job ? isActive(job.state) : false;
-
-  useEffect(() => {
-    let cancelled = false;
-    callTool("list_jobs")
-      .then(({ result }) => {
-        if (cancelled) return;
-        const error = toolError(result);
-        setListError(error);
-        if (!error) setJobs(parseJobs(result));
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) setListError(errorText(error));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId, tick]);
 
   const [loaded, setLoaded] = useState<Loaded | null>(lastLoaded);
   const current = loaded && loaded.id === runId ? loaded : null;
@@ -133,12 +103,12 @@ export function RunAnalysis({ sessionId, theme, onOpenMolecule }: Props) {
   }, [runId, file, queued, running, tick]);
 
   useEffect(() => {
-    if (!running) return;
+    if (!running || !onScreen) return;
     const timer = window.setInterval(() => {
       if (!document.hidden) setTick((t) => t + 1);
     }, REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [running]);
+  }, [running, onScreen]);
 
   // The TTP's objectives: weights pick the few lines and violins shown first, transforms tell the better side of each.
   const ttpKey = job?.ttpId ? `${job.ttpId}@${job.ttpVersion ?? ""}` : null;
@@ -243,7 +213,7 @@ export function RunAnalysis({ sessionId, theme, onOpenMolecule }: Props) {
     return () => document.removeEventListener("keydown", onKey);
   }, [filtered]);
 
-  if (jobs === null) {
+  if (runs === null) {
     return <Centered>{listError ? <p style={{ color: "var(--color-accent)" }}>Could not load the runs: {listError}</p> : <p className="text-faint">Loading runs…</p>}</Centered>;
   }
   if (!job) {
@@ -258,7 +228,7 @@ export function RunAnalysis({ sessionId, theme, onOpenMolecule }: Props) {
     <span className="bg-inset inline-flex items-center gap-1.5 rounded-full py-0.5 pr-1 pl-2 tabular-nums">
       <span className="text-body font-medium">{selected.toLocaleString()}</span>
       <span className="text-faint">selected</span>
-      <button type="button" onClick={clear} title="Clear the selection (Esc)" className="text-muted hover:text-body hover:bg-raised cursor-pointer rounded-full px-1.5">
+      <button type="button" onClick={clear} className="text-muted hover:text-body hover:bg-raised cursor-pointer rounded-full px-1.5">
         clear
       </button>
     </span>
@@ -273,16 +243,16 @@ export function RunAnalysis({ sessionId, theme, onOpenMolecule }: Props) {
             {job.maxSteps ? `/${job.maxSteps}` : ""}
           </span>
         )}
-        {running && <span className="size-1.5 animate-pulse rounded-full" style={{ background: "var(--color-ok)" }} title="Live: refreshed every minute" />}
+        {running && <span className="size-1.5 animate-pulse rounded-full" style={{ background: "var(--color-ok)" }} />}
         <span className="ml-auto flex items-center gap-1">
           {chip}
-          <button type="button" onClick={() => setTick((t) => t + 1)} title="Reload" aria-label="Reload" className="text-faint hover:text-body cursor-pointer p-0.5">
+          <button type="button" onClick={() => setTick((t) => t + 1)} aria-label="Reload" className="text-faint hover:text-body cursor-pointer p-0.5">
             <RefreshIcon />
           </button>
         </span>
       </div>
       {job.state === "failed" && job.error && (
-        <p className="border-subtle text-muted shrink-0 truncate border-b px-3 py-1" style={{ boxShadow: "inset 2px 0 0 var(--color-accent)" }} title={job.error}>
+        <p className="border-subtle text-muted shrink-0 truncate border-b px-3 py-1" style={{ boxShadow: "inset 2px 0 0 var(--color-accent)" }}>
           {errorSummary(job.error)}
         </p>
       )}
@@ -337,7 +307,6 @@ export function RunAnalysis({ sessionId, theme, onOpenMolecule }: Props) {
                     value={colourBy}
                     onChange={(event) => setColourBy(event.target.value)}
                     aria-label="Colour by"
-                    title="Colour by"
                     className="bg-sunken border-subtle max-w-36 cursor-pointer truncate rounded border px-1 py-0.5 text-[11px] outline-none"
                   >
                     {endpoints.map((e: Endpoint) => (
@@ -405,7 +374,6 @@ function ModeButton({ on, onClick, title, children }: { on: boolean; onClick: ()
       type="button"
       onClick={onClick}
       aria-pressed={on}
-      title={title}
       aria-label={title}
       className={`grid size-5 cursor-pointer place-items-center rounded-sm ${on ? "bg-raised text-body shadow-sm" : "text-faint hover:text-muted"}`}
     >

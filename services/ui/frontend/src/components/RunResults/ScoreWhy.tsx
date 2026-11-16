@@ -47,17 +47,17 @@ export function ScoreWhy({ values, ttp: given, ttpId, ttpVersion, title }: Props
       <ul className="flex flex-col gap-0.5">
         {why.items.map((item) => (
           <li key={item.name} className="grid grid-cols-[minmax(0,9rem)_5rem_auto_auto] items-center gap-2">
-            <span className="text-muted truncate" title={item.name}>
+            <span className="text-muted truncate">
               {item.name}
             </span>
             <span className="bg-inset h-1 overflow-hidden rounded-full" aria-hidden="true">
               <span className="block h-full rounded-full" style={{ width: `${Math.round((item.desirability ?? 0) * 100)}%`, background: tone(item.desirability) }} />
             </span>
-            <span className="font-mono tabular-nums" title={item.raw !== null ? "raw value → desirability" : "desirability"}>
+            <span className="font-mono tabular-nums">
               {item.raw !== null && <span className="text-faint">{short(item.raw)} → </span>}
               {item.desirability === null ? "—" : item.desirability.toFixed(2)}
             </span>
-            <span className="text-faint tabular-nums" title="Weight, as a share of all weights">
+            <span className="text-faint tabular-nums">
               w {Math.round(item.share * 100)}%
             </span>
           </li>

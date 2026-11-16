@@ -68,11 +68,11 @@ export function ObjectiveCard({ objective, onChange, onRename, onRemove, weights
             ) : (
               <span className="min-w-0 flex-1 truncate px-1 text-xs font-semibold">{objective.name}</span>
             )}
-            <span className="text-faint hidden max-w-48 truncate text-[10px] sm:block" title={what}>
+            <span className="text-faint hidden max-w-48 truncate text-[10px] sm:block">
               {what}
             </span>
             {onRemove && (
-              <button type="button" onClick={onRemove} aria-label={`Remove ${objective.name}`} title="Remove" className="text-faint hover:text-body cursor-pointer px-1 text-sm leading-none">
+              <button type="button" onClick={onRemove} aria-label={`Remove ${objective.name}`} className="text-faint hover:text-body cursor-pointer px-1 text-sm leading-none">
                 ×
               </button>
             )}
@@ -139,7 +139,7 @@ export function ObjectiveCard({ objective, onChange, onRename, onRemove, weights
             />
             <span className="w-8 shrink-0 text-right font-mono text-[11px] tabular-nums">{objective.weight.toFixed(2)}</span>
             {share !== undefined && (
-              <span className="text-faint w-8 shrink-0 text-right text-[10px] tabular-nums" title="Share of the total weight">
+              <span className="text-faint w-8 shrink-0 text-right text-[10px] tabular-nums">
                 {Math.round(share * 100)}%
               </span>
             )}

@@ -20,8 +20,8 @@ interface Props {
  * A 2D drawing of one molecule.
  *
  * An invalid SMILES is a normal output of a generative model, so it gets a
- * quiet placeholder that keeps the size it was given, with the reason in its
- * tooltip; table rows and grid cells keep their shape either way.
+ * quiet placeholder that keeps the size it was given, with the reason as its
+ * label; table rows and grid cells keep their shape either way.
  */
 export function MolDepiction({ smiles, theme, width = 260, height = 170, atoms, label, className = "" }: Props) {
   const { rdkit, failed } = useRDKit();
@@ -69,7 +69,6 @@ function Undrawable({ className, short, reason }: { className: string; short: st
     <div
       role="img"
       aria-label={reason}
-      title={reason}
       className={`@container text-faint flex flex-col items-center justify-center gap-1 overflow-hidden ${className}`}
     >
       <svg viewBox="0 0 24 24" className="size-4 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">

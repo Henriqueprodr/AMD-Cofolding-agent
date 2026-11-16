@@ -10,20 +10,11 @@ interface Props {
   onSet: (count: number) => void;
 }
 
-/**
- * What to offer when the deployment will not say what it could run. Four is
- * enough for the work to divide and few enough to be safe anywhere; the
- * alternative, picking a number off an unreadable scheduler, would be a
- * guess dressed as a measurement.
- */
-const FALLBACK_CEILING = 4;
+/** The fixed choices; "…" after them is any number the deployment can host. */
+const STEPS = [2, 4, 6, 8] as const;
 
-/**
- * The scheduler's answer is the whole partition, which is thousands and no
- * use as the end of a slider. Offer a working range and say what the real
- * ceiling is in the tooltip.
- */
-const OFFERED = 8;
+/** Turning sub-agents on without saying how many means this many. */
+const DEFAULT_MAX = 2;
 
 /**
  * How many sub-agents the conversation may run at once.
@@ -35,31 +26,39 @@ const OFFERED = 8;
  */
 export function AgentsButton({ count, onSet }: Props) {
   const [open, setOpen] = useState(false);
+  // Null until read, and null again when the deployment will not say: a
+  // number typed then stands, because clamping to a guessed ceiling would
+  // refuse a team the deployment may well be able to host.
   const [ceiling, setCeiling] = useState<number | null>(null);
-  const [basis, setBasis] = useState<string | null>(null);
+  const [typing, setTyping] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [reduced, setReduced] = useState<number | null>(null);
 
   useEffect(() => {
-    if (!open || ceiling !== null) return;
     let cancelled = false;
     fetchCapacity()
       .then((capacity) => {
-        if (cancelled) return;
-        setCeiling(capacity.max_supervisors ?? FALLBACK_CEILING);
-        setBasis(capacity.max_supervisors === null ? "the deployment would not say what it could run" : (capacity.detail ?? null));
+        if (!cancelled) setCeiling(capacity.max_supervisors);
       })
-      .catch(() => {
-        if (!cancelled) {
-          setCeiling(FALLBACK_CEILING);
-          setBasis("the ceiling could not be read");
-        }
-      });
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [open, ceiling]);
+  }, []);
 
-  const max = Math.max(2, Math.min(OFFERED, ceiling ?? FALLBACK_CEILING));
   const on = count > 1;
+  const custom = on && !STEPS.includes(count as (typeof STEPS)[number]);
+
+  /** Take a typed number: at least 1, and never more than the deployment can host. */
+  function apply() {
+    const wanted = Math.floor(Number(typed));
+    if (!Number.isFinite(wanted) || wanted < 1) return;
+    const allowed = ceiling === null ? wanted : Math.min(wanted, Math.max(1, ceiling));
+    setReduced(allowed < wanted ? allowed : null);
+    setTyping(false);
+    setTyped("");
+    onSet(allowed);
+  }
 
   return (
     <div className="relative">
@@ -69,7 +68,6 @@ export function AgentsButton({ count, onSet }: Props) {
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-label="Sub-agents"
-        title={on ? `Up to ${count} sub-agents at once` : "Let the agent run experiments side by side"}
         className={
           on
             ? "flex h-7 shrink-0 cursor-pointer items-center gap-1 rounded-full border px-2.5 text-[11px] touch:h-9"
@@ -84,36 +82,96 @@ export function AgentsButton({ count, onSet }: Props) {
         <div
           role="dialog"
           aria-label="Sub-agents"
-          className="bg-raised border-subtle shadow-card absolute bottom-full left-0 z-20 mb-1 w-60 rounded-lg border p-3 text-xs"
-          onMouseLeave={() => setOpen(false)}
+          className="bg-raised border-subtle shadow-card absolute bottom-full left-0 z-20 mb-1 rounded-lg border p-2.5 text-xs"
+          // Not while a number is being typed: the pointer drifting off would throw it away.
+          onMouseLeave={() => !typing && setOpen(false)}
         >
-          <div className="mb-2 flex items-baseline justify-between">
-            <span className="text-faint">Sub-agents at once</span>
-            <span className="tabular-nums">{count}</span>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <span className="text-body font-medium">Sub-agents</span>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={on}
+              aria-label="Use sub-agents"
+              onClick={() => onSet(on ? 1 : Math.min(DEFAULT_MAX, ceiling ?? DEFAULT_MAX))}
+              className="relative h-4 w-7 shrink-0 cursor-pointer rounded-full transition-colors"
+              style={{ background: on ? "var(--color-accent)" : "var(--text-faint)" }}
+            >
+              <span
+                aria-hidden="true"
+                className={`bg-raised absolute top-0.5 left-0.5 size-3 rounded-full shadow-sm transition-transform ${on ? "translate-x-3" : ""}`}
+              />
+            </button>
           </div>
-          <input
-            type="range"
-            min={1}
-            max={max}
-            step={1}
-            value={Math.min(count, max)}
-            onChange={(event) => onSet(Number(event.target.value))}
-            aria-label="Sub-agents at once"
-            className="w-full cursor-pointer accent-[var(--color-accent)]"
-          />
-          <div className="text-faint mt-0.5 flex justify-between text-[10px] tabular-nums">
-            <span>1</span>
-            <span>{max}</span>
+          <div role="group" aria-label="At most" className="bg-sunken flex gap-0.5 rounded-md p-0.5">
+            {STEPS.map((n) => (
+              <Choice
+                key={n}
+                on={on && !custom && count === n}
+                disabled={ceiling !== null && n > ceiling}
+                onClick={() => { onSet(n); setReduced(null); }}
+              >
+                {n}
+              </Choice>
+            ))}
+            {/* "…" expands to a type-a-number field; pressed state means a custom value is active. */}
+            {typing ? (
+              <input
+                autoFocus
+                type="number"
+                min={2}
+                max={ceiling ?? undefined}
+                value={typed}
+                onChange={(e) => setTyped(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") apply(); if (e.key === "Escape") setTyping(false); }}
+                onBlur={apply}
+                aria-label="Number of sub-agents"
+                className="bg-raised text-body shadow-card w-12 rounded px-1.5 py-0.5 text-center text-[11px] tabular-nums outline-none"
+              />
+            ) : (
+              <Choice on={custom} onClick={() => { setTyping(true); setTyped(custom ? String(count) : ""); }}>
+                {custom ? count : "…"}
+              </Choice>
+            )}
           </div>
-          <p className="text-faint mt-2 leading-snug">
-            {count > 1
-              ? "The agent may run experiments side by side and coordinate them. It still decides whether the work divides."
-              : "The agent works alone."}
-          </p>
-          {basis && <p className="text-faint mt-1 text-[10px] leading-snug">{basis}</p>}
+          {reduced !== null && (
+            <p className="text-faint mt-1.5 text-[10px]">
+              Reduced to {reduced} — deployment limit.
+            </p>
+          )}
         </div>
       )}
     </div>
+  );
+}
+
+/** One choice in the row: how many at most. */
+function Choice({
+  on,
+  disabled = false,
+  title,
+  onClick,
+  children,
+}: {
+  on: boolean;
+  disabled?: boolean;
+  title?: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={on}
+      disabled={disabled}
+      title={title}
+      onClick={onClick}
+      className={`min-w-7 cursor-pointer rounded px-1.5 py-0.5 text-center text-[11px] tabular-nums transition-colors disabled:cursor-default disabled:opacity-35 ${
+        on ? "bg-raised text-body shadow-card" : "text-muted enabled:hover:text-body"
+      }`}
+    >
+      {children}
+    </button>
   );
 }
 

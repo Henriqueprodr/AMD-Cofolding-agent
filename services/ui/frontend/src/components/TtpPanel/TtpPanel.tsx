@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 import { lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useJobList } from "../../hooks/useJobList";
 import { callTool, download } from "../../lib/api";
-import { parseJobs, shortDate, stateTone, toneColor, type JobSummary } from "../../lib/jobs";
+import { shortDate, stateTone, toneColor, type JobSummary } from "../../lib/jobs";
 import {
   applyPrompt,
   asTtp,
@@ -46,7 +47,7 @@ import {
   type TtpSummary,
 } from "../../lib/ttp";
 import { modelLabel, type SeedMolecule } from "../../lib/ttpRun";
-import { onRunsChanged, openRun } from "../../lib/workbenchBus";
+import { openRun } from "../../lib/workbenchBus";
 import { RunCard } from "../TtpBuilder/RunFields";
 import { ObjectiveCard } from "./ObjectiveCard";
 import { TransformCurve } from "./TransformCurve";
@@ -60,8 +61,6 @@ interface Props {
   events?: ToolEvent[];
   /** Put a prompt in the composer: "Use in chat", and "Apply" to have the agent adopt edits. */
   onAsk: (prompt: string) => void;
-  /** Show this stored TTP instead of the session's. */
-  ttpId?: string;
   /** The conversation's molecules, offered as Mol2Mol seeds. */
   molecules?: SeedMolecule[];
 }
@@ -77,11 +76,14 @@ type ListState = { state: "loading" } | { state: "error"; message: string } | { 
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
-function TtpEditor({ sessionId, events = [], onAsk, ttpId, molecules }: Props) {
+/** Before the first reading of the job list: no run has used any TTP yet, as far as the panel knows. */
+const NO_JOBS: JobSummary[] = [];
+
+function TtpEditor({ sessionId, events = [], onAsk, molecules }: Props) {
   const fromSession = useMemo(() => latestTtp(events), [events]);
   const [stored, setStored] = useState<TtpDraft | null>(() => loadDraft(sessionId));
   const [list, setList] = useState<ListState>({ state: "loading" });
-  const [jobs, setJobs] = useState<JobSummary[]>([]);
+  const jobs = useJobList().jobs ?? NO_JOBS;
   const [created, setCreated] = useState(() => createdTimes());
   const [choice, setChoice] = useState<string | null>(null);
   const [remote, setRemote] = useState<Remote | null>(null);
@@ -91,8 +93,6 @@ function TtpEditor({ sessionId, events = [], onAsk, ttpId, molecules }: Props) {
   const [query, setQuery] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [builder, setBuilder] = useState<{ initial?: Ttp } | null>(null);
-
-  const [jobsReload, setJobsReload] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -104,18 +104,6 @@ function TtpEditor({ sessionId, events = [], onAsk, ttpId, molecules }: Props) {
     };
   }, [reload]);
 
-  useEffect(() => {
-    let cancelled = false;
-    callTool("list_jobs")
-      .then((response) => !cancelled && setJobs(parseJobs(response.result)))
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [reload, jobsReload]);
-
-  useEffect(() => onRunsChanged(() => setJobsReload((n) => n + 1)), []);
-
   const activity = useMemo(() => {
     const latest: Record<string, string> = { ...created };
     for (const job of jobs) if (job.ttpId && job.createdAt && job.createdAt > (latest[job.ttpId] ?? "")) latest[job.ttpId] = job.createdAt;
@@ -125,7 +113,7 @@ function TtpEditor({ sessionId, events = [], onAsk, ttpId, molecules }: Props) {
   const ownIds = useMemo(() => sessionTtpIds(events), [events]);
   const options = useMemo(() => ttpOptions(filterTtps(items, query), ownIds), [items, query, ownIds]);
 
-  const selectedId = ttpId ?? choice ?? fromSession.id ?? stored?.base.id ?? items[0]?.id ?? null;
+  const selectedId = choice ?? fromSession.id ?? stored?.base.id ?? items[0]?.id ?? null;
   const sessionTtp = fromSession.ttp && fromSession.ttp.id === selectedId ? fromSession.ttp : null;
   const sessionVersion = sessionTtp?.version ?? 0;
 
@@ -182,13 +170,12 @@ function TtpEditor({ sessionId, events = [], onAsk, ttpId, molecules }: Props) {
           aria-label="Search TTPs"
           className="bg-sunken border-subtle focus:border-strong w-36 rounded-md border px-2 py-1 text-[11px] outline-none @lg:w-48"
         />
-        <button type="button" onClick={refresh} title="Reload the TTPs and runs" className="bg-inset text-muted hover:text-body shrink-0 cursor-pointer rounded-md px-2 py-1 text-[11px] font-medium touch:min-h-11">
+        <button type="button" onClick={refresh} className="bg-inset text-muted hover:text-body shrink-0 cursor-pointer rounded-md px-2 py-1 text-[11px] font-medium touch:min-h-11">
           Refresh
         </button>
         <button
           type="button"
           onClick={() => setBuilder({})}
-          title="Define a new therapeutic target profile"
           className="bg-inset text-body hover:bg-sunken shrink-0 cursor-pointer rounded-md px-2 py-1 text-[11px] font-semibold touch:min-h-11"
         >
           + New TTP
@@ -406,7 +393,6 @@ function TtpEditor({ sessionId, events = [], onAsk, ttpId, molecules }: Props) {
             type="button"
             onClick={saveDirect}
             disabled={!dirty || save.state === "busy"}
-            title="Write the edits to the TTP store with update_ttp"
             className="bg-inset text-muted hover:text-body cursor-pointer rounded-md px-2 py-1 font-medium disabled:cursor-default disabled:opacity-40 touch:min-h-11"
           >
             {save.state === "busy" ? "Saving…" : `Save as v${base.version + 1}`}
@@ -416,7 +402,6 @@ function TtpEditor({ sessionId, events = [], onAsk, ttpId, molecules }: Props) {
           type="button"
           onClick={() => onAsk(applyPrompt(base, draft))}
           disabled={!dirty}
-          title="Ask the agent to update the TTP and use it"
           className="cursor-pointer rounded-md px-2.5 py-1 font-semibold text-white transition-opacity hover:opacity-90 disabled:cursor-default disabled:opacity-40 touch:min-h-11"
           style={{ background: "var(--color-accent)" }}
         >
@@ -460,7 +445,7 @@ function TtpList({
             className={`border-l-2 px-3 py-1.5 text-left ${selected ? "bg-sunken" : "hover:bg-sunken border-transparent"} ${!mine && index > 0 && options[index - 1].mine ? "border-subtle mt-1 border-t pt-2" : ""}`}
             style={selected ? { borderColor: "var(--color-accent)" } : undefined}
           >
-            <span className="flex items-center gap-1 text-[11px] font-medium" title={t.name}>
+            <span className="flex items-center gap-1 text-[11px] font-medium">
               {mine && <span aria-hidden="true" className="size-1 shrink-0 rounded-full" style={{ background: "var(--color-accent)" }} />}
               <span className="truncate">{t.name}</span>
             </span>
@@ -527,19 +512,19 @@ function TtpReadView({
           {saved !== null && <span style={{ color: "var(--color-ok)" }}> · saved as v{saved}</span>}
         </p>
         <div className="mt-2 flex flex-wrap gap-1.5">
-          <button type="button" onClick={onUse} title="Put a reference to this TTP in the message box" className={ACTION} style={{ borderColor: "var(--color-accent)", color: "var(--color-accent)" }}>
+          <button type="button" onClick={onUse} className={ACTION} style={{ borderColor: "var(--color-accent)", color: "var(--color-accent)" }}>
             Use in chat
           </button>
-          <button type="button" onClick={() => setRunning(!running)} aria-expanded={running} title="Put a REINVENT run request in the message box" className={ACTION}>
+          <button type="button" onClick={() => setRunning(!running)} aria-expanded={running} className={ACTION}>
             Run…
           </button>
-          <button type="button" onClick={onDuplicate} title="Open a copy in the builder" className={ACTION}>
+          <button type="button" onClick={onDuplicate} className={ACTION}>
             Duplicate and edit
           </button>
-          <button type="button" onClick={onDownload} title={`Save ${ttpFileName(ttp)}`} className={ACTION}>
+          <button type="button" onClick={onDownload} className={ACTION}>
             Download JSON
           </button>
-          <button type="button" onClick={onEdit} title="Change weights and windows in place" className={ACTION}>
+          <button type="button" onClick={onEdit} className={ACTION}>
             Edit weights
           </button>
         </div>
@@ -553,7 +538,7 @@ function TtpReadView({
       <Block title="Target">
         <p className="text-[11px]">{target ?? <span className="text-muted">None: molecules are scored on ligand properties only.</span>}</p>
         {ttp.target?.protein_sequence && (
-          <p className="text-faint truncate font-mono text-[10px]" title={ttp.target.protein_sequence}>
+          <p className="text-faint truncate font-mono text-[10px]">
             {ttp.target.protein_sequence}
           </p>
         )}
@@ -573,8 +558,8 @@ function TtpReadView({
       {smarts.length > 0 && (
         <Block title="Constraints" hint="substructures to avoid">
           <div className="flex flex-wrap gap-1">
-            {smarts.map(({ s, type }, i) => (
-              <span key={`${i}:${s}`} className="bg-sunken border-subtle rounded-md border px-1.5 py-px font-mono text-[10px]" title={type}>
+            {smarts.map(({ s }, i) => (
+              <span key={`${i}:${s}`} className="bg-sunken border-subtle rounded-md border px-1.5 py-px font-mono text-[10px]">
                 {s}
               </span>
             ))}
@@ -588,7 +573,7 @@ function TtpReadView({
             {generation.map((row) => (
               <div key={row.label} className="contents">
                 <dt className="text-faint">{row.label}</dt>
-                <dd className="truncate font-mono" title={row.value}>
+                <dd className="truncate font-mono">
                   {row.value}
                 </dd>
               </div>
@@ -607,7 +592,6 @@ function TtpReadView({
                 <button
                   type="button"
                   onClick={() => openRun(job.id, job.state === "failed" || job.state === "queued" ? "jobs" : "results")}
-                  title={job.state === "failed" || job.state === "queued" ? "Open in Jobs" : "Open its results"}
                   className="hover:bg-sunken group flex w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-0.5 text-left text-[11px]"
                 >
                   <span className="size-1.5 shrink-0 rounded-full" style={{ background: toneColor(stateTone(job.state)) }} />
@@ -694,7 +678,7 @@ function VersionHistory({ ttp, runs }: { ttp: Ttp; runs: JobSummary[] }) {
                   <span className={`font-mono ${v === ttp.version ? "text-body" : ""}`}>v{v}</span>{" "}
                   {used.length ? (
                     used.map((j) => (
-                      <button key={j.id} type="button" onClick={() => openRun(j.id, "jobs")} className="hover:text-body cursor-pointer font-mono underline decoration-dotted" title={`${j.state} · open in Jobs`}>
+                      <button key={j.id} type="button" onClick={() => openRun(j.id, "jobs")} className="hover:text-body cursor-pointer font-mono underline decoration-dotted">
                         {j.id}
                       </button>
                     ))
@@ -779,7 +763,7 @@ function ObjectiveLine({ objective, share, relative, tag }: { objective: Objecti
   return (
     <li className="border-subtle flex items-center gap-3 border-t py-1.5 first:border-t-0">
       <div className="min-w-0 flex-1">
-        <p className="truncate text-[11px] font-medium" title={objective.comment ?? objective.name}>
+        <p className="truncate text-[11px] font-medium">
           {objective.name} <span className="text-faint text-[10px] font-normal">{[sourceLabel(objective), tag].filter(Boolean).join(" · ")}</span>
         </p>
         <p className="text-faint truncate text-[10px]">
@@ -793,7 +777,7 @@ function ObjectiveLine({ objective, share, relative, tag }: { objective: Objecti
       ) : (
         <span className="text-faint w-[84px] shrink-0 text-center text-[10px]">0–1 as is</span>
       )}
-      <div className="w-24 shrink-0" title={`weight ${objective.weight} · ${Math.round(share * 100)}% of the total`}>
+      <div className="w-24 shrink-0">
         <div className="bg-inset h-1.5 overflow-hidden rounded-full">
           <div className="h-full rounded-full" style={{ width: `${Math.max(3, share * 100)}%`, background: "var(--color-table)" }} />
         </div>

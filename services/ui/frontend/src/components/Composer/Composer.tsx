@@ -48,6 +48,8 @@ interface Props {
   agents?: number;
   /** Change that allowance. Without it the control is hidden. */
   onAgents?: (count: number) => void;
+  /** S1, S2… when the message goes to that sub-agent instead of the conductor. */
+  recipient?: string | null;
 }
 
 export interface ComposerHandle {
@@ -99,7 +101,7 @@ let attachmentId = 0;
  * stopping must not need a page reload.
  */
 export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer(
-  { value, onChange, onSend, onStop, busy, connected, tools, theme, sessionId, model, defaultEffort, molecules, autoUntil, onAuto, agents, onAgents },
+  { value, onChange, onSend, onStop, busy, connected, tools, theme, sessionId, model, defaultEffort, molecules, autoUntil, onAuto, agents, onAgents, recipient = null },
   ref,
 ) {
   const rootRef = useRef<HTMLDivElement>(null);
@@ -292,7 +294,15 @@ export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer
 
   function applySketch(drawn: string) {
     const target = sketch?.replace;
+    const hand = sketch?.onResult;
     setSketch(null);
+    // A scaffold drawn for the profile builder belongs in its field, not in
+    // the message, and must not be canonicalised: that would renumber the
+    // attachment points the builder is about to validate.
+    if (hand) {
+      hand(drawn);
+      return;
+    }
     void loadRDKit()
       .then((module) => canonical(module, drawn), () => null)
       .then((found) => {
@@ -321,7 +331,8 @@ export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer
     if (!content) return;
     const local = content.toLowerCase().startsWith(VIEW_PREFIX);
     // While the other model loads the gateway has no endpoint to answer on.
-    if (!local && (busy || !connected || loading)) return;
+    // Busy is no reason to hold it: the running turn reads it after its current step.
+    if (!local && (!connected || loading)) return;
     if (uploading) {
       setProblem("Wait for the upload to finish.");
       return;
@@ -341,9 +352,11 @@ export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer
 
   const placeholder = !connected
     ? "Waiting for the agent…"
-    : busy
-      ? "The agent is working. You can write your next message."
-      : "Ask the agent, or type / for commands";
+    : recipient
+      ? `Message ${recipient}. It reads it after its current step.`
+      : busy
+        ? "The agent is working. Send a message and it reads it after its current step."
+        : "Ask the agent, or type / for commands";
   const hasChips = smiles.length > 0 || attachments.length > 0 || problem;
 
   return (
@@ -483,7 +496,6 @@ export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer
                 onClick={() => setModelMenu((open) => !open)}
                 aria-haspopup="menu"
                 aria-expanded={modelMenu}
-                title={loading ? `${loading} is loading` : "Model and thinking level"}
                 className="text-muted hover:text-body border-subtle flex h-7 cursor-pointer items-center gap-1.5 rounded-full border px-2.5 text-[11px] touch:h-9"
               >
                 <span className="max-w-[14rem] truncate">{loading ? `Loading ${loading}…` : (current?.label ?? "Model")}</span>
@@ -532,7 +544,6 @@ export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer
                         ))}
                     </Fragment>
                   ))}
-                  {served && !served.switchable && <p className="text-faint px-3 pt-1 pb-0.5 leading-snug">The model is fixed for this session.</p>}
                   {models.note && (
                     <p className="px-3 pt-1 pb-0.5 leading-snug" style={{ color: "var(--color-warn)" }}>
                       {models.note}
@@ -543,24 +554,24 @@ export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer
             </div>
 
             <span className="flex-1" />
-            {busy ? (
+            {busy && (
               <button
                 type="button"
                 onClick={onStop}
                 aria-label="Stop the agent"
-                title="Stop the agent"
                 className="border-strong text-body hover:bg-sunken flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-xl border px-3 text-xs font-semibold touch:h-11"
               >
                 <span aria-hidden="true" className="size-2.5 rounded-sm" style={{ background: "var(--color-accent)" }} />
                 Stop
               </button>
-            ) : (
+            )}
+            {/* Beside Stop while the agent works, once there is something to send. */}
+            {(!busy || value.trim() || attachments.length > 0) && (
               <button
                 type="button"
                 onClick={submit}
                 disabled={!connected || loading !== null || (!value.trim() && attachments.length === 0)}
                 aria-label="Send"
-                title={loading ? `${loading} is still loading` : "Send"}
                 className="bg-accent hover:bg-accent-strong disabled:bg-inset disabled:text-faint grid size-8 shrink-0 cursor-pointer place-items-center rounded-xl text-white transition-colors disabled:cursor-not-allowed touch:size-11"
               >
                 <svg viewBox="0 0 24 24" className="size-4" fill="none" stroke="currentColor" strokeWidth="2.2" aria-hidden="true">
@@ -594,7 +605,7 @@ export const Composer = memo(forwardRef<ComposerHandle, Props>(function Composer
 
       {sketch && (
         <Suspense fallback={null}>
-          <Sketcher smiles={sketch.smiles} theme={theme} onUse={applySketch} onClose={() => setSketch(null)} />
+          <Sketcher smiles={sketch.smiles} mode={sketch.mode} theme={theme} onUse={applySketch} onClose={() => setSketch(null)} />
         </Suspense>
       )}
 
@@ -622,7 +633,6 @@ function ToolButton({ label, onClick, children }: { label: string; onClick: () =
       type="button"
       onClick={onClick}
       aria-label={label}
-      title={label}
       className="text-muted hover:text-body hover:bg-sunken grid size-7 shrink-0 cursor-pointer place-items-center rounded-lg touch:size-9"
     >
       <svg viewBox="0 0 24 24" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -638,7 +648,6 @@ function SmilesChip({ smiles, valid, theme }: { smiles: string; valid: boolean |
     <button
       type="button"
       onClick={() => openSketcher(bad ? undefined : smiles, smiles)}
-      title={bad ? `RDKit cannot read ${smiles}` : `${smiles}: edit in the sketcher`}
       className="bg-sunken flex h-10 max-w-[15rem] cursor-pointer items-center gap-1.5 rounded-lg border pr-2 pl-1 text-left hover:border-strong"
       style={bad ? { borderColor: "var(--color-accent)" } : undefined}
     >
@@ -672,7 +681,7 @@ function FileChip({ name, detail, failed, onRemove }: { name: string; detail: st
       </svg>
       <span className="min-w-0 leading-tight">
         <span className="block truncate font-medium">{name}</span>
-        <span className="text-faint block truncate text-[10px]" style={failed ? { color: "var(--color-accent)" } : undefined} title={detail}>
+        <span className="text-faint block truncate text-[10px]" style={failed ? { color: "var(--color-accent)" } : undefined}>
           {detail}
         </span>
       </span>

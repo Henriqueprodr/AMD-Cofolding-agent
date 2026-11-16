@@ -40,6 +40,30 @@ const result = (id: string, name: string, extra: object = {}) => ({
 });
 
 describe("applyEvents", () => {
+  it("keeps a message sent mid-turn inside the turn, so the calls still running get their results", () => {
+    const state = applyEvents(
+      EMPTY_TRANSCRIPT,
+      turn(
+        { type: "tool_call", id: "c1", name: "score_molecules", arguments: {} },
+        { type: "user_message", content: "Use the morpholine series", interjected: true },
+        result("c1", "score_molecules"),
+        { type: "assistant_message", content: "Switching.", inputTokens: 1, outputTokens: 1 },
+        { type: "status", state: "idle" },
+      ),
+    );
+
+    expect(state.turns.map((t) => t.role)).toEqual(["user", "agent"]);
+    const agent = state.turns[1] as AgentTurn;
+    expect(agent.blocks.map((b) => b.kind)).toEqual(["tool", "user", "text"]);
+    expect(toolSteps(agent)[0].result).toBeDefined();
+    expect(agent.done).toBe(true);
+  });
+
+  it("starts a turn of its own for a mid-turn message that arrives after the turn ended", () => {
+    const state = applyEvents(EMPTY_TRANSCRIPT, turn({ type: "status", state: "idle" }, { type: "user_message", content: "Again", interjected: true }));
+    expect(state.turns.map((t) => t.role)).toEqual(["user", "agent", "user"]);
+  });
+
   it("builds a question and a finished answer", () => {
     const state = applyEvents(
       EMPTY_TRANSCRIPT,

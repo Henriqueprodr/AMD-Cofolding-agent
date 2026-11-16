@@ -39,7 +39,6 @@ export function MoleculeFacts({ score, components = [], cofold, onOpenComplex, p
               <button
                 type="button"
                 onClick={onOpenComplex}
-                title="Show the predicted complex in the viewer"
                 className="hover:bg-inset -my-0.5 cursor-pointer rounded px-1.5 py-0.5 text-[10px] font-semibold"
                 style={{ color: "var(--color-structure)" }}
               >

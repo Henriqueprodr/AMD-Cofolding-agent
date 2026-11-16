@@ -135,7 +135,10 @@ export function etaLabel(remainingMs: number | null): string {
 type LaunchStep = { name: string; at: number; result?: { result: string; isError: boolean } };
 
 /** The jobs this conversation started, from the results of its run_optimization calls, oldest first. */
-export function conversationJobIds(steps: readonly LaunchStep[], tools: readonly string[] = ["run_optimization"]): string[] {
+export function conversationJobIds(
+  steps: readonly LaunchStep[],
+  tools: readonly string[] = ["run_optimization", "run_generation_campaign"],
+): string[] {
   const ids: string[] = [];
   for (const step of [...steps].sort((a, b) => a.at - b.at)) {
     if (!tools.includes(step.name) || !step.result || step.result.isError) continue;
@@ -147,11 +150,18 @@ export function conversationJobIds(steps: readonly LaunchStep[], tools: readonly
 
 /**
  * Every job this conversation launched: its own calls, which are seen at
- * once, and what the gateway knows (runs continued from those outside the chat).
+ * once, what the gateway knows (runs continued from those outside the chat),
+ * and the runs its campaigns' sub-agents started, which the gateway puts
+ * down to the sub-agent's session and not to this one.
  */
-export function ownJobIds(steps: readonly LaunchStep[], runs: { jobs: readonly { id: string; launched: boolean }[] } | null | undefined): string[] {
-  const ids = conversationJobIds(steps, ["run_optimization", "run_transfer_learning"]);
+export function ownJobIds(
+  steps: readonly LaunchStep[],
+  runs: { jobs: readonly { id: string; launched: boolean }[] } | null | undefined,
+  campaignJobs: Iterable<string> = [],
+): string[] {
+  const ids = conversationJobIds(steps, ["run_optimization", "run_transfer_learning", "run_generation_campaign"]);
   for (const job of runs?.jobs ?? []) if (job.launched && !ids.includes(job.id)) ids.push(job.id);
+  for (const id of campaignJobs) if (!ids.includes(id)) ids.push(id);
   return ids;
 }
 

@@ -115,10 +115,10 @@ export function TrajectoryPlot({ endpoints, stats, shown, onToggle, colours, liv
           />
         ))}
         <span className="ml-auto flex items-center gap-0.5">
-          <Toggle on={smoothOn} onClick={() => setSmooth((v) => !v)} title="Moving average over a few steps; raw means stay faint behind">
+          <Toggle on={smoothOn} onClick={() => setSmooth((v) => !v)}>
             Smooth
           </Toggle>
-          <Toggle on={band} onClick={() => setBand((v) => !v)} title="Min–max range per step (hover a legend entry for its own)">
+          <Toggle on={band} onClick={() => setBand((v) => !v)}>
             Range
           </Toggle>
         </span>
@@ -199,13 +199,12 @@ export function TrajectoryPlot({ endpoints, stats, shown, onToggle, colours, liv
   );
 }
 
-function Toggle({ on, onClick, title, children }: { on: boolean; onClick: () => void; title: string; children: string }) {
+function Toggle({ on, onClick, children }: { on: boolean; onClick: () => void; children: string }) {
   return (
     <button
       type="button"
       onClick={onClick}
       aria-pressed={on}
-      title={title}
       className={`cursor-pointer rounded px-1.5 py-0.5 text-[10.5px] ${on ? "bg-inset text-body" : "text-faint hover:text-muted"}`}
     >
       {children}

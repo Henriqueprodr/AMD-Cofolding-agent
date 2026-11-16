@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 import type { PropertiesPanel } from "../../types/api";
 import type { Theme } from "../../hooks/useTheme";
 import { propertiesSheet } from "../../lib/csv";
-import { endpointLabel, endpointRange, endpointTitle, endpointUnit, formatValue, serviceName, shortUnit } from "../../lib/properties";
+import { endpointLabel, endpointRange, endpointUnit, formatValue, serviceName, shortUnit } from "../../lib/properties";
 import { radarData } from "../../lib/radar";
 import { ExportButtons } from "../DataTable/ExportButtons";
 import { MolDepiction } from "../MolDepiction/MolDepiction";
@@ -54,7 +54,6 @@ export function PropertiesCard({ panel, theme, onOpen, onOpenMolecule, limit }: 
             type="button"
             onClick={() => setAllEndpoints(!allEndpoints)}
             aria-expanded={allEndpoints}
-            title={allEndpoints ? `Show the first ${SHOWN_ENDPOINTS} endpoints only` : `Show the ${hiddenEndpoints} endpoint${hiddenEndpoints === 1 ? "" : "s"} not in the table`}
             className="text-faint hover:text-body hover:bg-inset shrink-0 cursor-pointer rounded px-1 text-[11px] font-medium touch:min-h-11"
           >
             {allEndpoints ? "fewer" : `+${hiddenEndpoints} more`}
@@ -75,7 +74,7 @@ export function PropertiesCard({ panel, theme, onOpen, onOpenMolecule, limit }: 
             ))}
           </span>
         )}
-        <ExportButtons name={`${serviceName(panel)} predictions`} sheet={() => propertiesSheet(panel)} scope={`all ${panel.molecules.length} molecules`} />
+        <ExportButtons name={`${serviceName(panel)} predictions`} sheet={() => propertiesSheet(panel)} />
       </header>
       {showRadar && <RadarChart axes={radar.axes} series={radar.series} total={panel.molecules.filter((m) => m.ok).length} />}
       <div className={`overflow-x-auto ${showRadar ? "hidden" : ""}`}>
@@ -87,13 +86,13 @@ export function PropertiesCard({ panel, theme, onOpen, onOpenMolecule, limit }: 
                 const unit = endpointUnit(panel, endpoint);
                 const short = shortUnit(unit);
                 return (
-                  <th key={endpoint} className="px-2 py-1.5 text-right font-medium whitespace-nowrap" title={endpointTitle(endpoint, unit)}>
+                  <th key={endpoint} className="px-2 py-1.5 text-right font-medium whitespace-nowrap">
                     {endpointLabel(endpoint)}
                     {short && <span className="text-faint ml-1 text-[9px] font-normal">{short}</span>}
                   </th>
                 );
               })}
-              <th className="px-2 py-1.5 text-center font-medium" title="Inside the models' applicability domain">
+              <th className="px-2 py-1.5 text-center font-medium">
                 AD
               </th>
             </tr>
@@ -108,7 +107,6 @@ export function PropertiesCard({ panel, theme, onOpen, onOpenMolecule, limit }: 
                         type="button"
                         disabled={!onOpenMolecule}
                         onClick={() => molecule.smiles && onOpenMolecule?.(molecule.smiles)}
-                        title={onOpenMolecule ? "Open in the workbench" : undefined}
                         aria-label={`Open ${molecule.label ?? molecule.smiles} in the workbench`}
                         className="enabled:hover:bg-inset h-12 w-16 shrink-0 rounded enabled:cursor-pointer"
                       >
@@ -162,7 +160,6 @@ export function PropertiesCard({ panel, theme, onOpen, onOpenMolecule, limit }: 
                     <span className="text-faint">—</span>
                   ) : (
                     <span
-                      title={molecule.adPass ? "Inside the applicability domain" : "Outside the applicability domain: treat with caution"}
                       style={{ color: molecule.adPass ? "var(--color-ok)" : "var(--color-accent)" }}
                     >
                       {molecule.adPass ? "✓" : "!"}
@@ -196,7 +193,7 @@ export function PropertiesCard({ panel, theme, onOpen, onOpenMolecule, limit }: 
 function FailureReason({ error }: { error: string | null }) {
   const reason = error ?? "the prediction failed";
   return (
-    <span className="mt-0.5 flex max-w-40 min-w-0 items-center gap-1 text-[10px] @xl:max-w-52" title={`Not predicted: ${reason}`}>
+    <span className="mt-0.5 flex max-w-40 min-w-0 items-center gap-1 text-[10px] @xl:max-w-52">
       <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full" style={{ background: "var(--color-warn)" }} />
       <span className="truncate">Not predicted: {reason}</span>
     </span>

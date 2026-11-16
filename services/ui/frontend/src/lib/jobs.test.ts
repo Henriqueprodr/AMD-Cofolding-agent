@@ -70,6 +70,15 @@ describe("parseJobs", () => {
     expect(jobs[1]).toMatchObject({ ttpId: "jak2-lead", ttpVersion: 3, maxSteps: 300, hasCheckpoint: true, state: "stopped" });
   });
 
+  it("reads the Slurm job and Boltz use of a relayed run, and leaves them unsaid otherwise", () => {
+    const [relayed, local] = parseJobs([
+      { ...job, slurm_job_id: "23708696", uses_boltz: true },
+      { ...job, job_id: "b0", created_at: "2026-10-25T10:00:00+00:00" },
+    ]);
+    expect(relayed).toMatchObject({ slurmJobId: "23708696", usesBoltz: true });
+    expect(local).toMatchObject({ slurmJobId: null, usesBoltz: null });
+  });
+
   it("is empty for anything that is not a list", () => {
     expect(parseJobs({ error: "x" })).toEqual([]);
     expect(parseJobs(null)).toEqual([]);

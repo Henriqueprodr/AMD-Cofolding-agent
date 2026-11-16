@@ -1,4 +1,4 @@
-﻿// Copyright Advanced Micro Devices, Inc.
+// Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
 /**
@@ -182,11 +182,11 @@ export function fit(mobile: Vec3[], target: Vec3[]): Transform {
 
 /**
  * Superpose *b* on *a* by their CA atoms: pair residues by sequence, fit,
- * then refit a few times without pairs further than *cutoff* Å apart, so a
- * moved loop or a disordered tail does not pull the core. Null when fewer
- * than *minPairs* residues align.
+ * then refit a few times without the pairs furthest apart, down to those
+ * within *cutoff* Å, so a moved loop or a disordered tail does not pull the
+ * core. Null when fewer than *minPairs* residues align.
  */
-export function superposeCa(a: CaAtom[], b: CaAtom[], { cutoff = 2, cycles = 5, minPairs = 10 } = {}): Superposition | null {
+export function superposeCa(a: CaAtom[], b: CaAtom[], { cutoff = 2, cycles = 8, minPairs = 10 } = {}): Superposition | null {
   const seqA = a.map((atom) => oneLetter(atom.resname)).join("");
   const seqB = b.map((atom) => oneLetter(atom.resname)).join("");
   const pairs = alignSequences(seqA, seqB);
@@ -196,9 +196,18 @@ export function superposeCa(a: CaAtom[], b: CaAtom[], { cutoff = 2, cycles = 5, 
     core.map(([, j]) => b[j].pos),
     core.map(([i]) => a[i].pos),
   );
+  let limit = Infinity;
   for (let cycle = 0; cycle < cycles; cycle++) {
-    const kept = pairs.filter(([i, j]) => distance2(apply(transform, b[j].pos), a[i].pos) <= cutoff * cutoff);
-    if (kept.length === core.length || kept.length < Math.max(3, pairs.length / 4)) break;
+    // Tightened towards *cutoff* in steps: a tail packed elsewhere drags the
+    // first fit so far that few pairs are within *cutoff* of it straight away.
+    const spread = rmsd(
+      core.map(([, j]) => apply(transform, b[j].pos)),
+      core.map(([i]) => a[i].pos),
+    );
+    limit = Math.max(cutoff, Math.min(limit / 2, 2 * spread));
+    const kept = pairs.filter(([i, j]) => distance2(apply(transform, b[j].pos), a[i].pos) <= limit * limit);
+    if (kept.length < Math.max(3, pairs.length / 4)) break;
+    if (kept.length === core.length && limit === cutoff) break;
     core = kept;
     transform = fit(
       core.map(([, j]) => b[j].pos),

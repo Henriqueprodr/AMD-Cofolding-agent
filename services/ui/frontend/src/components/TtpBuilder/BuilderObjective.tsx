@@ -37,7 +37,7 @@ export function BuilderObjective({ objective, onChange, onRename, onRemove, weig
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex items-center gap-2">
           <span className="flex w-44 min-w-0 shrink-0 items-center gap-1.5">
-            <span aria-hidden="true" title={group ?? undefined} className="size-1.5 shrink-0 rounded-full" style={{ background: colour }} />
+            <span aria-hidden="true" className="size-1.5 shrink-0 rounded-full" style={{ background: colour }} />
             <input
               value={objective.name}
               onChange={(event) => onRename(event.target.value)}
@@ -53,11 +53,10 @@ export function BuilderObjective({ objective, onChange, onRename, onRemove, weig
             value={Math.min(weights.max, objective.weight)}
             onChange={(event) => onChange({ weight: Number(event.target.value) })}
             aria-label={`${objective.name} weight`}
-            title="Weight"
             className="min-w-0 flex-1 accent-[var(--color-table)]"
           />
           <span className="w-8 shrink-0 text-right font-mono text-[11px] tabular-nums">{objective.weight.toFixed(2)}</span>
-          <span className="text-faint w-7 shrink-0 text-right text-[10px] tabular-nums" title="Share of the total weight">
+          <span className="text-faint w-7 shrink-0 text-right text-[10px] tabular-nums">
             {Math.round(share * 100)}%
           </span>
         </div>
@@ -110,7 +109,7 @@ export function BuilderObjective({ objective, onChange, onRename, onRemove, weig
       ) : (
         <span aria-hidden="true" className="w-[132px] shrink-0" />
       )}
-      <button type="button" onClick={onRemove} aria-label={`Remove ${objective.name}`} title="Remove" className="text-faint hover:text-body cursor-pointer self-start px-1 text-sm leading-none">
+      <button type="button" onClick={onRemove} aria-label={`Remove ${objective.name}`} className="text-faint hover:text-body cursor-pointer self-start px-1 text-sm leading-none">
         ×
       </button>
     </li>

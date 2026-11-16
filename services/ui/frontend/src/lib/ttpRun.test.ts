@@ -33,7 +33,7 @@ describe("run settings", () => {
     expect(loadRunSettings(store)).toEqual(DEFAULT_RUN);
     expect(DEFAULT_RUN.prior).toBeNull();
     saveRunSettings({ enabled: true, maxSteps: 100, batchSize: 32, prior: "mol2mol", model: ".m2m_high", seeds: "CCO" }, store);
-    expect(loadRunSettings(store)).toEqual({ enabled: true, maxSteps: 100, batchSize: 32, prior: null, model: ".m2m_high", seeds: "CCO" });
+    expect(loadRunSettings(store)).toEqual({ enabled: true, maxSteps: 100, batchSize: 32, prior: null, model: ".m2m_high", seeds: "CCO", scaffold: "" });
     store.setItem(RUN_KEY, JSON.stringify({ maxSteps: -3, batchSize: 1.5, prior: "x", model: "/etc/passwd" }));
     expect(loadRunSettings(store)).toEqual(DEFAULT_RUN);
     store.setItem(RUN_KEY, "{oops");
@@ -41,12 +41,34 @@ describe("run settings", () => {
   });
 
   it("checks the prior, steps, batch size and seeds", () => {
-    expect(runProblems(DEFAULT_RUN)).toEqual([expect.stringMatching(/from scratch or analogues/)]);
+    expect(runProblems(DEFAULT_RUN)).toEqual([expect.stringMatching(/Choose how to generate/)]);
     expect(runProblems({ ...DEFAULT_RUN, prior: "reinvent" })).toEqual([]);
     expect(runProblems({ ...DEFAULT_RUN, prior: "reinvent", maxSteps: 0 })[0]).toMatch(/Steps/);
     expect(runProblems({ ...DEFAULT_RUN, prior: "reinvent", batchSize: 10_000 })[0]).toMatch(/Batch/);
     expect(runProblems({ ...DEFAULT_RUN, prior: "mol2mol" })).toEqual(["Mol2Mol needs at least one seed SMILES."]);
     expect(runProblems({ ...DEFAULT_RUN, prior: "mol2mol", seeds: "CCO" })).toEqual([]);
+  });
+
+  it("will not start a scaffold or linker run without the structure it decorates", () => {
+    // These two have nothing to generate from until the structure is given,
+    // and REINVENT refuses an attachment point that carries no number.
+    expect(runProblems({ ...DEFAULT_RUN, prior: "libinvent" })[0]).toMatch(/scaffold/);
+    expect(runProblems({ ...DEFAULT_RUN, prior: "libinvent", scaffold: "[*]c1ccccc1" })[0]).toMatch(/needs a number/);
+    expect(runProblems({ ...DEFAULT_RUN, prior: "libinvent", scaffold: "[*:1]c1ccccc1" })).toEqual([]);
+
+    expect(runProblems({ ...DEFAULT_RUN, prior: "linkinvent", scaffold: "[*:1]CC" })[0]).toMatch(/two fragments/);
+    expect(runProblems({ ...DEFAULT_RUN, prior: "linkinvent", scaffold: "[*:1]CC | [*:2]OC" })).toEqual([]);
+  });
+
+  it("asks for the starter that can actually build a scaffold run", () => {
+    // run_optimization builds de novo and Mol2Mol only and refuses these two
+    // by name, so the request has to name run_generation_campaign.
+    const ttp = { id: "t1", name: "BRD4" };
+    const text = ttpRequest(ttp, { ...DEFAULT_RUN, enabled: true, prior: "libinvent", scaffold: "[*:1]c1ccccc1" });
+
+    expect(text).toContain("LibInvent");
+    expect(text).toContain("[*:1]c1ccccc1");
+    expect(text).toContain("run_generation_campaign");
   });
 
   it("adds and removes seeds without duplicates", () => {

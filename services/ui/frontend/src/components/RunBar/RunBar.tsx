@@ -1,15 +1,13 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { Artifacts } from "../../lib/artifacts";
 import { callTool, jobFileUrl } from "../../lib/api";
 import {
   errorSummary,
   isActive,
   jobTitle,
-  parseAlerts,
-  parseJobs,
   parseStatus,
   toolError,
   type JobState,
@@ -29,8 +27,11 @@ import {
   shortDuration,
   type RunEvent,
 } from "../../lib/runProgress";
-import { notifyRunsChanged, onRunsChanged, openRun, openWorkbench } from "../../lib/workbenchBus";
+import { notifyRunsChanged, onRunsChanged, openRun } from "../../lib/workbenchBus";
 import { cofoldShown, inFlightCofold, runUsesBoltz, type CofoldStatus } from "../../lib/cofold";
+import { agentLabels, campaignRuns } from "../../lib/fleet";
+import { useCampaignDetails } from "../../hooks/useCampaignJobs";
+import { useJobList, useJobWatch } from "../../hooks/useJobList";
 import { refreshSessionList, useSessionRuns } from "../../hooks/useSessions";
 import { Bar, CofoldRow, Eta } from "./CofoldRow";
 import { ScoreTrend } from "./ScoreTrend";
@@ -59,6 +60,8 @@ const DONE_MS = 8_000;
 /** How long a run's finished cofold batch stays while the run prepares the next. */
 const HOLD_MS = 180_000;
 const ASKED_KEY = "cofold.notify.asked";
+/** Before the first reading of the job list: nothing to show and nothing to report. */
+const NO_JOBS: JobSummary[] = [];
 
 const watch = new RunWatch();
 
@@ -112,8 +115,8 @@ async function readLogTail(jobId: string): Promise<string> {
   }
 }
 
-async function readLive(jobId: string, withLog: boolean): Promise<Live | null> {
-  const [{ result }, log] = await Promise.all([callTool("get_optimization_status", { job_id: jobId }), withLog ? readLogTail(jobId) : Promise.resolve("")]);
+async function readLive(jobId: string): Promise<Live | null> {
+  const [{ result }, log] = await Promise.all([callTool("get_optimization_status", { job_id: jobId }), readLogTail(jobId)]);
   const status = parseStatus(result);
   if (!status) return null;
   const marks = parseStepTimes(log);
@@ -121,24 +124,29 @@ async function readLive(jobId: string, withLog: boolean): Promise<Live | null> {
 }
 
 /**
- * "Designing": a slim bar above the composer while a REINVENT run of this
- * conversation goes on, with its progress, elapsed time and an estimate of
- * the time left, and under it what Boltz cofolds for the conversation.
- * A click opens the run in the workbench; Stop asks first, then calls
- * stop_optimization. A finished run stays a few seconds with its outcome.
+ * A slim bar above the composer while a REINVENT run of this conversation
+ * goes on, with its progress and an estimate of the time left, and under it
+ * what Boltz cofolds for the conversation. With several going at once it
+ * shows the first, and a tab on its top edge opens all of them in a box over
+ * the conversation, one line each. A click opens the run in the
+ * workbench; Stop asks first, then calls stop_optimization. A finished run
+ * stays a few seconds with its outcome.
  */
 export const RunBar = memo(function RunBar({ sessionId, steps, turnAt = null, onNotice }: Props) {
   const runs = useSessionRuns(sessionId);
-  const conversation = useMemo(() => ownJobIds(steps, runs), [steps, runs]);
-  const conversationKey = conversation.join(",");
-  const [jobs, setJobs] = useState<JobSummary[]>([]);
-  const [listTick, setListTick] = useState(0);
+  const campaigns = useCampaignDetails(sessionId);
+  const delegated = useMemo(() => campaignRuns(campaigns, agentLabels(campaigns)), [campaigns]);
+  const conversation = useMemo(() => ownJobIds(steps, runs, delegated.keys()), [steps, runs, delegated]);
+  const { jobs: read, alerts } = useJobList();
+  const jobs = read ?? NO_JOBS;
   const [live, setLive] = useState<Record<string, Live>>({});
   const [pollTick, setPollTick] = useState(0);
   const [finished, setFinished] = useState<{ job: JobSummary | JobStatus; at: number } | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const [confirm, setConfirm] = useState(false);
-  const [stopping, setStopping] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  /** The run whose Stop is waiting to be confirmed. */
+  const [confirm, setConfirm] = useState<string | null>(null);
+  const [stopping, setStopping] = useState<ReadonlySet<string>>(() => new Set());
   const [stopError, setStopError] = useState<{ jobId: string; text: string } | null>(null);
 
   const stateOf = (job: JobSummary): JobState => live[job.id]?.status.state ?? job.state;
@@ -147,57 +155,23 @@ export const RunBar = memo(function RunBar({ sessionId, steps, turnAt = null, on
     conversation,
   );
   const shownKey = shown.map((job) => job.id).join(",");
-  const first = shown[0] ?? null;
 
-  useEffect(() => {
-    let cancelled = false;
-    callTool("list_jobs")
-      .then(async ({ result }) => {
-        if (cancelled || toolError(result)) return;
-        const list = parseJobs(result);
-        setJobs(list);
-        announce(watch.jobs(list), list, onNotice);
-        if (!list.some((job) => isActive(job.state))) return;
-        const alerts = await callTool("get_job_alerts").catch(() => null);
-        if (!cancelled && alerts) announce(watch.alertsOf(parseAlerts(alerts.result)), list, onNotice);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId, conversationKey, listTick, onNotice]);
-
-  useEffect(
-    () =>
-      onRunsChanged(() => {
-        setListTick((t) => t + 1);
-        refreshSessionList();
-      }),
-    [],
-  );
-
+  // Watched only while a run is going on; one that starts announces itself (onRunsChanged).
   const anyRunning = jobs.some((job) => isActive(job.state));
-  useEffect(() => {
-    if (!anyRunning) return;
-    const timer = window.setInterval(() => {
-      if (!document.hidden) setListTick((t) => t + 1);
-    }, WATCH_MS);
-    return () => window.clearInterval(timer);
-  }, [anyRunning]);
+  useJobWatch(anyRunning ? WATCH_MS : null);
 
+  useEffect(() => announce(watch.jobs(jobs), jobs, onNotice), [jobs, onNotice]);
   useEffect(() => {
-    const onVisible = () => {
-      if (!document.hidden) setListTick((t) => t + 1);
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
-  }, []);
+    if (anyRunning) announce(watch.alertsOf(alerts), jobs, onNotice);
+  }, [anyRunning, jobs, alerts, onNotice]);
+
+  useEffect(() => onRunsChanged(refreshSessionList), []);
 
   useEffect(() => {
     if (!shownKey) return;
     let cancelled = false;
     const ids = shownKey.split(",");
-    Promise.all(ids.map((id, i) => readLive(id, i === 0).catch(() => null))).then((results) => {
+    Promise.all(ids.map((id) => readLive(id).catch(() => null))).then((results) => {
       if (cancelled) return;
       const next: Record<string, Live> = {};
       results.forEach((entry, i) => {
@@ -256,8 +230,8 @@ export const RunBar = memo(function RunBar({ sessionId, steps, turnAt = null, on
   ) : null;
 
   async function stop(job: JobSummary) {
-    setConfirm(false);
-    setStopping(true);
+    setConfirm(null);
+    setStopping((previous) => new Set(previous).add(job.id));
     setStopError(null);
     try {
       const { result } = await callTool("stop_optimization", { job_id: job.id });
@@ -268,93 +242,41 @@ export const RunBar = memo(function RunBar({ sessionId, steps, turnAt = null, on
     } catch (reason) {
       setStopError({ jobId: job.id, text: errorText(reason) });
     } finally {
-      setStopping(false);
+      setStopping((previous) => {
+        const next = new Set(previous);
+        next.delete(job.id);
+        return next;
+      });
       setPollTick((t) => t + 1);
       notifyRunsChanged();
     }
   }
 
-  if (first) {
-    const entry = live[first.id];
-    const input = {
-      state: first.state,
-      currentStep: entry?.status.currentStep ?? null,
-      logStep: entry?.logStep ?? null,
-      maxSteps: entry?.status.maxSteps ?? first.maxSteps,
-      startedAt: first.startedAt,
-      secondsPerStep: entry?.secondsPerStep ?? null,
+  if (shown.length) {
+    const open = expanded && shown.length > 1;
+    const toggle = (next: boolean) => {
+      setExpanded(next);
+      // A Stop asked of a line that is folded away would be answered unseen.
+      setConfirm(null);
     };
-    const progress = runProgress({ ...input, now });
-    const estimate = entry ? runProgress({ ...input, now: entry.at }) : null;
-    const remaining = estimate ? countDown(estimate.remainingMs, now - (entry?.at ?? now)) : null;
-    const others = shown.slice(1);
-    const title = jobTitle(first);
-    const error = stopError?.jobId === first.id ? stopError.text : null;
-
-    if (confirm) {
-      return (
-        <Shell extra={cofoldRow}>
-          <span className="col-span-8 min-w-0 leading-tight whitespace-normal">
-            Stop <b className="font-semibold">{title}</b> at step {progress.done}? REINVENT saves a checkpoint, so it can be resumed.
-          </span>
-          <Actions>
-            <BarButton onClick={() => setConfirm(false)}>Cancel</BarButton>
-            <BarButton tone="bad" onClick={() => void stop(first)}>
-              Stop run
-            </BarButton>
-          </Actions>
-        </Shell>
-      );
-    }
-
+    const line = (job: JobSummary, divided: boolean) => (
+      <Line key={job.id} divided={divided}>
+        <RunLine
+          job={job}
+          entry={live[job.id]}
+          now={now}
+          title={delegated.get(job.id)?.title || jobTitle(job)}
+          stopping={stopping.has(job.id)}
+          error={stopError?.jobId === job.id ? stopError.text : null}
+          confirming={confirm === job.id}
+          onConfirm={(asking) => setConfirm(asking ? job.id : null)}
+          onStop={() => void stop(job)}
+        />
+      </Line>
+    );
     return (
-      <Shell extra={cofoldRow}>
-        <button
-          type="button"
-          onClick={() => openRun(first.id, "jobs")}
-          title={`Open ${title} (${first.id}) in the workbench`}
-          className="col-span-8 grid min-w-0 cursor-pointer grid-cols-subgrid items-center text-left"
-        >
-          <span aria-hidden="true" className="size-1.5 animate-pulse rounded-full" style={{ background: "var(--color-accent)" }} />
-          <span className="font-medium">{first.state === "queued" ? "Starting" : stopping ? "Stopping" : "Designing"}</span>
-          <span className="text-faint min-w-0 truncate">
-            {error ? (
-              <span style={{ color: "var(--color-accent)" }} title={error}>
-                {error}
-              </span>
-            ) : (
-              title
-            )}
-          </span>
-          <Bar fraction={progress.fraction ?? 0} />
-          <span className="text-muted text-right font-mono tabular-nums" title="Steps done / maximum steps">
-            {progress.done}/{progress.max ?? "—"}
-          </span>
-          <span>
-            <ScoreTrend status={entry?.status} width={56} className="hidden @lg:block" />
-          </span>
-          <span className="text-faint text-right tabular-nums" title="Elapsed">
-            {progress.elapsedMs !== null ? shortDuration(progress.elapsedMs) : ""}
-          </span>
-          <span className="text-faint tabular-nums" title={estimate?.remainingMs != null ? "Estimated from the recent step rate" : "Waiting for a few steps"}>
-            {first.state === "queued" ? "" : <Eta remainingMs={remaining} />}
-          </span>
-        </button>
-        <Actions>
-          {others.length > 0 && (
-            <BarButton onClick={() => openWorkbench("jobs")} title={`Also running: ${others.map((job) => `${jobTitle(job)} (${job.id})`).join(", ")}`}>
-              +{others.length}
-            </BarButton>
-          )}
-          <BarButton tone="primary" onClick={() => openRun(first.id, "jobs")} title="Open the job: progress, results and activity">
-            Job
-          </BarButton>
-          {first.type === "optimization" && first.state === "running" && (
-            <BarButton tone="bad" disabled={stopping} onClick={() => setConfirm(true)} title="Stop the run (asks first)">
-              <StopIcon /> Stop
-            </BarButton>
-          )}
-        </Actions>
+      <Shell extra={cofoldRow} more={shown.length > 1 ? { count: shown.length, open, toggle } : null} list={open ? shown.map((job, i) => line(job, i > 0)) : null}>
+        {line(shown[0], false)}
       </Shell>
     );
   }
@@ -368,50 +290,185 @@ export const RunBar = memo(function RunBar({ sessionId, steps, turnAt = null, on
     const label = state === "completed" ? "Finished" : state === "failed" ? "Failed" : "Stopped";
     return (
       <Shell extra={cofoldRow}>
-        <button type="button" onClick={() => openRun(job.id, "jobs")} className="col-span-8 grid min-w-0 cursor-pointer grid-cols-subgrid items-center text-left">
-          <span aria-hidden="true" className="size-1.5 rounded-full" style={{ background: color }} />
-          <span className="font-medium" style={{ color }}>
-            {label}
-          </span>
-          <span className="text-faint min-w-0 truncate">{jobTitle(job)}</span>
-          <Bar fraction={progress.fraction} colour={color} />
-          <span className="text-muted text-right font-mono tabular-nums">
-            {progress.done}/{progress.max ?? "—"}
-          </span>
-          <span />
-          <span className="text-faint text-right tabular-nums" title="Ran for">
-            {progress.elapsedMs !== null ? shortDuration(progress.elapsedMs) : ""}
-          </span>
-          <span />
-        </button>
-        <Actions>
-          <BarButton tone="primary" onClick={() => openRun(job.id, state === "failed" ? "jobs" : "results")} title="Open the job">
-            Job
-          </BarButton>
-          <BarButton onClick={() => setFinished(null)} title="Dismiss">
-            ×
-          </BarButton>
-        </Actions>
+        <Line>
+          <button type="button" onClick={() => openRun(job.id, "jobs")} className="col-span-8 grid min-w-0 cursor-pointer grid-cols-subgrid items-center text-left">
+            <span aria-hidden="true" className="size-1.5 rounded-full" style={{ background: color }} />
+            <span className="font-medium" style={{ color }}>
+              {label}
+            </span>
+            <span className="text-faint min-w-0 truncate">{delegated.get(job.id)?.title || jobTitle(job)}</span>
+            <Bar fraction={progress.fraction} colour={color} />
+            <span className="text-muted text-right font-mono tabular-nums">
+              {progress.done}/{progress.max ?? "—"}
+            </span>
+            <span />
+            <span className="text-faint text-right tabular-nums">
+              {progress.elapsedMs !== null ? shortDuration(progress.elapsedMs) : ""}
+            </span>
+            <span />
+          </button>
+          <Actions>
+            <BarButton tone="primary" onClick={() => openRun(job.id, state === "failed" ? "jobs" : "results")}>
+              Job
+            </BarButton>
+            <BarButton onClick={() => setFinished(null)}>×</BarButton>
+          </Actions>
+        </Line>
       </Shell>
     );
   }
 
-  return cofoldRow ? <Shell>{cofoldRow}</Shell> : null;
+  return cofoldRow ? (
+    <Shell>
+      <Line>{cofoldRow}</Line>
+    </Shell>
+  ) : null;
 });
 
-/** Every line shares the bar's columns: dot, label, detail, progress, count, extra, elapsed, time left, actions. */
-const ROW = "col-span-full grid min-h-7 grid-cols-subgrid items-center py-0.5 pr-1 pl-2.5";
+interface RunLineProps {
+  job: JobSummary;
+  entry: Live | undefined;
+  now: number;
+  /** The task behind a campaign's run, else the run's own title. */
+  title: string;
+  stopping: boolean;
+  error: string | null;
+  confirming: boolean;
+  onConfirm: (asking: boolean) => void;
+  onStop: () => void;
+}
 
-/** The bar; *extra* is a second line under the run, e.g. what Boltz is cofolding. */
-function Shell({ children, extra }: { children: React.ReactNode; extra?: React.ReactNode }) {
+/** One running job: what it is, how far it has got, and its buttons. */
+function RunLine({ job, entry, now, title, stopping, error, confirming, onConfirm, onStop }: RunLineProps) {
+  const input = {
+    state: job.state,
+    currentStep: entry?.status.currentStep ?? null,
+    logStep: entry?.logStep ?? null,
+    maxSteps: entry?.status.maxSteps ?? job.maxSteps,
+    startedAt: job.startedAt,
+    secondsPerStep: entry?.secondsPerStep ?? null,
+  };
+  const progress = runProgress({ ...input, now });
+  const estimate = entry ? runProgress({ ...input, now: entry.at }) : null;
+  const remaining = estimate ? countDown(estimate.remainingMs, now - (entry?.at ?? now)) : null;
+
+  if (confirming) {
+    return (
+      <>
+        <span className="col-span-8 min-w-0 leading-tight whitespace-normal">
+          Stop <b className="font-semibold">{title}</b> at step {progress.done}? REINVENT saves a checkpoint, so it can be resumed.
+        </span>
+        <Actions>
+          <BarButton onClick={() => onConfirm(false)}>Cancel</BarButton>
+          <BarButton tone="bad" onClick={onStop}>
+            Stop run
+          </BarButton>
+        </Actions>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <button type="button" onClick={() => openRun(job.id, "jobs")} className="col-span-8 grid min-w-0 cursor-pointer grid-cols-subgrid items-center text-left">
+        <span aria-hidden="true" className="size-1.5 animate-pulse rounded-full" style={{ background: "var(--color-accent)" }} />
+        <span className="font-medium">{job.state === "queued" ? "Starting" : stopping ? "Stopping" : ""}</span>
+        <span className="text-faint min-w-0 truncate">{error ? <span style={{ color: "var(--color-accent)" }}>{error}</span> : title}</span>
+        <Bar fraction={progress.fraction ?? 0} />
+        <span className="text-muted text-right font-mono tabular-nums">
+          {progress.done}/{progress.max ?? "—"}
+        </span>
+        <span>
+          <ScoreTrend status={entry?.status} width={56} className="hidden @lg:block" />
+        </span>
+        <span />
+        <span className="text-faint tabular-nums">{job.state === "queued" ? "" : <Eta remainingMs={remaining} />}</span>
+      </button>
+      <Actions>
+        <BarButton tone="primary" onClick={() => openRun(job.id, "jobs")}>
+          Job
+        </BarButton>
+        {job.type === "optimization" && job.state === "running" && (
+          <BarButton tone="bad" disabled={stopping} onClick={() => onConfirm(true)}>
+            <StopIcon /> Stop
+          </BarButton>
+        )}
+      </Actions>
+    </>
+  );
+}
+
+const GRID = "grid grid-cols-[auto_auto_minmax(0,1fr)_auto_auto_auto_auto_auto_auto] gap-x-1.5 @lg:gap-x-2 text-[11px] whitespace-nowrap";
+
+/**
+ * The bar; *extra* is a line under the runs, e.g. what Boltz is cofolding.
+ * With more than one run, a tab on its top edge opens *list*, every run, in
+ * a box over the conversation that closes on a click anywhere else.
+ */
+function Shell({
+  children,
+  extra,
+  more = null,
+  list = null,
+}: {
+  children: React.ReactNode;
+  extra?: React.ReactNode;
+  more?: { count: number; open: boolean; toggle: (open: boolean) => void } | null;
+  list?: React.ReactNode;
+}) {
+  const box = useRef<HTMLDivElement>(null);
+  const close = more?.toggle;
+  useEffect(() => {
+    if (!list || !close) return;
+    const outside = (event: PointerEvent) => {
+      if (!box.current?.contains(event.target as Node)) close(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close(false);
+    };
+    document.addEventListener("pointerdown", outside);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [list, close]);
+
   return (
     <div className="@container mx-auto w-full max-w-3xl px-3 sm:px-4" role="status" aria-live="polite">
-      <div className="bg-sunken border-subtle grid grid-cols-[auto_auto_minmax(0,1fr)_auto_auto_auto_auto_auto_auto] gap-x-1.5 rounded-t-lg @lg:gap-x-2 border border-b-0 text-[11px] whitespace-nowrap">
-        <div className={ROW}>{children}</div>
-        {extra && <div className={`${ROW} border-subtle border-t`}>{extra}</div>}
+      <div ref={box} className="relative">
+        {list && (
+          <div
+            aria-label="Every run going on"
+            className={`bg-raised border-subtle shadow-card absolute inset-x-0 bottom-full z-20 mb-3 max-h-64 overflow-y-auto rounded-lg border ${GRID}`}
+          >
+            {list}
+          </div>
+        )}
+        {more && (
+          <button
+            type="button"
+            onClick={() => more.toggle(!more.open)}
+            aria-expanded={more.open}
+            aria-label={more.open ? "Hide the list of runs" : `Show all ${more.count} runs`}
+            title={`${more.count} runs`}
+            className="bg-sunken border-subtle text-muted hover:text-body absolute -top-2 left-1/2 z-10 -translate-x-1/2 cursor-pointer rounded-md border px-1.5 text-[10px] leading-3 tracking-widest"
+          >
+            …
+          </button>
+        )}
+        <div className={`bg-sunken border-subtle rounded-t-lg border border-b-0 ${GRID}`}>
+          {children}
+          {extra && <Line divided>{extra}</Line>}
+        </div>
       </div>
     </div>
   );
+}
+
+/** Every line shares the bar's columns: dot, label, detail, progress, count, extra, elapsed, time left, actions. */
+function Line({ children, divided = false }: { children: React.ReactNode; divided?: boolean }) {
+  return <div className={`col-span-full grid min-h-7 grid-cols-subgrid items-center py-0.5 pr-1 pl-2.5${divided ? " border-subtle border-t" : ""}`}>{children}</div>;
 }
 
 function Actions({ children }: { children: React.ReactNode }) {
@@ -421,15 +478,16 @@ function Actions({ children }: { children: React.ReactNode }) {
 function BarButton({
   children,
   onClick,
-  title,
   disabled,
   tone,
+  expanded,
 }: {
   children: React.ReactNode;
   onClick: () => void;
-  title?: string;
   disabled?: boolean;
   tone?: "bad" | "primary";
+  /** For a button that shows and hides more of the bar. */
+  expanded?: boolean;
 }) {
   const look =
     tone === "bad"
@@ -441,8 +499,8 @@ function BarButton({
     <button
       type="button"
       onClick={onClick}
-      title={title}
       disabled={disabled}
+      aria-expanded={expanded}
       className={`inline-flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 font-medium disabled:cursor-default disabled:opacity-40 ${look}`}
     >
       {children}

@@ -4,7 +4,7 @@
 import { useState, type ReactNode } from "react";
 import { sendToViewer } from "../../lib/viewerBus";
 import { openPdbEntry } from "../../lib/rcsb";
-import { hasTargetFacts, structureHint, targetLigands, type PocketResidue, type TargetFacts } from "../../lib/ttp";
+import { hasTargetFacts, targetLigands, type PocketResidue, type TargetFacts } from "../../lib/ttp";
 import { CopyButton } from "../CopyButton/CopyButton";
 
 interface Props {
@@ -65,7 +65,7 @@ export function TargetCard({ facts, onAsk, children }: Props) {
           <div className="flex items-start gap-2">
             <span aria-hidden="true" className="mt-1.5 size-2 shrink-0 rounded-full" style={{ background: "var(--color-structure)" }} />
             <div className="min-w-0 flex-1">
-              <h3 className="truncate text-sm font-semibold" title={facts.name ?? title}>
+              <h3 className="truncate text-sm font-semibold">
                 {title}
               </h3>
               {subtitle && <p className="text-muted truncate text-[11px]">{subtitle}</p>}
@@ -78,7 +78,6 @@ export function TargetCard({ facts, onAsk, children }: Props) {
                 href={`https://www.uniprot.org/uniprotkb/${encodeURIComponent(facts.uniprot)}/entry`}
                 target="_blank"
                 rel="noreferrer"
-                title={`${facts.uniprot} on uniprot.org`}
                 className="shrink-0 rounded-full border px-1.5 py-px font-mono text-[10px] font-semibold hover:opacity-80"
                 style={{ color: "var(--color-structure)", borderColor: "var(--color-structure)" }}
               >
@@ -88,7 +87,7 @@ export function TargetCard({ facts, onAsk, children }: Props) {
           </div>
 
           {facts.function && (
-            <p className="text-muted line-clamp-2 text-[11px] leading-relaxed" title={facts.function}>
+            <p className="text-muted line-clamp-2 text-[11px] leading-relaxed">
               {facts.function}
             </p>
           )}
@@ -96,16 +95,15 @@ export function TargetCard({ facts, onAsk, children }: Props) {
           <dl className="flex flex-wrap gap-x-5 gap-y-1.5">
             <Fact
               label="Length"
-              title={facts.uniprotSequence && facts.uniprotSequence.length !== facts.sequenceLength ? `a construct; the UniProt sequence has ${count(facts.uniprotSequence.length)} aa` : undefined}
             >
               {facts.sequenceLength !== null ? `${count(facts.sequenceLength)} aa` : null}
             </Fact>
             <Fact label="Chains">{facts.chains.length ? facts.chains.join(", ") : null}</Fact>
             <Fact label="Profile">{facts.ttpId}</Fact>
-            <Fact label="MSA" title={facts.msaPath ?? undefined}>
+            <Fact label="MSA">
               {facts.msaPath?.split("/").pop()}
             </Fact>
-            <Fact label="Receptor" title={facts.proteinPdbPath ?? undefined}>
+            <Fact label="Receptor">
               {facts.proteinPdbPath?.split("/").pop()}
             </Fact>
           </dl>
@@ -118,7 +116,6 @@ export function TargetCard({ facts, onAsk, children }: Props) {
                     href={`https://www.rcsb.org/structure/${encodeURIComponent(id)}`}
                     target="_blank"
                     rel="noreferrer"
-                    title={[`${id} on rcsb.org`, structureHint(facts, id)].filter(Boolean).join(" · ")}
                     className="hover:bg-inset rounded-l-md py-px pr-1 pl-1.5"
                     style={{ color: "var(--color-structure)" }}
                   >
@@ -128,7 +125,6 @@ export function TargetCard({ facts, onAsk, children }: Props) {
                     type="button"
                     onClick={() => void openEntry(id)}
                     disabled={opening?.id === id && !opening.error}
-                    title={`Open ${id} in the 3D viewer`}
                     aria-label={`Open ${id} in the 3D viewer`}
                     className="text-faint hover:text-body cursor-pointer rounded-r-md py-px pr-1.5 pl-0.5 disabled:cursor-wait disabled:opacity-60"
                   >
@@ -152,7 +148,6 @@ export function TargetCard({ facts, onAsk, children }: Props) {
                   href={`https://www.rcsb.org/ligand/${encodeURIComponent(ligand.code)}`}
                   target="_blank"
                   rel="noreferrer"
-                  title={[ligand.name, ligand.pdbIds.join(", ")].filter(Boolean).join(" · ")}
                   className="bg-sunken border-subtle hover:border-strong rounded-md border px-1.5 py-px font-mono text-[10px]"
                 >
                   {ligand.code}
@@ -166,7 +161,7 @@ export function TargetCard({ facts, onAsk, children }: Props) {
               label="Pocket"
               hint={`${facts.pocket.length} residues · ${facts.profiledComplexes} profiled complex${facts.profiledComplexes === 1 ? "" : "es"}`}
               action={
-                <button type="button" onClick={() => focus(facts.pocket)} title="Focus these residues in the 3D viewer" className="text-muted hover:text-body cursor-pointer text-[11px] font-medium">
+                <button type="button" onClick={() => focus(facts.pocket)} className="text-muted hover:text-body cursor-pointer text-[11px] font-medium">
                   Show in viewer
                 </button>
               }
@@ -176,7 +171,6 @@ export function TargetCard({ facts, onAsk, children }: Props) {
                   key={`${residue.chain}:${residue.label}`}
                   type="button"
                   onClick={() => focus([residue])}
-                  title={`${residue.chain ? `chain ${residue.chain} · ` : ""}${residue.contacts} contact${residue.contacts === 1 ? "" : "s"}: ${residue.types.join(", ")}`}
                   className="bg-sunken border-subtle hover:border-strong cursor-pointer rounded-md border px-1.5 py-px font-mono text-[10px]"
                   style={{ color: "var(--color-structure)" }}
                 >
@@ -240,12 +234,12 @@ export function TargetCard({ facts, onAsk, children }: Props) {
   );
 }
 
-function Fact({ label, title, children }: { label: string; title?: string; children: ReactNode }) {
+function Fact({ label, children }: { label: string; children: ReactNode }) {
   if (children === null || children === undefined || children === "") return null;
   return (
     <div className="min-w-0">
       <dt className="text-faint truncate text-[10px]">{label}</dt>
-      <dd className="truncate font-mono text-[11px]" title={title ?? (typeof children === "string" ? children : undefined)}>
+      <dd className="truncate font-mono text-[11px]">
         {children}
       </dd>
     </div>

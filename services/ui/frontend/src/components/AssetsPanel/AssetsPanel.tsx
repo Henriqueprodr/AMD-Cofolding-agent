@@ -147,7 +147,6 @@ export function AssetsPanel({ events = [], onOpenStructure, onInsert }: Props) {
             type="button"
             onClick={refresh}
             disabled={listing.state === "loading"}
-            title="Refresh"
             aria-label="Refresh"
             className={`${action} shrink-0 disabled:cursor-default disabled:opacity-50`}
           >
@@ -165,7 +164,6 @@ export function AssetsPanel({ events = [], onOpenStructure, onInsert }: Props) {
                 type="button"
                 aria-pressed={activeType === c.type}
                 onClick={() => setType(activeType === c.type ? null : c.type)}
-                title={c.type === HIDDEN_TYPE ? "Engine internals (npz, pkl, lock, yaml, json); not part of All" : undefined}
                 className={`${chip(activeType === c.type)} ${c.type === HIDDEN_TYPE && activeType !== c.type ? "ml-auto border-transparent opacity-70" : ""}`}
               >
                 {c.label} <span className="text-faint">{c.count}</span>
@@ -189,7 +187,6 @@ export function AssetsPanel({ events = [], onOpenStructure, onInsert }: Props) {
             type="button"
             onClick={() => void downloadShown()}
             disabled={busy}
-            title={selected.size ? "Download the selected files as one ZIP" : "Download the files shown as one ZIP"}
             className="border-subtle hover:border-strong text-body ml-auto shrink-0 cursor-pointer rounded-md border px-2 py-0.5 text-[11px] disabled:cursor-default disabled:opacity-50 touch:min-h-11"
           >
             {busy ? "Preparing\u2026" : `${selected.size ? `Download ${selected.size}` : "Download all"}${bulkBytes ? ` (${formatBytes(bulkBytes)})` : ""}`}
@@ -293,17 +290,17 @@ function GroupSection({ group, expanded, onToggleOpen, selected, onSelect, onDow
         />
         <button type="button" onClick={onToggleOpen} aria-expanded={expanded} className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left text-xs">
           <span className="text-faint w-2.5 shrink-0 text-[10px]">{expanded ? "\u25be" : "\u25b8"}</span>
-          <span className="min-w-0 truncate font-medium" title={group.key || undefined}>
+          <span className="min-w-0 truncate font-medium">
             {group.label}
           </span>
-          {group.inChat && <span className="size-1.5 shrink-0 rounded-full" style={{ background: "var(--color-accent)" }} title="Used in this chat" />}
+          {group.inChat && <span className="size-1.5 shrink-0 rounded-full" style={{ background: "var(--color-accent)" }} />}
           <span className="text-faint shrink-0 text-[10px]">
             {group.files.length}
             {group.bytes ? ` \u00b7 ${formatBytes(group.bytes)}` : ""}
           </span>
         </button>
         {paths.length > 0 && (
-          <button type="button" onClick={onDownload} disabled={busy} title="Download this folder as one ZIP" className={`${action} opacity-0 group-hover:opacity-100 focus-visible:opacity-100 touch:opacity-100 disabled:opacity-50`}>
+          <button type="button" onClick={onDownload} disabled={busy} className={`${action} opacity-0 group-hover:opacity-100 focus-visible:opacity-100 touch:opacity-100 disabled:opacity-50`}>
             Download
           </button>
         )}
@@ -345,7 +342,7 @@ function FileRow({ file, checked, onCheck, onOpenStructure, onInsert }: RowProps
   return (
     <li className="group hover:bg-sunken flex items-center gap-2 rounded-md px-1 py-0.5 text-[11px]">
       <input type="checkbox" checked={checked} disabled={!file.archivePath} onChange={(event) => onCheck(event.target.checked)} aria-label={`Select ${file.label}`} className={checkbox} />
-      <span className="min-w-0 flex-1 truncate" title={file.path}>
+      <span className="min-w-0 flex-1 truncate">
         {file.label}
       </span>
       <span className="text-faint shrink-0 font-mono text-[10px] uppercase">{file.ext}</span>
@@ -357,11 +354,11 @@ function FileRow({ file, checked, onCheck, onOpenStructure, onInsert }: RowProps
             Open
           </button>
         )}
-        <button type="button" onClick={() => onInsert(file.path)} title="Insert the path into the prompt" className={action}>
+        <button type="button" onClick={() => onInsert(file.path)} className={action}>
           Insert
         </button>
         {file.url && (
-          <a href={file.url} download={file.path.split("/").pop()} title="Download" aria-label={`Download ${file.label}`} className={action}>
+          <a href={file.url} download={file.path.split("/").pop()} aria-label={`Download ${file.label}`} className={action}>
             {"\u2193"}
           </a>
         )}

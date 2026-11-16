@@ -10,22 +10,27 @@ export const DOCK_DEFAULT_WIDTH = "clamp(520px, 56vw, calc(100vw - 680px))";
 const WIDTH_KEY = "cofold.dock.width";
 
 /** The tabs of the dock, always all shown. */
-export type DockTab = "structure" | "molecules" | "jobs" | "campaign" | "target" | "ttp" | "assets";
+export type DockTab = "structure" | "molecules" | "campaign" | "target" | "assets";
 /** What can be asked for: a tab, or a view inside one (e.g. "properties" is a view of the molecules tab). */
-export type DockView = DockTab | "candidates" | "properties" | "shortlist" | "tables" | "results" | "activity";
+export type DockView = DockTab | "jobs" | "candidates" | "properties" | "results" | "activity" | "pooled" | "space" | "ttp";
 
-// Campaign sits after Jobs: one is this conversation's own runs, the other
-// the same work seen across the sub-agents running it.
-export const DOCK_TABS: readonly DockTab[] = ["structure", "molecules", "jobs", "campaign", "target", "ttp", "assets"];
+/** Molecules is held back from the bar for now; what asks for it still opens it. */
+export const DOCK_TABS: readonly DockTab[] = ["campaign", "structure", "target", "assets"];
 
 /** Views shown inside another tab; some were tabs of their own once, and links still name them. */
 const MERGED: Partial<Record<DockView, DockTab>> = {
   candidates: "molecules",
   properties: "molecules",
-  shortlist: "molecules",
-  tables: "molecules",
-  activity: "jobs",
-  results: "jobs",
+  // The runs are the campaign's: this conversation's own and the sub-agents'
+  // are one body of work, and the Campaign tab is where it is read.
+  jobs: "campaign",
+  activity: "campaign",
+  results: "campaign",
+  // The campaign's own Molecules and Analysis: every run's, not one run's.
+  pooled: "campaign",
+  space: "campaign",
+  // The profile belongs with the target it was written for.
+  ttp: "target",
 };
 
 /** The tab that shows `view`. */

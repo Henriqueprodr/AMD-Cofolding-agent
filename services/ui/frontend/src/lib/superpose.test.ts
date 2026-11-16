@@ -82,6 +82,16 @@ describe("superposeCa", () => {
     expect(rmsd([apply(result!.transform, b[0].pos)], [a[5].pos])).toBeLessThan(1e-6);
   });
 
+  it("keeps the core when a long tail is packed far away", () => {
+    // Like EGFR's C-terminal tail in 1XKK against 1M17.
+    const n = SEQUENCE.length;
+    const a = atoms(trace(n));
+    const b = atoms(trace(n).map((p, i) => apply(moved, i >= n - 18 ? ([p[0] + 40, p[1] - 30, p[2]] as Vec3) : p)));
+    const result = superposeCa(a, b);
+    expect(result!.core).toBe(n - 18);
+    expect(result!.caRmsd).toBeLessThan(1e-6);
+  });
+
   it("gives up on unrelated proteins", () => {
     expect(superposeCa(atoms(trace(20), "W".repeat(20)), atoms(trace(20), "G".repeat(20)))).toBeNull();
   });

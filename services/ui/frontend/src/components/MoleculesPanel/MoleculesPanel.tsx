@@ -123,7 +123,6 @@ export function MoleculesPanel({ artifacts, theme, sessionId, onOpenMolecule, on
     else setSort(null);
   };
   const name = starredOnly ? `starred molecules ${session}` : `molecules ${session}`;
-  const scope = shown.length === rows.length ? `all ${rows.length} molecules` : `the ${shown.length} shown`;
   const importFile = (text: string | null) => {
     if (text === null) return setNote("That file could not be read");
     try {
@@ -149,7 +148,6 @@ export function MoleculesPanel({ artifacts, theme, sessionId, onOpenMolecule, on
           type="button"
           aria-pressed={starredOnly}
           onClick={() => setStarredOnly((on) => !on)}
-          title={starredOnly ? "Show every molecule" : "Show the starred molecules only"}
           className={`inline-flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] touch:min-h-11 ${
             starredOnly ? "text-body" : "border-subtle text-muted hover:text-body"
           }`}
@@ -163,7 +161,6 @@ export function MoleculesPanel({ artifacts, theme, sessionId, onOpenMolecule, on
         </button>
         <span className="ml-auto flex items-center gap-0.5">
           <TextButton
-            title={`Download ${scope} as CSV`}
             disabled={shown.length === 0}
             onClick={() => {
               const { columns: cols, rows: cells } = moleculeSheet(shown, columns);
@@ -173,7 +170,6 @@ export function MoleculesPanel({ artifacts, theme, sessionId, onOpenMolecule, on
             <DownloadIcon /> CSV
           </TextButton>
           <TextButton
-            title={rdkit ? `Download ${scope} as SDF, the numbers as data fields` : "RDKit is loading"}
             disabled={!rdkit || shown.length === 0}
             onClick={() => {
               if (!rdkit) return;
@@ -192,19 +188,19 @@ export function MoleculesPanel({ artifacts, theme, sessionId, onOpenMolecule, on
           <span className="mr-auto min-w-0 truncate">{note ?? "Stars are kept in this browser."}</span>
           {onAsk && starred.length > 0 && (
             <>
-              <TextButton title="Start a Mol2Mol run from the starred molecules" onClick={() => setSeeding(!seeding)}>
+              <TextButton onClick={() => setSeeding(!seeding)}>
                 Use as seeds…
               </TextButton>
-              <TextButton title="Put a cofolding request for the starred molecules in the composer" onClick={() => onAsk(shortlistPrompt(starred))}>
+              <TextButton onClick={() => onAsk(shortlistPrompt(starred))}>
                 Cofold
               </TextButton>
-              <TextButton title="Put an ADMET request for the starred molecules in the composer" onClick={() => onAsk(admetPrompt(starred))}>
+              <TextButton onClick={() => onAsk(admetPrompt(starred))}>
                 ADMET
               </TextButton>
             </>
           )}
           {starred.length > 0 && (
-            <TextButton title="Back up the stars as JSON, to import them in another browser" onClick={() => download(fileName(`shortlist ${session}`, "json"), shortlistJson(starred, session), "application/json")}>
+            <TextButton onClick={() => download(fileName(`shortlist ${session}`, "json"), shortlistJson(starred, session), "application/json")}>
               <DownloadIcon /> JSON
             </TextButton>
           )}
@@ -231,7 +227,7 @@ export function MoleculesPanel({ artifacts, theme, sessionId, onOpenMolecule, on
           footer={
             shown.length > limit && (
               <p className="py-2 text-center">
-                <TextButton title={`${shown.length - limit} more molecules`} onClick={() => setLimit((n) => n + PAGE)}>
+                <TextButton onClick={() => setLimit((n) => n + PAGE)}>
                   Show more · {shown.length - limit}
                 </TextButton>
               </p>
@@ -248,7 +244,7 @@ function ImportButton({ onFile }: { onFile: (text: string | null) => void }) {
   const input = useRef<HTMLInputElement>(null);
   return (
     <>
-      <TextButton title="Import starred molecules from a shortlist JSON file" onClick={() => input.current?.click()}>
+      <TextButton onClick={() => input.current?.click()}>
         Import…
       </TextButton>
       <input

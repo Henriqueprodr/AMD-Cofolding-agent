@@ -1,9 +1,9 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { useCampaignJobs } from "../../hooks/useCampaignJobs";
-import { refreshSessionList, useJobOwners, useRunsKnown, useSessionRuns } from "../../hooks/useSessions";
+import { useEffect, useState, type ReactNode } from "react";
+import { useJobList } from "../../hooks/useJobList";
+import { refreshSessionList } from "../../hooks/useSessions";
 import type { Theme } from "../../hooks/useTheme";
 import { callTool, download, jobFileUrl } from "../../lib/api";
 import { candidatesSdf, candidatesSheet, fileName } from "../../lib/csv";
@@ -11,7 +11,6 @@ import { loadRDKit, withMol } from "../../lib/rdkit";
 import {
   bestScore,
   canResume,
-  conversationJobs,
   convergenceTone,
   errorSummary,
   fmt,
@@ -19,9 +18,7 @@ import {
   int,
   isActive,
   jobTitle,
-  parseAlerts,
   parseCandidates,
-  parseJobs,
   parseStatus,
   pct,
   progress,
@@ -36,15 +33,15 @@ import {
   toolError,
   uniqueAlerts,
   type Candidate,
-  type JobAlert,
   type JobStatus,
   type JobSummary,
   type Tone,
 } from "../../lib/jobs";
-import { scopedJob } from "../../lib/jobScope";
+import { useJobScope } from "../JobPicker/useJobScope";
 import { loadJobStructures, openRunStructure, runStructurePanel, type JobStructure } from "../../lib/jobStructures";
 import type { MoleculeContext } from "../../lib/moleculePage";
-import { focusRun, notifyRunsChanged, onRunsChanged, openRun, openWorkbench, useFocusedRun } from "../../lib/workbenchBus";
+import { focusRun, notifyRunsChanged, onRunsChanged, openRun, openWorkbench } from "../../lib/workbenchBus";
+import { usePanelShown } from "../../hooks/panelShownContext";
 import { DownloadIcon, ExportButtons, TextButton } from "../DataTable/ExportButtons";
 import { ScoreTrend } from "../RunBar/ScoreTrend";
 import { Badge } from "./Badge";
@@ -85,19 +82,9 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
  * agent through onAsk.
  */
 export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
-  const [allJobs, setJobs] = useState<JobSummary[] | null>(null);
-  const [listError, setListError] = useState<string | null>(null);
-  const [alerts, setAlerts] = useState<JobAlert[]>([]);
-  const focused = useFocusedRun();
-  const runs = useSessionRuns(sessionId);
-  const owners = useJobOwners();
-  const known = useRunsKnown();
-  const campaignJobs = useCampaignJobs(sessionId);
-  const summary = useMemo(() => {
-    if (!allJobs || known === null) return undefined;
-    // A gateway that does not say who launched what: every job is the conversation's.
-    return scopedJob(allJobs, known ? conversationJobs(allJobs, runs, focused, owners, sessionId, campaignJobs).own : allJobs, focused);
-  }, [allJobs, known, runs, focused, owners, sessionId, campaignJobs]);
+  const { job: summary, error: listError } = useJobScope(sessionId ?? null);
+  const { jobs: allJobs, alerts } = useJobList();
+  const shown = usePanelShown();
   const [tick, setTick] = useState(0);
   const [status, setStatus] = useState<Loaded<JobStatus | null> | null>(null);
   const [candidates, setCandidates] = useState<Loaded<Candidate[]> | null>(null);
@@ -113,23 +100,9 @@ export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
 
   useEffect(() => onRunsChanged(() => setTick((t) => t + 1)), []);
 
+  // Who launched what: without it the panel cannot tell this conversation's run from the newest of all.
   useEffect(() => {
-    let cancelled = false;
     refreshSessionList();
-    Promise.all([callTool("list_jobs"), callTool("get_job_alerts").catch(() => null)])
-      .then(([list, alertList]) => {
-        if (cancelled) return;
-        const error = toolError(list.result);
-        setListError(error);
-        if (!error) setJobs(parseJobs(list.result));
-        if (alertList) setAlerts(parseAlerts(alertList.result));
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) setListError(errorText(error));
-      });
-    return () => {
-      cancelled = true;
-    };
   }, [tick, sessionId]);
 
   useEffect(() => {
@@ -181,12 +154,12 @@ export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
   }, [activeId, hasResults, growing, tick]);
 
   useEffect(() => {
-    if (!live) return;
+    if (!live || !shown) return;
     const timer = window.setInterval(() => {
       if (!document.hidden) setTick((t) => t + 1);
     }, POLL_MS);
     return () => window.clearInterval(timer);
-  }, [live]);
+  }, [live, shown]);
 
   const [shownId, setShownId] = useState(activeId);
   if (shownId !== activeId) {
@@ -284,7 +257,7 @@ export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
               <Badge tone={stateTone(job.state)}>{job.state}</Badge>
               {diagnostics?.convergence && <Badge tone={convergenceTone(diagnostics.convergence)}>{diagnostics.convergence}</Badge>}
               <ScoreTrend status={s} width={72} className="hidden @md:block" />
-              <button type="button" onClick={refresh} title="Refresh" aria-label="Refresh" className="text-faint hover:text-body cursor-pointer p-0.5">
+              <button type="button" onClick={refresh} aria-label="Refresh" className="text-faint hover:text-body cursor-pointer p-0.5">
                 <RefreshIcon />
               </button>
             </h2>
@@ -294,7 +267,7 @@ export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
                 { name: "config.toml", label: "config.toml", mime: "text/plain", hint: "The REINVENT configuration the run used" },
                 { name: "reinvent.log", label: "reinvent.log", mime: "text/plain", hint: "REINVENT's log" },
               ].map((file) => (
-                <TextButton key={file.name} title={`${file.hint} (${file.name})`} onClick={() => void saveFile(job.id, file.name, file.mime)}>
+                <TextButton key={file.name} onClick={() => void saveFile(job.id, file.name, file.mime)}>
                   <DownloadIcon /> {file.label}
                 </TextButton>
               ))}
@@ -417,12 +390,12 @@ export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
                   const stats = scoringComponents(s).find((c) => c.name === h.name);
                   return (
                     <div key={h.name} className="grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 py-0.5">
-                      <span className="truncate" title={h.name}>{h.name}</span>
-                      <span className="text-muted font-mono tabular-nums" title="mean / max">
+                      <span className="truncate">{h.name}</span>
+                      <span className="text-muted font-mono tabular-nums">
                         {fmt(stats?.mean ?? h.mean, 2)}
                         {stats?.max != null && <span className="text-faint"> / {fmt(stats.max, 2)}</span>}
                       </span>
-                      <Badge tone={healthTone(h.status)} title={h.nanRate !== null ? `${pct(h.nanRate)} NaN` : undefined}>
+                      <Badge tone={healthTone(h.status)}>
                         {h.status}
                       </Badge>
                     </div>
@@ -454,8 +427,8 @@ export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
             actions={
               top && top.value.length > 0 ? (
                 <>
-                  <ExportButtons name={`${job.id} top candidates`} sheet={() => candidatesSheet(top.value)} scope={`the top ${top.value.length} candidates`} />
-                  <TextButton title="Download the top candidates as an SD file with their scores" onClick={() => void saveSdf(job.id, top.value)}>
+                  <ExportButtons name={`${job.id} top candidates`} sheet={() => candidatesSheet(top.value)} />
+                  <TextButton onClick={() => void saveSdf(job.id, top.value)}>
                     <DownloadIcon /> SDF
                   </TextButton>
                 </>

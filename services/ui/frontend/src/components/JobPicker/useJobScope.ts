@@ -1,15 +1,17 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useCampaignJobs } from "../../hooks/useCampaignJobs";
+import { useJobList } from "../../hooks/useJobList";
 import { useJobOwners, useRunsKnown, useSessionRuns } from "../../hooks/useSessions";
-import { callTool } from "../../lib/api";
-import { conversationJobs, parseAlerts, parseJobs, toolError, uniqueAlerts, type JobAlert, type JobSummary } from "../../lib/jobs";
+import { conversationJobs, uniqueAlerts, type JobAlert, type JobSummary } from "../../lib/jobs";
 import { scopedJob } from "../../lib/jobScope";
-import { onRunsChanged, useFocusedRun } from "../../lib/workbenchBus";
+import { useFocusedRun } from "../../lib/workbenchBus";
+import { usePanelShown } from "../../hooks/panelShownContext";
 
-const REFRESH_MS = 15_000;
+/** Shortest of the periods the panels used to poll at on their own. */
+const REFRESH_MS = 10_000;
 
 export interface JobScope {
   /** Every optimization job, null until the list and who launched what are known. */
@@ -25,43 +27,15 @@ export interface JobScope {
   error: string | null;
 }
 
-/** The jobs and the one the Jobs tab is about (scopedJob), read again when runs change and every 15 s. */
+/** The jobs and the one the Jobs tab is about (scopedJob), read again when runs change and while the panel is on screen. */
 export function useJobScope(sessionId: string | null): JobScope {
-  const [jobs, setJobs] = useState<JobSummary[] | null>(null);
-  const [alertList, setAlertList] = useState<JobAlert[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [tick, setTick] = useState(0);
+  const shown = usePanelShown();
+  const { jobs, alerts: alertList, error } = useJobList(shown ? REFRESH_MS : null);
   const focused = useFocusedRun();
   const sessionRuns = useSessionRuns(sessionId);
   const owners = useJobOwners();
   const known = useRunsKnown();
   const campaignJobs = useCampaignJobs(sessionId);
-
-  useEffect(() => onRunsChanged(() => setTick((t) => t + 1)), []);
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (!document.hidden) setTick((t) => t + 1);
-    }, REFRESH_MS);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    Promise.all([callTool("list_jobs", {}), callTool("get_job_alerts", {}).catch(() => null)])
-      .then(([list, alerted]) => {
-        if (cancelled) return;
-        const failure = toolError(list.result);
-        setError(failure);
-        if (!failure) setJobs(parseJobs(list.result));
-        if (alerted) setAlertList(parseAlerts(alerted.result));
-      })
-      .catch((reason: unknown) => {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [tick]);
 
   const scope = useMemo(() => {
     if (!jobs || known === null) return null;

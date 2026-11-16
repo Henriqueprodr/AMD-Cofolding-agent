@@ -1,7 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import type { CampaignDetail, ConversationEvent, FleetCampaign, FleetCapacity, Panel, SessionSummary } from "../types/api";
+import type { CampaignAtlas, CampaignDetail, CampaignEvents, ConversationEvent, FleetCampaign, FleetCapacity, Panel, QueuedMessage, SessionSummary, TaskConversation } from "../types/api";
 import type { CofoldStatus } from "./cofold";
 import type { JobStructure } from "./jobStructures";
 
@@ -50,6 +50,10 @@ export const renameSession = (id: string, title: string) =>
 export const deleteSession = (id: string) =>
   request<{ deleted: string }>(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
 
+/** POST /api/sessions/{id}/stop: its turn, its open campaigns with their sub-agents, and its running runs. */
+export const stopSession = (id: string) =>
+  request<{ campaigns: string[]; runs: string[]; problems: string[] }>(`/api/sessions/${encodeURIComponent(id)}/stop`, { method: "POST" });
+
 export const sessionEvents = (id: string) =>
   request<{ session: SessionSummary; events: ConversationEvent[] }>(
     `/api/sessions/${encodeURIComponent(id)}/events`,
@@ -78,9 +82,11 @@ const READ_ONLY = new Set([
   "list_external_services",
 ]);
 /**
- * Polled by several panels at once (run bar, Jobs, Results, TTP), so an
- * answer is reused for this long; each call costs about a second through a
- * tunnel. Shorter than the fastest poll (10 s) so every poll still sees news.
+ * Polled by several panels at once, so an answer is reused for this long;
+ * each call costs about a second through a tunnel. Shorter than the fastest
+ * poll (10 s) so every poll still sees news. The job list has one reader of
+ * its own now (useJobList) and keeps this as a floor under the refreshes a
+ * run that is starting and stopping asks for.
  */
 const SHARED_MS: Record<string, number> = { list_jobs: 8_000, get_optimization_status: 8_000, get_job_alerts: 8_000 };
 
@@ -151,6 +157,25 @@ export const fetchCampaigns = (sessionId?: string | null) =>
 
 export const fetchCampaign = (campaignId: string) =>
   request<CampaignDetail>(`/api/fleet/campaigns/${encodeURIComponent(campaignId)}`);
+
+/** What a campaign knows: its branches and their current findings. */
+export const fetchCampaignAtlas = (campaignId: string) =>
+  request<CampaignAtlas>(`/api/fleet/campaigns/${encodeURIComponent(campaignId)}/atlas`);
+
+/** What has happened in a campaign, oldest first: the ledger's own history. */
+export const fetchCampaignEvents = (campaignId: string) =>
+  request<CampaignEvents>(`/api/fleet/campaigns/${encodeURIComponent(campaignId)}/events`);
+
+/** What a sub-agent said and did on one task, from the transcript it wrote. */
+export const fetchTaskConversation = (taskId: string) =>
+  request<TaskConversation>(`/api/fleet/tasks/${encodeURIComponent(taskId)}/conversation`);
+
+/** Leave *text* for the sub-agent on *taskId*; it reads it after its current step. */
+export const sendTaskMessage = (taskId: string, text: string) =>
+  request<QueuedMessage>(`/api/fleet/tasks/${encodeURIComponent(taskId)}/messages`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
 
 /** The largest supervisor pool this deployment could run; null is unknown, not unlimited. */
 export const fetchCapacity = () => request<FleetCapacity>("/api/fleet/capacity");

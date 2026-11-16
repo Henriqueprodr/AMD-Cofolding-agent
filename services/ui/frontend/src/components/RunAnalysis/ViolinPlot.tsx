@@ -197,8 +197,7 @@ const Violin = memo(function Violin({ endpoint, values, offsets, width, colour, 
             else onRange(endpoint.key, [Math.min(draft.from, to), Math.max(draft.from, to)]);
           }}
           onPointerCancel={() => setDraft(null)}
-        >
-          <title>Drag to keep a range · click to clear</title>
+        >
           <text x={cx} y={TOP - 4} textAnchor="middle" fontSize={9} fill="var(--text-faint)">
             {format(axis.from(hi))}
           </text>
@@ -253,7 +252,7 @@ const Violin = memo(function Violin({ endpoint, values, offsets, width, colour, 
 function Label({ endpoint }: { endpoint: Endpoint }) {
   const scaleNote = endpoint.scale === "linear" ? "" : " · log scale";
   return (
-    <div className="h-[26px] px-1 text-center leading-tight" title={`${endpoint.key}${endpoint.source === "score" ? " · score (0–1): the CSV has no raw value" : ""}${scaleNote}`}>
+    <div className="h-[26px] px-1 text-center leading-tight">
       <div className="text-muted truncate text-[10.5px]">{endpoint.label}</div>
       <div className="text-faint truncate text-[9.5px]">
         {endpoint.unit || "\u00a0"}

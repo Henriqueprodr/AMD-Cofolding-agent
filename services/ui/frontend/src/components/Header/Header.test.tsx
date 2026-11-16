@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { Header } from "./Header";
 
 const noop = () => undefined;
-const render = (busy: boolean) =>
+const render = () =>
   renderToStaticMarkup(
     <Header
       theme="light"
@@ -15,25 +15,20 @@ const render = (busy: boolean) =>
       agent={null}
       gatewayError={null}
       title="EGFR binders"
-      busy={busy}
       onReconnect={noop}
       railOpen
       onToggleRail={noop}
       workbenchOpen
       onToggleWorkbench={noop}
-      onOpenPalette={noop}
     />,
   );
 
 describe("Header", () => {
-  it("names the conversation without a target line", () => {
-    const html = render(false);
+  it("names the conversation and nothing else about it", () => {
+    const html = render();
     expect(html).toContain("EGFR binders");
     expect(html).not.toContain("No target yet");
     expect(html).not.toContain("working…");
-  });
-
-  it("says when the agent is working", () => {
-    expect(render(true)).toContain("working…");
+    expect(html).not.toContain("Actions");
   });
 });

@@ -25,7 +25,6 @@ export function StarButton({ smiles, label, source, values, session, className =
       type="button"
       aria-pressed={on}
       aria-label={on ? "Remove from shortlist" : "Add to shortlist"}
-      title={on ? "On the shortlist" : "Add to shortlist"}
       onClick={(event) => {
         event.stopPropagation();
         toggleStar(key, { smiles, ...(label ? { label } : {}), ...(source ? { source } : {}), ...(on ? {} : { values: values?.() }) });

@@ -46,14 +46,12 @@ export function AutoButton({ until, onSet }: Props) {
       <span
         className="flex h-7 shrink-0 items-center gap-0.5 rounded-full border pr-0.5 pl-2.5 text-[11px] touch:h-9"
         style={{ borderColor: "var(--color-accent)" }}
-        title="The agent keeps working on its own until this runs out"
       >
         <span className="font-medium">Auto {countdown(left)}</span>
         <button
           type="button"
           onClick={() => onSet(0)}
           aria-label="Stop working on its own"
-          title="Stop working on its own"
           className="text-faint hover:text-body grid size-5 cursor-pointer place-items-center rounded-full"
         >
           ×
@@ -75,7 +73,6 @@ export function AutoButton({ until, onSet }: Props) {
         aria-haspopup="menu"
         aria-expanded={menu}
         aria-label="Work on its own"
-        title="Let the agent keep working on its own"
         className="text-muted hover:text-body hover:bg-sunken grid size-7 shrink-0 cursor-pointer place-items-center rounded-lg touch:size-9"
       >
         <svg viewBox="0 0 24 24" className="size-4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -90,7 +87,7 @@ export function AutoButton({ until, onSet }: Props) {
           className="bg-raised border-subtle shadow-card absolute bottom-full left-0 z-20 mb-1 w-44 overflow-hidden rounded-lg border py-1 text-xs"
           onMouseLeave={() => setMenu(false)}
         >
-          <p className="text-faint px-3 pt-0.5 pb-1 leading-snug">Keep working alone for</p>
+          <p className="text-faint px-3 pt-0.5 pb-1 leading-snug">Autonomous</p>
           {BUDGETS.map((minutes) => (
             <button
               key={minutes}
@@ -108,7 +105,7 @@ export function AutoButton({ until, onSet }: Props) {
             onClick={() => choose(Number(window.prompt("Minutes to work alone?", "90")))}
             className="hover:bg-sunken text-muted w-full cursor-pointer px-3 py-1.5 text-left"
           >
-            Custom…
+            …
           </button>
         </div>
       )}

@@ -70,9 +70,10 @@ or npm problem of this machine. The same `npm ci` works outside Docker.
 - [ ] The WebSocket stays open during a long Boltz run. nginx keeps the
       socket for one hour without traffic. Check that no SSH or cluster
       timeout closes it first.
-- [ ] A second message while the agent works gives the message "The agent
-      is still working on the previous request." The composer stays
-      disabled until the turn ends.
+- [ ] A second message while the agent works shows at once in the open
+      turn, marked as sent mid-turn. The agent reads it after its current
+      step; if the turn ends first, the next turn answers it. It is never
+      dropped, and still shows after a reload.
 - [ ] Close the tab while a tool runs. The `dd-web` log shows "Cancelling
       the turn of a disconnected client". The MCP connection still works
       for the next tab (a cancelled MCP call must not break the shared

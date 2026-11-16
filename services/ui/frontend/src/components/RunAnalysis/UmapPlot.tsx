@@ -347,7 +347,6 @@ export function UmapPlot({ molecules, layout, working, colourBy, endpoint, goal,
         <div
           className="pointer-events-none absolute bottom-1 left-1 rounded-md px-1.5 pt-0.5 pb-0 text-[9.5px] tabular-nums"
           style={{ background: "color-mix(in srgb, var(--surface-raised) 82%, transparent)" }}
-          title={better}
         >
           <div className="text-muted mb-0.5 flex items-baseline gap-1.5">
             <span>{name}</span>
@@ -392,12 +391,11 @@ export function UmapPlot({ molecules, layout, working, colourBy, endpoint, goal,
           onClick={() => setView(HOME)}
           className="text-muted hover:text-body absolute top-1 left-1 cursor-pointer rounded-md px-1.5 py-0.5 text-[10px]"
           style={{ background: "color-mix(in srgb, var(--surface-raised) 82%, transparent)" }}
-          title="Reset the view (double-click)"
         >
           Reset view · {view.k.toFixed(1)}×
         </button>
       )}
-      {working && <span className="absolute top-1 right-1 size-1.5 animate-pulse rounded-full" style={{ background: "var(--color-structure)" }} title="Updating the map" />}
+      {working && <span className="absolute top-1 right-1 size-1.5 animate-pulse rounded-full" style={{ background: "var(--color-structure)" }} />}
       {hoverAt && own !== null && own === hovered && (
         <div
           className="bg-raised border-subtle shadow-card pointer-events-none absolute z-10 rounded-lg border p-1"

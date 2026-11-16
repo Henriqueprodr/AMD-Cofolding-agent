@@ -24,6 +24,8 @@ const job = (id: string, state: JobSummary["state"] = "completed"): JobSummary =
   checkpointPath: null,
   hasCheckpoint: false,
   workingDir: null,
+  slurmJobId: null,
+  usesBoltz: null,
 });
 
 const a = job("aaaa1111");

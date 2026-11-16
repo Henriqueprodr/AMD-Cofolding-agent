@@ -281,6 +281,22 @@ export interface Comparison {
   ligandRmsd: number | null;
 }
 
+/** One structure of a stack, drawn in *color*: its protein, and its ligand's carbons. */
+export interface StackItem {
+  url: string;
+  format: "cif" | "pdb";
+  label: string;
+  color: number;
+}
+
+/** How one stacked structure sat on the loaded one. */
+export interface Stacked {
+  label: string;
+  /** False when its protein shares too little sequence with the loaded one's to superpose. */
+  superposed: boolean;
+  caRmsd: number | null;
+}
+
 /** Carbon colours of the two ligands and the colour of the overlaid protein, "#rrggbb" read as numbers. */
 export interface CompareColors {
   primary: number;
@@ -396,6 +412,11 @@ export class StructureView {
   private primaryHidden = false;
   private compareToken = 0;
   private compareQueue: Promise<unknown> = Promise.resolve();
+  /** The download nodes of the stacked structures, and their structures. */
+  private stackRefs: string[] = [];
+  private stackStructures = new Set<string>();
+  /** The loaded structure's representations as they were coloured before the stack. */
+  private stackThemes = new Map<string, unknown>();
   style: ViewStyleName = "cartoon";
 
   static async create(host: HTMLElement, background: number): Promise<StructureView> {
@@ -444,7 +465,9 @@ export class StructureView {
 
   /** The loaded structures other than the one overlaid for comparison. */
   private get ownStructures(): StructureRef[] {
-    return (this.plugin?.managers.structure.hierarchy.current.structures ?? []).filter((s) => s.cell.transform.ref !== this.compareStructure);
+    return (this.plugin?.managers.structure.hierarchy.current.structures ?? []).filter(
+      (s) => s.cell.transform.ref !== this.compareStructure && !this.stackStructures.has(s.cell.transform.ref),
+    );
   }
 
   private get structureRef(): StructureRef | null {
@@ -460,6 +483,7 @@ export class StructureView {
     await viewer.plugin.clear();
     this.contactsRef = null;
     this.forgetCompare();
+    this.forgetStack();
     if (token !== this.loadToken || this.disposed) return false;
     await viewer.loadStructureFromUrl(url, format === "cif" ? "mmcif" : "pdb", false, { label });
     if (token !== this.loadToken || this.disposed) return false;
@@ -700,6 +724,7 @@ export class StructureView {
     const lib = window.molstar?.lib;
     const primary = this.structureRef?.cell.obj?.data;
     if (!plugin || !lib?.structure || !lib.plugin || !primary) return null;
+    await this.removeStack();
     await this.removeCompare();
     const loadToken = this.loadToken;
     const current = () => token === this.compareToken && loadToken === this.loadToken && !this.disposed;
@@ -774,6 +799,118 @@ export class StructureView {
       aligned: fit?.aligned ?? 0,
       ligandRmsd: match?.rmsd ?? null,
     };
+  }
+
+  /**
+   * Overlay several structures on the loaded one, each superposed on it by
+   * its protein and drawn in its own colour, the loaded one in *primary*.
+   * Ends a comparison. Null when superseded by a newer call or a new load.
+   */
+  stack(primary: number, others: StackItem[]): Promise<Stacked[] | null> {
+    const token = ++this.compareToken;
+    const run = this.compareQueue.then(() => (token === this.compareToken ? this.drawStack(primary, others, token) : null));
+    this.compareQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Back to the loaded structure alone, in its own colours. */
+  unstack(): Promise<void> {
+    this.compareToken++;
+    const run = this.compareQueue.then(() => this.removeStack());
+    this.compareQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  get stacking(): boolean {
+    return this.stackRefs.length > 0 || this.stackThemes.size > 0;
+  }
+
+  private async drawStack(primary: number, others: StackItem[], token: number): Promise<Stacked[] | null> {
+    const plugin = this.plugin;
+    const lib = window.molstar?.lib;
+    const own = this.structureRef;
+    const loadedData = own?.cell.obj?.data;
+    if (!plugin || !lib?.structure || !lib.plugin || !own || !loadedData) return null;
+    await this.removeCompare();
+    await this.removeStack();
+    const loadToken = this.loadToken;
+    const current = () => token === this.compareToken && loadToken === this.loadToken && !this.disposed;
+    const B = plugin.builders;
+
+    const recolour = plugin.state.data.build();
+    for (const component of own.components) {
+      const ligand = isLigandComponent(component.key);
+      for (const repr of component.representations) {
+        const ref = repr.cell.transform.ref;
+        this.stackThemes.set(ref, repr.cell.transform.params?.colorTheme);
+        recolour.to(ref).update((draft) => {
+          draft.colorTheme = ligand ? carbonTheme(primary) : uniformTheme(primary);
+        });
+      }
+    }
+    await recolour.commit({ doNotLogTiming: true });
+
+    const mine = atomsOf(lib.structure, loadedData).ca;
+    const placed: Stacked[] = [];
+    for (const item of others) {
+      if (!current()) return this.abandonStack();
+      const data = await B.data.download({ url: item.url, isBinary: false, label: item.label });
+      this.stackRefs.push(data.ref);
+      const trajectory = await B.structure.parseTrajectory(data, item.format === "cif" ? "mmcif" : "pdb");
+      const structure = await B.structure.createStructure(await B.structure.createModel(trajectory));
+      this.stackStructures.add(structure.ref);
+      if (!current() || !structure.data) return this.abandonStack();
+
+      const fit = superposeCa(mine, atomsOf(lib.structure, structure.data).ca);
+      let parent = structure.ref;
+      if (fit) {
+        const builder = plugin.state.data.build();
+        const node = builder.to(structure.ref).apply(lib.plugin.StateTransforms.Model.TransformStructureConformation, {
+          transform: { name: "matrix", params: { data: toMat4(fit.transform), transpose: false } },
+        });
+        await builder.commit({ doNotLogTiming: true });
+        parent = node.ref;
+      }
+      const polymer = await B.structure.tryCreateComponentStatic(parent, "polymer");
+      if (polymer) {
+        await B.structure.representation.addRepresentation(polymer, { type: "cartoon", color: "uniform", colorParams: uniformTheme(item.color).params });
+      }
+      const ligand = await B.structure.tryCreateComponentStatic(parent, "ligand");
+      if (ligand) {
+        await B.structure.representation.addRepresentation(ligand, { type: "ball-and-stick", color: "element-symbol", colorParams: carbonTheme(item.color).params });
+      }
+      placed.push({ label: item.label, superposed: fit !== null, caRmsd: fit?.caRmsd ?? null });
+    }
+    if (!current()) return this.abandonStack();
+    this.fit();
+    return placed;
+  }
+
+  private async abandonStack(): Promise<null> {
+    await this.removeStack();
+    return null;
+  }
+
+  private forgetStack(): void {
+    this.stackRefs = [];
+    this.stackStructures.clear();
+    this.stackThemes.clear();
+  }
+
+  private async removeStack(): Promise<void> {
+    const plugin = this.plugin;
+    if (!plugin || !this.stacking) return;
+    const builder = plugin.state.data.build();
+    const present = new Set(this.ownStructures.flatMap((s) => s.components.flatMap((c) => c.representations.map((r) => r.cell.transform.ref))));
+    for (const [ref, theme] of this.stackThemes) {
+      if (!present.has(ref) || !theme) continue;
+      builder.to(ref).update((draft) => {
+        draft.colorTheme = theme;
+      });
+    }
+    for (const ref of this.stackRefs) builder.delete(ref);
+    this.forgetStack();
+    await builder.commit({ doNotLogTiming: true });
   }
 
   private async abandonCompare(): Promise<null> {

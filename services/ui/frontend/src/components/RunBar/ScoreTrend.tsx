@@ -18,7 +18,7 @@ export function ScoreTrend({ status, width = 64, height = 14, className = "" }: 
   if (!path) return null;
   const title = trendTitle(points);
   return (
-    <span className={`shrink-0 leading-none ${className}`} title={title}>
+    <span className={`shrink-0 leading-none ${className}`}>
       <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={title} className="block">
         <path d={path} fill="none" stroke="var(--color-structure)" strokeWidth={1} strokeLinejoin="round" strokeLinecap="round" />
       </svg>

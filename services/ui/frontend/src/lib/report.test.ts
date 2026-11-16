@@ -76,6 +76,8 @@ const STATUS: JobStatus = {
   checkpointPath: null,
   hasCheckpoint: false,
   workingDir: null,
+  slurmJobId: null,
+  usesBoltz: null,
   currentStep: 280,
   molecules: 17792,
   valid: 17190,
@@ -268,7 +270,7 @@ describe("reading the conversation", () => {
       { role: "user", id: "u2", content: "Stop", at: 3 },
       { role: "agent", id: "a2", at: 4, done: true, blocks: [{ kind: "cancelled", id: "x" }] },
     ]);
-    expect(turns).toEqual([{ question: "Predict ADMET for caffeine", title: "Answer", answer: "Caffeine is soluble." }]);
+    expect(turns).toEqual([{ question: "Predict ADMET for caffeine", title: null, answer: "Caffeine is soluble." }]);
   });
 
   it("lists each run's best, then what was measured, once per molecule", () => {

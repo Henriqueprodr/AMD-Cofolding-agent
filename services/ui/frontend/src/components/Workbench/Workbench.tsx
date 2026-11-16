@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 import { memo, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
-import type { StructurePanel } from "../../types/api";
+import type { Campaign, StructurePanel } from "../../types/api";
 import type { Theme } from "../../hooks/useTheme";
 import type { Artifacts } from "../../lib/artifacts";
 import { DOCK_DEFAULT_WIDTH, DOCK_MIN_WIDTH, DOCK_TABS, clampWidth, dockRoom, dockTabOf, loadWidth, saveWidth, type DockTab, type DockView } from "../../lib/dock";
 import { sendToViewer } from "../../lib/viewerBus";
+import { fetchPdbEntry } from "../../lib/rcsb";
 import { onMoleculeRequest, type MoleculeContext } from "../../lib/moleculePage";
 import { StructureWorkspace } from "../StructureWorkspace/StructureWorkspace";
 import { MoleculePage } from "../MoleculePage/MoleculePage";
@@ -20,9 +21,15 @@ import { TtpPanel } from "../TtpPanel/TtpPanel";
 import { TargetPanel } from "../TargetCard/TargetPanel";
 import { AssetsPanel } from "../AssetsPanel/AssetsPanel";
 import { CampaignPanel } from "../CampaignPanel/CampaignPanel";
-import { JobPicker } from "../JobPicker/JobPicker";
+import { JobTimeline } from "../CampaignPanel/JobTimeline";
+import { CampaignNav } from "../CampaignPanel/CampaignNav";
+import { CampaignMolecules } from "../CampaignPanel/CampaignMolecules";
+import { CampaignAnalysis } from "../CampaignPanel/CampaignAnalysis";
+import { CampaignJobs } from "../CampaignPanel/CampaignJobs";
+import { useFocusedRun } from "../../lib/workbenchBus";
+import { PanelShown } from "../../hooks/PanelShown";
 
-/** A tab, or a view inside one: "candidates" and "properties" open Molecules, "results" and "activity" (Analysis) views of Jobs. */
+/** A tab, or a view inside one: "candidates" and "properties" open Molecules, "jobs", "results" and "activity" (Analysis) views of Campaign. */
 export type WorkbenchTab = DockView;
 export type WorkbenchLayout = "sidebar" | "sheet";
 
@@ -42,19 +49,19 @@ interface Props {
   onClose: () => void;
   /** Bump to show `tab` afresh even when it did not change (e.g. back to a list from a molecule page). */
   openSeq?: number;
+  /** The conductor's log of the conversation, for the Campaign tab. */
+  campaignLog?: Campaign | null;
 }
 
 const LABEL: Record<DockTab, string> = {
   structure: "Structure",
   molecules: "Molecules",
-  jobs: "Jobs",
   campaign: "Campaign",
   target: "Target",
-  ttp: "TTP",
   assets: "Assets",
 };
 /** Tabs a molecule page opens over; from any other, it opens over Molecules. */
-const PAGE_TABS: readonly DockTab[] = ["molecules", "jobs"];
+const PAGE_TABS: readonly DockTab[] = ["molecules", "campaign"];
 
 /** A molecule's page, shown over the list of the tab it was opened from. */
 interface Page {
@@ -64,11 +71,9 @@ interface Page {
 }
 type Show = (smiles: string, context?: MoleculeContext) => void;
 
-const JOB_VIEWS = [
-  { id: "jobs", label: "Summary" },
-  { id: "results", label: "Results" },
-  // The view id predates the Analysis view; dock.ts and the workbench bus still call it "activity".
-  { id: "activity", label: "Analysis" },
+const TARGET_VIEWS = [
+  { id: "target", label: "Target" },
+  { id: "ttp", label: "Profile" },
 ] as const;
 
 /**
@@ -95,6 +100,7 @@ export const Workbench = memo(function Workbench(props: Props) {
   }, [isSheet, onClose]);
 
   const active = dockTabOf(tab);
+  const pickedRun = useFocusedRun();
 
   /** The view each merged tab showed last, so going back to it lands where the user left. Synced from the `tab` prop during render. */
   const [lastView, setLastView] = useState<Partial<Record<DockTab, WorkbenchTab>>>(() => ({ [active]: tab }));
@@ -117,6 +123,9 @@ export const Workbench = memo(function Workbench(props: Props) {
   }, [page, selectedSmiles, onSelectSmiles]);
 
   const viewOf = (id: DockTab): WorkbenchTab => lastView[id] ?? id;
+  // A tab kept behind another still needs to know which of its views to hold.
+  const campaignView = active === "campaign" ? tab : viewOf("campaign");
+  const targetView = active === "target" ? tab : viewOf("target");
   const show: Show = (smiles, context) => {
     const here = PAGE_TABS.includes(active) ? active : "molecules";
     setPage({ tab: here, smiles, ...(context ? { context } : {}) });
@@ -149,7 +158,6 @@ export const Workbench = memo(function Workbench(props: Props) {
           role="separator"
           aria-orientation="vertical"
           aria-label="Resize the workbench"
-          title="Drag to resize"
           onPointerDown={(event) => {
             event.currentTarget.setPointerCapture(event.pointerId);
             setDragging(true);
@@ -193,7 +201,6 @@ export const Workbench = memo(function Workbench(props: Props) {
           type="button"
           onClick={onClose}
           aria-label="Hide the workbench"
-          title="Hide the workbench"
           className="text-muted hover:text-body grid size-8 shrink-0 cursor-pointer place-items-center self-center rounded-lg text-sm touch:size-11"
         >
           ›
@@ -214,41 +221,62 @@ export const Workbench = memo(function Workbench(props: Props) {
           />
         )}
         {/* Hidden rather than unmounted under a page, so going back finds the list as it was. */}
-        <div className={shown ? "hidden" : "contents"}>
-          {active === "structure" && <StructureTab {...props} />}
-          {active === "molecules" && <MoleculesPanel artifacts={artifacts} theme={props.theme} sessionId={sessionId} onOpenMolecule={show} onAsk={props.onAsk} />}
-          {active === "jobs" && (
-            <>
-              <JobPicker sessionId={sessionId} />
-              <ViewSwitch label="Jobs" views={JOB_VIEWS} value={tab} onChange={onTabChange} />
-              {tab === "jobs" && (
-                <div className="min-h-0 flex-1">
-                  <JobsPanel sessionId={sessionId ?? undefined} theme={props.theme} onAsk={props.onAsk} onOpenMolecule={show} />
-                </div>
-              )}
-              {tab === "results" && (
-                <div className="min-h-0 flex-1">
-                  <RunResults artifacts={artifacts} theme={props.theme} sessionId={sessionId} onOpenMolecule={show} onAsk={props.onAsk} />
-                </div>
-              )}
-              {tab === "activity" && (
-                <div className="min-h-0 flex-1">
-                  <RunAnalysis sessionId={sessionId} theme={props.theme} onOpenMolecule={show} />
-                </div>
-              )}
-            </>
-          )}
-          {active === "campaign" && (
-            <CampaignPanel sessionId={sessionId} theme={props.theme} onOpenMolecule={(smiles) => show(smiles)} />
-          )}
-          {(active === "ttp" || active === "target" || active === "assets") && <ContextTab {...props} />}
+        {/* Keyed on the conversation: another one starts with only the tab it opens on. */}
+        <div key={sessionId ?? ""} className={shown ? "hidden" : "contents"}>
+          <PanelShown shown={!shown}>
+          <Kept shown={active === "structure"}>
+            <StructureTab {...props} />
+          </Kept>
+          <Kept shown={active === "molecules"}>
+            <MoleculesPanel artifacts={artifacts} theme={props.theme} sessionId={sessionId} onOpenMolecule={show} onAsk={props.onAsk} />
+          </Kept>
+          <Kept shown={active === "campaign"}>
+            <JobTimeline sessionId={sessionId} onOpenRun={() => onTabChange("jobs")} />
+            <CampaignNav sessionId={sessionId} view={campaignView} onView={onTabChange} />
+            <Kept shown={campaignView === "campaign"}>
+              <CampaignPanel
+                sessionId={sessionId}
+                log={props.campaignLog}
+                theme={props.theme}
+                onOpenMolecule={(smiles) => show(smiles)}
+                onShowProperties={() => onTabChange("properties")}
+                onOpenRun={() => onTabChange("jobs")}
+              />
+            </Kept>
+            <Kept shown={campaignView === "pooled"} className="flex min-h-0 flex-1 flex-col">
+              <CampaignMolecules sessionId={sessionId} theme={props.theme} onOpenMolecule={(smiles) => show(smiles)} />
+            </Kept>
+            <Kept shown={campaignView === "space"} className="flex min-h-0 flex-1 flex-col">
+              <CampaignAnalysis sessionId={sessionId} theme={props.theme} onOpenMolecule={(smiles) => show(smiles)} onShowTask={() => onTabChange("campaign")} />
+            </Kept>
+            <Kept shown={campaignView === "jobs" && pickedRun === null} className="flex min-h-0 flex-1 flex-col">
+              <CampaignJobs sessionId={sessionId} />
+            </Kept>
+            <Kept shown={campaignView === "jobs" && pickedRun !== null} className="min-h-0 flex-1">
+              <JobsPanel sessionId={sessionId ?? undefined} theme={props.theme} onAsk={props.onAsk} onOpenMolecule={show} />
+            </Kept>
+            <Kept shown={campaignView === "results"} className="min-h-0 flex-1">
+              <RunResults artifacts={artifacts} theme={props.theme} sessionId={sessionId} onOpenMolecule={show} onAsk={props.onAsk} />
+            </Kept>
+            <Kept shown={campaignView === "activity"} className="min-h-0 flex-1">
+              <RunAnalysis sessionId={sessionId} theme={props.theme} onOpenMolecule={show} />
+            </Kept>
+          </Kept>
+          <Kept shown={active === "target"}>
+            <ViewSwitch label="Target" views={TARGET_VIEWS} value={targetView} onChange={onTabChange} />
+            <ContextTab {...props} tab={targetView} />
+          </Kept>
+          <Kept shown={active === "assets"}>
+            <ContextTab {...props} tab="assets" />
+          </Kept>
+          </PanelShown>
         </div>
       </div>
     </aside>
   );
 });
 
-/** The tabs about the campaign rather than its results: the profile, the target and the files. */
+/** What the work is about rather than what came of it: the target, its profile and the files. */
 function ContextTab({ tab, artifacts, sessionId, onAsk }: Props) {
   const events = useMemo(() => toolEvents(artifacts.steps), [artifacts.steps]);
   const molecules = useMemo(() => candidatesOf(artifacts).map((c) => ({ smiles: c.smiles, label: c.name })), [artifacts]);
@@ -265,9 +293,40 @@ function ContextTab({ tab, artifacts, sessionId, onAsk }: Props) {
 
 function StructureTab({ artifacts, activeStructure, onSelectStructure, theme, onAsk, sessionId }: Props) {
   const list = artifacts.structures;
-  const sequence = useMemo(() => extractTargetFacts(toolEvents(artifacts.steps)).uniprotSequence, [artifacts.steps]);
+  const facts = useMemo(() => extractTargetFacts(toolEvents(artifacts.steps)), [artifacts.steps]);
+  const [opening, setOpening] = useState<{ id: string; error?: string } | null>(null);
   if (!activeStructure) {
-    return <Empty>No structure yet. When the agent cofolds a complex with Boltz-2, it appears here.</Empty>;
+    const open = (id: string) => {
+      setOpening({ id });
+      fetchPdbEntry(id, sessionId ?? "new")
+        .then((panel) => {
+          setOpening(null);
+          onSelectStructure(panel);
+        })
+        .catch((reason: unknown) => setOpening({ id, error: reason instanceof Error ? reason.message : String(reason) }));
+    };
+    return (
+      <Empty>
+        No structure yet. When the agent cofolds a complex with Boltz-2, it appears here.
+        {facts.pdbIds.length > 0 && (
+          <span className="mt-3 flex flex-wrap justify-center gap-1">
+            <span className="w-full pb-1">Or open one of the target&apos;s PDB entries:</span>
+            {facts.pdbIds.slice(0, 8).map((id) => (
+              <button
+                key={id}
+                type="button"
+                disabled={opening !== null && !opening.error}
+                onClick={() => open(id)}
+                className="border-subtle text-muted hover:text-body cursor-pointer rounded-full border px-2 py-0.5 font-mono text-[11px] disabled:cursor-wait disabled:opacity-60"
+              >
+                {opening?.id === id && !opening.error ? `${id}…` : id}
+              </button>
+            ))}
+            {opening?.error && <span className="w-full pt-1">{opening.error}</span>}
+          </span>
+        )}
+      </Empty>
+    );
   }
   return (
     <StructureWorkspace
@@ -276,11 +335,28 @@ function StructureTab({ artifacts, activeStructure, onSelectStructure, theme, on
       onSelect={onSelectStructure}
       interactions={artifacts.interactions}
       properties={artifacts.properties}
-      targetSequence={sequence}
+      targetSequence={facts.uniprotSequence}
+      targetPdbIds={facts.pdbIds}
       sessionId={sessionId}
       theme={theme}
       onAsk={onAsk}
     />
+  );
+}
+
+/**
+ * Mounted the first time it is shown and kept after, hidden while something
+ * else is. Coming back to a tab then shows it as it was left, where
+ * unmounting it meant every panel fetching, parsing and laying out again.
+ */
+function Kept({ shown, className = "contents", children }: { shown: boolean; className?: string; children: ReactNode }) {
+  const [seen, setSeen] = useState(shown);
+  if (shown && !seen) setSeen(true);
+  if (!seen && !shown) return null;
+  return (
+    <div className={shown ? className : "hidden"}>
+      <PanelShown shown={shown}>{children}</PanelShown>
+    </div>
   );
 }
 

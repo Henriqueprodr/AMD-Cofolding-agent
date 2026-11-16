@@ -82,7 +82,6 @@ export function TargetPanel({ events, onAsk }: Props) {
                 role="tab"
                 aria-selected={selected}
                 onClick={() => setPicked(target.key)}
-                title={[target.facts.name ?? targetName(target.facts), target.facts.organism, target.inSession ? "this chat" : "looked up here"].filter(Boolean).join(" · ")}
                 className={`shrink-0 cursor-pointer rounded-full border px-2 py-0.5 text-[11px] whitespace-nowrap ${selected ? "bg-sunken" : "border-subtle text-muted hover:text-body"}`}
                 style={selected ? { borderColor: "var(--color-structure)", color: "var(--color-structure)" } : undefined}
               >

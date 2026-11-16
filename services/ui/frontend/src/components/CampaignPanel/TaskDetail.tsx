@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: MIT
 
 import { useEffect, useMemo, useState } from "react";
+import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { Theme } from "../../hooks/useTheme";
-import type { CampaignDetail, FleetResult } from "../../types/api";
+import type { CampaignDetail, FleetResult, TaskSpec } from "../../types/api";
 import { callTool } from "../../lib/api";
 import { relativeTime } from "../../lib/campaign";
-import { taskPhase, ttpIdOf } from "../../lib/fleet";
-import { asTtp, objectivesOf, parseResult, payloadError, sourceLabel, targetRange, targetSummary, type Ttp } from "../../lib/ttp";
+import { ranBy, reportBody, taskPhase, ttpIdOf } from "../../lib/fleet";
+import { asTtp, objectivesOf, parseResult, payloadError, targetRange, targetSummary, type Ttp } from "../../lib/ttp";
 import { short } from "../RunAnalysis/plotUtils";
 import { Card, Placeholder } from "../RunAnalysis/shared";
 import { MoleculeTable, type MoleculeRow } from "../MoleculeTable/MoleculeTable";
@@ -16,6 +18,8 @@ import { shortId, useNow } from "./shared";
 interface Props {
   detail: CampaignDetail;
   taskId: string;
+  /** S1, S2… for each sub-agent, as the plot above labels them. */
+  labels?: ReadonlyMap<string, string>;
   theme: Theme;
   onBack: () => void;
   onOpenMolecule?: (smiles: string) => void;
@@ -30,15 +34,27 @@ const PHASE_WORD: Record<ReturnType<typeof taskPhase>, string> = {
   pending: "waiting for an agent",
 };
 
+const KIND_WORD: Record<string, string> = {
+  design: "design run",
+  research: "research",
+  analysis: "analysis",
+  retrosynthesis: "retrosynthesis",
+  question: "question",
+};
+
 /**
- * One sub-agent's task, in the same terms a single run is read in: what was
- * asked, the molecules it found, and the profile it was scored against.
+ * One sub-agent's task: the brief it was given, the report it sent back,
+ * and — when it ran one — the molecules and the profile they were scored
+ * against.
+ *
+ * The report leads, because for most kinds of task it is the whole of what
+ * the sub-agent produced: nothing else crosses back from its conversation.
  *
  * The TTP is shown whole rather than as a difference from the campaign's,
  * because on most campaigns there is nothing to difference against: the task
  * writes its own.
  */
-export function TaskDetail({ detail, taskId, theme, onBack, onOpenMolecule, onOpenJob }: Props) {
+export function TaskDetail({ detail, taskId, labels = new Map(), theme, onBack, onOpenMolecule, onOpenJob }: Props) {
   const now = useNow();
   const task = detail.tasks.find((t) => t.task_id === taskId) ?? null;
   const result = detail.results.find((r) => r.task_id === taskId) ?? null;
@@ -54,22 +70,27 @@ export function TaskDetail({ detail, taskId, theme, onBack, onOpenMolecule, onOp
   }
 
   const phase = taskPhase(task);
+  const owner = ranBy(task);
   const parents = task.spec.derived_from ?? [];
+  const kind = task.spec.kind || "design";
+  const design = kind === "design";
+  const runs = [...new Set([task.job_id, ...(result?.job_ids ?? [])].filter((id): id is string => !!id))];
 
   return (
     <div className="flex flex-col gap-2.5 p-3">
       <BackLink onBack={onBack} />
 
       <Card
-        title="Task"
+        title={task.spec.title || "Task"}
         actions={
           <span className="text-faint text-[11px]">
-            {PHASE_WORD[phase]}
+            {KIND_WORD[kind] ?? kind} · {PHASE_WORD[phase]}
             {task.attempts > 1 && ` · attempt ${task.attempts}`}
           </span>
         }
       >
         <p className="text-[12px] leading-relaxed">{task.spec.intent || <span className="text-faint">The conductor recorded no intent for this task.</span>}</p>
+        <Brief spec={task.spec} />
         {task.spec.rationale && <p className="text-muted mt-1.5 text-[11px] leading-relaxed">{task.spec.rationale}</p>}
         {task.spec.weight_overrides && Object.keys(task.spec.weight_overrides).length > 0 && (
           <p className="text-faint mt-1.5 text-[10.5px]">
@@ -81,20 +102,35 @@ export function TaskDetail({ detail, taskId, theme, onBack, onOpenMolecule, onOp
         )}
         <dl className="text-faint mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[10.5px]">
           <Fact label="task">{task.task_id}</Fact>
-          {task.lease_owner && <Fact label="sub-agent">{task.lease_owner}</Fact>}
+          {owner && (
+            <Fact label="sub-agent">
+              {labels.get(owner) ? `${labels.get(owner)} · ${owner}` : owner}
+            </Fact>
+          )}
           {parents.length > 0 && <Fact label="came from">{parents.map(shortId).join(", ")}</Fact>}
-          {task.job_id && (
-            <Fact label="run">
-              <button type="button" onClick={() => onOpenJob(task.job_id!)} className="cursor-pointer underline-offset-2 hover:underline">
-                {task.job_id}
-              </button>
+          {runs.length > 0 && (
+            // Every run it started, not only the one it was harvested from:
+            // a sub-agent working a chain of tools can start several.
+            <Fact label={runs.length === 1 ? "run" : "runs"}>
+              {runs.map((jobId, index) => (
+                <span key={jobId}>
+                  {index > 0 && ", "}
+                  <button type="button" onClick={() => onOpenJob(jobId)} className="cursor-pointer underline-offset-2 hover:underline">
+                    {jobId}
+                  </button>
+                </span>
+              ))}
             </Fact>
           )}
           {task.error && <Fact label="error">{task.error}</Fact>}
         </dl>
       </Card>
 
-      <Molecules result={result} phase={phase} theme={theme} onOpenMolecule={onOpenMolecule} />
+      <Report result={result} phase={phase} now={now} />
+
+      {(design || (result?.candidates?.length ?? 0) > 0) && (
+        <Molecules result={result} phase={phase} theme={theme} onOpenMolecule={onOpenMolecule} />
+      )}
 
       {result && Object.keys(result.objective_profile).length > 0 && (
         <Card title="What it scored" actions={<span className="text-faint text-[11px]">posted {relativeTime(result.posted_at, now)}</span>}>
@@ -108,12 +144,68 @@ export function TaskDetail({ detail, taskId, theme, onBack, onOpenMolecule, onOp
                 </li>
               ))}
           </ul>
-          {result.summary && <p className="text-muted mt-2 text-[11px] leading-relaxed">{result.summary}</p>}
         </Card>
       )}
 
-      {ttpId && <TtpSummaryCard key={ttpId} ttpId={ttpId} authored={!detail.campaign.base_ttp_id} />}
+      {design && ttpId && <TtpSummaryCard key={ttpId} ttpId={ttpId} authored={!detail.campaign.base_ttp_id} />}
     </div>
+  );
+}
+
+/** The rest of what the conductor wrote: what it knew, and what it wanted back. */
+function Brief({ spec }: { spec: TaskSpec }) {
+  if (!spec.context && !spec.deliverable) return null;
+  return (
+    <div className="border-subtle mt-2 flex flex-col gap-1.5 border-l pl-2.5">
+      {spec.context && (
+        <p className="text-muted text-[11px] leading-relaxed">
+          <span className="text-faint">Context · </span>
+          {spec.context}
+        </p>
+      )}
+      {spec.deliverable && (
+        <p className="text-muted text-[11px] leading-relaxed">
+          <span className="text-faint">Asked for · </span>
+          {spec.deliverable}
+        </p>
+      )}
+    </div>
+  );
+}
+
+const PLUGINS = [remarkGfm];
+
+/**
+ * The sub-agent's own account of the task.
+ *
+ * The only thing that crosses from its conversation to this one: its tool
+ * calls, its reasoning and everything it read are its own. A task that ran
+ * nothing — research, a question, a retrosynthesis — has nothing else.
+ */
+function Report({ result, phase, now }: { result: FleetResult | null; phase: ReturnType<typeof taskPhase>; now: number }) {
+  const text = reportBody(result?.report || "");
+  const summary = (result?.summary || "").trim();
+
+  return (
+    <Card title="Report" actions={result && <span className="text-faint text-[11px]">reported {relativeTime(result.posted_at, now)}</span>}>
+      {text ? (
+        <div className="markdown text-[11.5px] leading-relaxed">
+          <Markdown remarkPlugins={PLUGINS}>{text}</Markdown>
+        </div>
+      ) : summary ? (
+        <p className="text-[11.5px] leading-relaxed">{summary}</p>
+      ) : (
+        <Placeholder height={70}>
+          {phase === "running"
+            ? "The sub-agent is still working. Its report arrives when it finishes."
+            : phase === "failed"
+              ? "The task failed before the sub-agent reported."
+              : phase === "pending"
+                ? "No sub-agent has picked this up yet."
+                : "The sub-agent posted its result without writing a report."}
+        </Placeholder>
+      )}
+    </Card>
   );
 }
 
@@ -234,11 +326,11 @@ function TtpSummaryCard({ ttpId, authored }: { ttpId: string; authored: boolean 
           <ul className="flex flex-col gap-1">
             {objectives.map((objective) => (
               <li key={objective.name} className="flex items-baseline gap-2 text-[11.5px]">
-                <span className="min-w-0 flex-1 truncate" title={`${sourceLabel(objective)} · ${objective.component ?? ""}`}>
+                <span className="min-w-0 flex-1 truncate">
                   {objective.name}
                 </span>
                 {targetRange(objective.transform) && <span className="text-faint shrink-0 text-[10.5px] tabular-nums">{targetRange(objective.transform)}</span>}
-                <span className="text-muted w-10 shrink-0 text-right tabular-nums" title="weight">
+                <span className="text-muted w-10 shrink-0 text-right tabular-nums">
                   ×{+objective.weight.toPrecision(3)}
                 </span>
               </li>

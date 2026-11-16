@@ -5,6 +5,7 @@ import type { ComponentProps } from "react";
 import { Editor } from "ketcher-react";
 import { StandaloneStructServiceProvider } from "ketcher-standalone";
 import type { Ketcher, StructServiceProvider } from "ketcher-core";
+import type { SketchMode } from "../../lib/sketcherBus";
 import "ketcher-react/dist/index.css";
 import "./sketcher.css";
 
@@ -21,7 +22,6 @@ const HIDDEN: (keyof Buttons)[] = [
   "settings",
   "fullscreen",
   "sgroup",
-  "rgroup",
   "reaction-plus",
   "arrows",
   "reaction-mapping-tools",
@@ -29,22 +29,35 @@ const HIDDEN: (keyof Buttons)[] = [
   "text",
   "create-monomer",
 ];
-const BUTTONS: Buttons = Object.fromEntries(HIDDEN.map((name) => [name, { hidden: true }]));
+
+// The R-group group holds the attachment point tool, which is the only way to
+// mark a position for LibInvent or LinkInvent. It stays hidden when drawing an
+// ordinary molecule, where an attachment point is a mistake rather than the
+// point.
+const hiddenFor = (mode: SketchMode): Buttons =>
+  Object.fromEntries(
+    [...HIDDEN, ...(mode === "molecule" ? (["rgroup"] as (keyof Buttons)[]) : [])].map((name) => [
+      name,
+      { hidden: true },
+    ]),
+  );
 
 interface Props {
   initial?: string;
+  /** What is being drawn; decides whether attachment points can be placed. */
+  mode?: SketchMode;
   onReady: (ketcher: Ketcher) => void;
   onError: (message: string) => void;
 }
 
-export default function KetcherEditor({ initial, onReady, onError }: Props) {
+export default function KetcherEditor({ initial, mode = "molecule", onReady, onError }: Props) {
   return (
     <Editor
       staticResourcesUrl=""
       structServiceProvider={structServiceProvider}
       errorHandler={onError}
       disableMacromoleculesEditor
-      buttons={BUTTONS}
+      buttons={hiddenFor(mode)}
       onInit={(ketcher: Ketcher) => {
         const start = initial ? ketcher.setMolecule(initial) : Promise.resolve();
         start.then(

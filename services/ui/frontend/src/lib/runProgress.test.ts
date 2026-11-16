@@ -145,13 +145,14 @@ describe("which runs", () => {
 
   it("collects the jobs the conversation started", () => {
     const steps = [
+      { name: "run_generation_campaign", at: 0, result: result("dddd4444eeee5555") },
       { name: "run_optimization", at: 2, result: result("bbbb2222") },
       { name: "get_optimization_status", at: 3, result: result("bbbb2222") },
       { name: "run_optimization", at: 1, result: result("aaaa1111") },
       { name: "run_optimization", at: 4, result: { result: "boom", isError: true } },
       { name: "run_optimization", at: 5 },
     ];
-    expect(conversationJobIds(steps)).toEqual(["aaaa1111", "bbbb2222"]);
+    expect(conversationJobIds(steps)).toEqual(["dddd4444eeee5555", "aaaa1111", "bbbb2222"]);
   });
 
   it("shows only the conversation's own running jobs", () => {
@@ -169,6 +170,7 @@ describe("which runs", () => {
     const steps = [
       { name: "run_transfer_learning", at: 1, result: result("aaaa1111") },
       { name: "run_optimization", at: 2, result: result("bbbb2222") },
+      { name: "run_generation_campaign", at: 3, result: result("dddd4444eeee5555") },
     ];
     const runs = {
       jobs: [
@@ -177,8 +179,15 @@ describe("which runs", () => {
         { id: "dddd4444", launched: false },
       ],
     };
-    expect(ownJobIds(steps, runs)).toEqual(["aaaa1111", "bbbb2222", "cccc3333"]);
+    expect(ownJobIds(steps, runs)).toEqual(["aaaa1111", "bbbb2222", "dddd4444eeee5555", "cccc3333"]);
     expect(ownJobIds([], null)).toEqual([]);
-    expect(conversationJobIds(steps)).toEqual(["bbbb2222"]);
+    expect(conversationJobIds(steps)).toEqual(["bbbb2222", "dddd4444eeee5555"]);
+  });
+
+  it("adds the runs the campaigns' sub-agents started, which the gateway puts down to their own sessions", () => {
+    // With two or more sub-agents the conductor starts no run itself, so
+    // without these the bar would sit empty through the whole campaign.
+    const steps = [{ name: "run_optimization", at: 1, result: result("aaaa1111") }];
+    expect(ownJobIds(steps, null, ["eeee5555", "aaaa1111", "ffff6666"])).toEqual(["aaaa1111", "eeee5555", "ffff6666"]);
   });
 });

@@ -32,7 +32,7 @@ export function AlertCard({ alert }: { alert: Record<string, unknown> }) {
       </div>
       <p className="text-body mt-1.5 text-[0.8125rem] leading-relaxed">{message}</p>
       <div className="mt-1.5">
-        <ArtifactButton label="Open jobs" onClick={() => openWorkbench("jobs")} />
+        <ArtifactButton label="Jobs" onClick={() => openWorkbench("jobs")} />
       </div>
     </div>
   );

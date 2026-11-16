@@ -31,17 +31,19 @@ const TOOL_TITLES: [RegExp, string][] = [
 const MINOR = /^(list_|get_ttp$|fetch_)/;
 
 const HEADING = /^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/m;
+/** Headings that name no subject, so never a title. */
+const EMPTY_HEADING = /^(the |final )?answer:?$/i;
 
 /** The text of the answer's first heading, without inline markdown. */
 export function firstHeading(markdown: string): string | null {
   const match = HEADING.exec(markdown);
   if (!match) return null;
   const text = match[1].replace(/[*_`]/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").trim();
-  return text || null;
+  return text && !EMPTY_HEADING.test(text) ? text : null;
 }
 
-/** A bold title for a turn: the answer's first heading, else its main tool, else "Answer". */
-export function answerTitle(texts: string[], tools: string[]): string {
+/** A bold title for a turn: the answer's first heading, else its main tool, else none rather than a word that says nothing. */
+export function answerTitle(texts: string[], tools: string[]): string | null {
   for (const text of texts) {
     const heading = firstHeading(text);
     if (heading) return heading;
@@ -53,13 +55,13 @@ export function answerTitle(texts: string[], tools: string[]): string {
     }
     return null;
   };
-  return titled(tools.filter((name) => !MINOR.test(name))) ?? titled(tools) ?? "Answer";
+  return titled(tools.filter((name) => !MINOR.test(name))) ?? titled(tools);
 }
 
 /** The answer without its first line when that line is the heading used as the title. */
-export function withoutLeadingHeading(markdown: string, title: string): string {
+export function withoutLeadingHeading(markdown: string, title: string | null): string {
   const match = /^\s*#{1,6}\s+(.+?)\s*#*\s*(\n|$)/.exec(markdown);
-  if (!match || firstHeading(match[0]) !== title) return markdown;
+  if (!title || !match || firstHeading(match[0]) !== title) return markdown;
   return markdown.slice(match[0].length).replace(/^\s*\n/, "");
 }
 
@@ -87,29 +89,29 @@ export function artifactLinks(panels: Panel[], tools: string[]): ArtifactLink[] 
   };
   const structures = panels.filter((panel): panel is StructurePanel => panel.kind === "structure");
   const best = bestStructure(structures);
-  if (best) add(structures.length > 1 ? "Open best pose" : "Open pose", { kind: "viewer", request: { path: best.path, source: "answer" } });
+  if (best) add(structures.length > 1 ? "Best pose" : "Pose", { kind: "viewer", request: { path: best.path, source: "answer" } });
 
   const profile = panels.find((panel) => panel.kind === "interactions" && panel.structurePath);
   if (profile?.kind === "interactions" && profile.structurePath) {
-    add("Show contacts", {
+    add("Contacts", {
       kind: "viewer",
       request: { path: profile.structurePath, action: { kind: "contacts", type: null }, source: "answer" },
     });
   }
 
   const has = (pattern: RegExp) => tools.some((name) => pattern.test(name));
-  if (has(/^get_top_candidates$/)) add("Open candidates", { kind: "workbench", tab: "candidates" });
+  if (has(/^get_top_candidates$/)) add("Candidates", { kind: "workbench", tab: "candidates" });
   if (has(/^(run|start|launch)_|_status$/)) {
-    add("Open candidates", { kind: "workbench", tab: "candidates" });
-    add("Open jobs", { kind: "workbench", tab: "jobs" });
+    add("Candidates", { kind: "workbench", tab: "candidates" });
+    add("Jobs", { kind: "workbench", tab: "jobs" });
   }
   if (panels.some((panel) => panel.kind === "properties") || has(/^predict_(admet|retrodmta)$/)) {
-    add("Open ADMET", { kind: "workbench", tab: "properties" });
+    add("ADMET", { kind: "workbench", tab: "properties" });
   }
-  if (panels.some((panel) => panel.kind === "molecule")) add("Open molecules", { kind: "workbench", tab: "molecules" });
-  if (has(/_ttps?$/)) add("Open TTP", { kind: "workbench", tab: "ttp" });
-  if (has(/^fetch_target_info$/)) add("Open target", { kind: "workbench", tab: "target" });
-  if (has(/^list_shared_assets$/)) add("Open assets", { kind: "workbench", tab: "assets" });
+  if (panels.some((panel) => panel.kind === "molecule")) add("Molecules", { kind: "workbench", tab: "molecules" });
+  if (has(/_ttps?$/)) add("TTP", { kind: "workbench", tab: "ttp" });
+  if (has(/^fetch_target_info$/)) add("Target", { kind: "workbench", tab: "target" });
+  if (has(/^list_shared_assets$/)) add("Assets", { kind: "workbench", tab: "assets" });
   return out;
 }
 

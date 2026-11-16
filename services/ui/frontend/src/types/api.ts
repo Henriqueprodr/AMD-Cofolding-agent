@@ -174,6 +174,8 @@ export interface UserMessageEvent extends Recorded {
   type: "user_message";
   content: string;
   effort?: Effort;
+  /** Sent while a turn ran: that turn reads it after its current step. */
+  interjected?: boolean;
 }
 
 export interface ThinkingEvent extends Recorded {
@@ -286,11 +288,19 @@ export interface FleetCampaign {
   session_id: string | null;
 }
 
-/** What the conductor asked for, in its own words. */
+/** What the conductor asked for, in its own words: the sub-agent's brief. */
 export interface TaskSpec {
-  /** Handed to the sub-agent verbatim; this is what the graph labels a task with. */
+  /** Handed to the sub-agent verbatim; this is the task. */
   intent?: string;
-  /** Tasks whose results led the conductor here: the edges of the graph. */
+  /** What sort of work it is: design, research, analysis, retrosynthesis, question. */
+  kind?: string;
+  /** A few words for the person watching, so a task is recognisable without the brief. */
+  title?: string;
+  /** What the sub-agent could not have found out for itself. */
+  context?: string;
+  /** What to come back with, when the shape of the answer matters. */
+  deliverable?: string;
+  /** Tasks whose results led the conductor here: the lines between the bubbles. */
   derived_from?: string[];
   /** Only on campaigns with a declared objective list. */
   weight_overrides?: Record<string, number>;
@@ -306,8 +316,10 @@ export interface FleetTask {
   state: string;
   attempts: number;
   created_at: string;
-  /** The supervisor holding it; null when nobody has claimed it. */
+  /** The supervisor holding it; null when nobody has claimed it, and again once it is done. */
   lease_owner: string | null;
+  /** The supervisor that last claimed it, kept after it finished; added by the gateway from the claims. */
+  ran_by?: string | null;
   lease_expires_at: string | null;
   claimed_at: string | null;
   finished_at: string | null;
@@ -328,10 +340,14 @@ export interface FleetResult {
   task_id: string;
   campaign_id: string;
   job_id: string | null;
-  /** Mean score per objective: the task's coordinates on the front. */
+  /** Score per objective of the task's best molecule; empty for work that scored nothing. */
   objective_profile: Record<string, number>;
   candidates: FleetCandidate[];
   summary: string | null;
+  /** The sub-agent's own account of the task, in prose. The only thing that crosses back. */
+  report?: string | null;
+  /** Every run it started, not only the one it was harvested from. */
+  job_ids?: string[];
   posted_at: string;
 }
 
@@ -350,12 +366,143 @@ export interface FleetSupervisor {
   last_seen_seconds_ago: number | null;
 }
 
+/**
+ * One thing that happened in a campaign, as the ledger recorded it.
+ *
+ * The ledger's own history, which is the only account of the work that is
+ * not an agent's word for it: who claimed what, when a run started, what
+ * came back.
+ */
+export interface FleetEvent {
+  event_id: number;
+  task_id: string | null;
+  /** campaign_created, task_enqueued, task_claimed, task_started_job, task_done, task_failed… */
+  kind: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+/** One line of a sub-agent's transcript, as its agent wrote it. */
+export interface SubagentEvent {
+  /** Local time of the supervisor's node, without a zone. */
+  ts?: string;
+  /** user_message, thinking, tool_call, tool_result, assistant_message, max_rounds, reset… */
+  event: string;
+  content?: string;
+  name?: string;
+  arguments?: Record<string, unknown>;
+  elapsed_s?: number;
+  is_error?: boolean;
+  error?: string;
+  /** The opening of what a tool returned; older transcripts kept only its length. */
+  excerpt?: string;
+  content_length?: number;
+  round?: number;
+  /** A message from the person watching, handed over mid-turn. */
+  interjected?: boolean;
+}
+
+/** A message left for a sub-agent, POST /api/fleet/tasks/{id}/messages. */
+export interface QueuedMessage {
+  ts: string;
+  text: string;
+}
+
+/** GET /api/fleet/tasks/{id}/conversation. */
+export interface TaskConversation {
+  task_id: string;
+  /** False when the sub-agent wrote no transcript under this task's name. */
+  found: boolean;
+  events: SubagentEvent[];
+  truncated: boolean;
+  /** Messages left for it that it has not read yet; absent from older gateways. */
+  queued?: QueuedMessage[];
+}
+
+/** GET /api/fleet/campaigns/{id}/events, oldest first. */
+export interface CampaignEvents {
+  events: FleetEvent[];
+  last_event_id: number;
+}
+
+export type FindingConfidence = "high" | "medium" | "low";
+
+/** A second opinion on a finding; it never overwrites the finding itself. */
+export interface FindingNote {
+  note_id: number;
+  finding_id: string;
+  body: string;
+  stance: "supports" | "disputes" | "extends" | null;
+  author: string;
+  task_id: string | null;
+  created_at: string;
+}
+
+/** Something the campaign now knows, under one branch of its plan. */
+export interface Finding {
+  finding_id: string;
+  campaign_id: string;
+  branch: string;
+  claim: string;
+  detail: string | null;
+  /** Where it came from: a DOI, a ChEMBL id, a job id, a PDB code. */
+  evidence: string[];
+  confidence: FindingConfidence;
+  tags: string[];
+  author: string;
+  task_id: string | null;
+  created_at: string;
+  supersedes: string | null;
+  superseded_by: string | null;
+  notes: FindingNote[];
+}
+
+/** One branch of the atlas: a workstream of the plan, or one an agent filed under. */
+export interface AtlasBranch {
+  branch: string;
+  name: string;
+  in_plan: boolean;
+  findings: number;
+  disputed: number;
+  latest: { finding_id: string; claim: string; confidence: FindingConfidence; created_at: string } | null;
+  tags: string[];
+}
+
+/** GET /api/fleet/campaigns/{id}/atlas: the branches and their current findings, newest first. */
+export interface CampaignAtlas {
+  campaign_id: string;
+  goal: string;
+  /** Current findings over the whole campaign. */
+  findings: number;
+  branches: AtlasBranch[];
+  empty_branches: string[];
+  items: Finding[];
+  /** More findings than one read hands out; the newest are the ones shown. */
+  truncated: boolean;
+}
+
 /** GET /api/fleet/campaigns/{id}: read together because separately they tear. */
 export interface CampaignDetail {
   campaign: FleetCampaign;
   tasks: FleetTask[];
   results: FleetResult[];
   supervisors: FleetSupervisor[];
+  /** Null when the ledger could not say; absent from an older gateway. */
+  metrics?: CampaignMetrics | null;
+}
+
+/** How busy a campaign keeps its team, over it and its leads' campaigns. */
+export interface CampaignMetrics {
+  concurrency: number;
+  running: number;
+  queued: number;
+  free_slots: number;
+  backlog_target: number;
+  /** Share of the slots' time spent holding a task; null before any claim. */
+  utilisation: number | null;
+  busy_seconds: number;
+  handoffs: number;
+  handoff_seconds: { median: number | null; max: number | null };
 }
 
 /**
@@ -484,11 +631,15 @@ export type TurnBlock =
       /** Epoch ms when the call started. */
       at: number;
       result?: ToolResultEvent;
+      /** The same call sent this many times in a row with the same answer, shown once. */
+      repeats?: number;
     }
   | { kind: "text"; id: string; content: string }
   | { kind: "error"; id: string; message: string }
   | { kind: "cancelled"; id: string }
-  | { kind: "alert"; id: string; alert: Record<string, unknown> };
+  | { kind: "alert"; id: string; alert: Record<string, unknown> }
+  /** A message the user sent while this turn ran. */
+  | { kind: "user"; id: string; content: string };
 
 export interface UserTurn {
   role: "user";

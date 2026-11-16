@@ -31,6 +31,10 @@ export interface JobSummary {
   checkpointPath: string | null;
   hasCheckpoint: boolean;
   workingDir: string | null;
+  /** The Slurm job a relayed run is; null for a subprocess of the runner. */
+  slurmJobId: string | null;
+  /** Whether it scores with Boltz, which is what gives a Slurm run its second GPU; null when not said. */
+  usesBoltz: boolean | null;
 }
 
 export interface TrajectoryPoint {
@@ -143,6 +147,8 @@ export function parseJob(raw: unknown): JobSummary | null {
     checkpointPath: str(d.checkpoint_path),
     hasCheckpoint: d.has_checkpoint === true,
     workingDir: str(d.working_dir),
+    slurmJobId: str(d.slurm_job_id),
+    usesBoltz: typeof d.uses_boltz === "boolean" ? d.uses_boltz : null,
   };
 }
 

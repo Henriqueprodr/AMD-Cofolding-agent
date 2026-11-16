@@ -9,7 +9,7 @@ import { SelectionTable } from "../RunAnalysis/SelectionTable";
 import { MoleculeTable } from "./MoleculeTable";
 
 describe("MoleculeTable", () => {
-  it("puts the SMILES on the drawing's tooltip and a copy button beside it, not in a column", () => {
+  it("puts a copy button beside the drawing rather than a SMILES column", () => {
     const html = renderToStaticMarkup(
       <MoleculeTable
         columns={[{ key: "Score", label: "Total", strong: true }, { key: "MW", label: "MW", unit: "Da" }]}
@@ -20,7 +20,6 @@ describe("MoleculeTable", () => {
     );
     expect(html).not.toContain(">SMILES<");
     expect(html).not.toContain(">CCO<");
-    expect(html).toContain('title="CCO"');
     expect(html).toContain('aria-label="Copy SMILES"');
     expect(html).toContain(">3D</button>");
     expect(html).toContain(">Da<");
@@ -57,7 +56,8 @@ describe("SelectionTable", () => {
       <SelectionTable molecules={molecules} mask={null} columns={molecules.endpoints} colours={new Map()} hovered={null} onHover={() => {}} onOpen={() => {}} theme="light" />,
     );
     expect(html).not.toContain(">SMILES<");
-    expect(html.indexOf('title="CCN"')).toBeLessThan(html.indexOf('title="CCO"'));
+    // The later step first: the table opens on the best of the run.
+    expect(html.indexOf(">0.70<")).toBeLessThan(html.indexOf(">0.50<"));
     expect(html).toContain(">Step<");
     expect(html).toContain(">0.70<");
   });

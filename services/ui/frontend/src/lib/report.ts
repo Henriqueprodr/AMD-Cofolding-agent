@@ -70,7 +70,8 @@ export interface ReportStructure {
 
 export interface ReportTurn {
   question: string;
-  title: string;
+  /** Null when neither a heading nor a tool says what the answer is about. */
+  title: string | null;
   answer: string;
 }
 
@@ -736,7 +737,7 @@ function turnsSection(turns: ReportTurn[]): string {
   const cards = turns.map(
     (t) => `<div class="card">
 ${t.question ? `<p class="q">${esc(t.question)}</p>` : ""}
-<h3>${esc(t.title)}</h3>
+${t.title ? `<h3>${esc(t.title)}</h3>` : ""}
 <p class="answer">${esc(t.answer)}</p>
 </div>`,
   );

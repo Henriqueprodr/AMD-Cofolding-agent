@@ -38,7 +38,6 @@ export function StructureCard({ panel, theme, isOpen }: Props) {
         <button
           type="button"
           onClick={show}
-          title={isOpen ? "In the 3D viewer" : "Open in the 3D viewer"}
           className="flex min-w-0 flex-1 cursor-pointer items-baseline gap-2 text-left"
         >
           <span className="min-w-0 truncate text-xs font-semibold">{structureTitle(panel)}</span>
@@ -53,7 +52,7 @@ export function StructureCard({ panel, theme, isOpen }: Props) {
     <figure className="bg-raised border-subtle m-0 overflow-hidden rounded-xl border">
       <figcaption className="border-subtle flex items-center gap-2 border-b px-3 py-2">
         <span aria-hidden="true" className="size-2 shrink-0 rounded-full" style={{ background: "var(--color-structure)" }} />
-        <span className="min-w-0 truncate text-xs font-semibold" title={panel.path}>
+        <span className="min-w-0 truncate text-xs font-semibold">
           {structureTitle(panel)}
         </span>
         {runOf(panel.path) && <span className="text-faint shrink-0 font-mono text-[10px]">{runOf(panel.path)}</span>}
@@ -61,7 +60,6 @@ export function StructureCard({ panel, theme, isOpen }: Props) {
           <span
             className="ml-auto shrink-0 text-[10px]"
             style={{ color: verdict.status === "pass" ? "var(--color-ok)" : "var(--color-warn)" }}
-            title={verdict.reasons.join(" · ") || "Confidence > 0.6, ligand ipTM > 0.5, PoseBusters all pass"}
           >
             {badge}
           </span>
@@ -72,7 +70,6 @@ export function StructureCard({ panel, theme, isOpen }: Props) {
         type="button"
         onClick={() => show()}
         className="hover:bg-sunken flex w-full cursor-pointer items-center gap-3 px-3 py-2 text-left"
-        title="Open in the 3D viewer"
       >
         {panel.smiles && (
           <MolDepiction smiles={panel.smiles} theme={theme} width={150} height={120} label={panel.label ?? undefined} className="h-20 w-24 shrink-0" />
@@ -80,7 +77,7 @@ export function StructureCard({ panel, theme, isOpen }: Props) {
         {facts.length > 0 && (
           <dl className="min-w-0 flex-1 space-y-0.5 text-[11px]">
             {facts.map((fact) => (
-              <div key={fact.label} className="flex items-baseline justify-between gap-2" title={fact.title}>
+              <div key={fact.label} className="flex items-baseline justify-between gap-2">
                 <dt className="text-faint truncate">{fact.label}</dt>
                 <dd className="shrink-0 font-mono tabular-nums" style={{ color: fact.tone === "warn" ? "var(--color-warn)" : undefined }}>
                   {fact.value}
@@ -112,7 +109,6 @@ function DownloadLink({ panel }: { panel: StructurePanel }) {
     <a
       href={panel.url}
       download={panel.name}
-      title={`Download ${panel.name}`}
       aria-label={`Download ${panel.name}`}
       className="text-muted hover:text-body hover:bg-inset inline-flex size-7 shrink-0 items-center justify-center rounded-md touch:size-11"
     >

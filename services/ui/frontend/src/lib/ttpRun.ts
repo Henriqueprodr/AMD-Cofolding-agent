@@ -1,6 +1,7 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
+import { fragmentList, fragmentProblems, scaffoldProblems } from "./attachment";
 import { parseResult } from "./ttp";
 
 /**
@@ -9,7 +10,10 @@ import { parseResult } from "./ttp";
  * molecules per step. The last settings used are kept in localStorage.
  */
 
-export type Prior = "reinvent" | "mol2mol";
+export type Prior = "reinvent" | "mol2mol" | "libinvent" | "linkinvent";
+
+/** The two that decorate a structure given to them rather than invent a whole one. */
+export const NEEDS_ATTACHMENT: readonly Prior[] = ["libinvent", "linkinvent"];
 
 export interface RunSettings {
   /** Whether the chat text asks the agent to start a run on the new TTP. */
@@ -22,10 +26,15 @@ export interface RunSettings {
   model: string;
   /** Seed SMILES for Mol2Mol, one per line. */
   seeds: string;
+  /**
+   * The scaffold for LibInvent, or the fragments for LinkInvent -- the
+   * structure those two decorate, which they cannot run without.
+   */
+  scaffold: string;
 }
 
 /** run_optimization's defaults and the server config's batch_size (reinvent4_mcp_config.yaml). */
-export const DEFAULT_RUN: RunSettings = { enabled: false, maxSteps: 300, batchSize: 16, prior: null, model: ".m2m_medium", seeds: "" };
+export const DEFAULT_RUN: RunSettings = { enabled: false, maxSteps: 300, batchSize: 16, prior: null, model: ".m2m_medium", seeds: "", scaffold: "" };
 
 export const MAX_STEPS = 5000;
 export const MAX_BATCH = 512;
@@ -57,6 +66,7 @@ export function loadRunSettings(storage: KeyValueStore | null = browserStorage()
       prior: null,
       model: typeof value.model === "string" && value.model.startsWith(".m2m") ? value.model : DEFAULT_RUN.model,
       seeds: typeof value.seeds === "string" ? value.seeds : "",
+      scaffold: typeof value.scaffold === "string" ? value.scaffold : "",
     };
   } catch {
     return DEFAULT_RUN;
@@ -85,8 +95,13 @@ export function runProblems(settings: RunSettings): string[] {
   const problems: string[] = [];
   if (!Number.isInteger(settings.maxSteps) || settings.maxSteps < 1 || settings.maxSteps > MAX_STEPS) problems.push(`Steps must be a whole number from 1 to ${MAX_STEPS}.`);
   if (!Number.isInteger(settings.batchSize) || settings.batchSize < 1 || settings.batchSize > MAX_BATCH) problems.push(`Batch size must be a whole number from 1 to ${MAX_BATCH}.`);
-  if (!settings.prior) problems.push("Choose how to generate: from scratch or analogues of your molecules.");
+  if (!settings.prior) problems.push("Choose how to generate: from scratch, analogues, a scaffold or a linker.");
   if (settings.prior === "mol2mol" && seedList(settings.seeds).length === 0) problems.push("Mol2Mol needs at least one seed SMILES.");
+  // Caught here rather than on submit: these two are refused for a structure
+  // the user drew correctly but left unnumbered, and the error arrives far
+  // from the field that caused it.
+  if (settings.prior === "libinvent") problems.push(...scaffoldProblems(settings.scaffold));
+  if (settings.prior === "linkinvent") problems.push(...fragmentProblems(fragmentList(settings.scaffold)));
   return problems;
 }
 
@@ -119,14 +134,28 @@ export function seedChoices(...lists: readonly (readonly SeedMolecule[] | undefi
 /** Seed text without one SMILES. */
 export const removeSeed = (text: string, smiles: string) => seedList(text).filter((s) => s !== smiles).join("\n");
 
-export const runModel = (settings: RunSettings) => (settings.prior === "mol2mol" ? settings.model : ".reinvent");
+export const runModel = (settings: RunSettings) =>
+  settings.prior === "mol2mol" ? settings.model : `.${settings.prior ?? "reinvent"}`;
 
 /** What the composer gets after a TTP is created: use it, or also start a run on it with these settings. */
 export function ttpRequest(ttp: { id: string; name: string }, settings: RunSettings): string {
   if (!settings.enabled) return `Use the TTP "${ttp.name}" (${ttp.id})`;
   const model = runModel(settings);
-  const from = settings.prior === "mol2mol" ? ` from ${seedList(settings.seeds).join(" ")}` : "";
-  return `Run REINVENT on the TTP "${ttp.name}" (${ttp.id}): ${modelLabel(model)} (${model})${from}, ${settings.maxSteps} steps, batch size ${settings.batchSize}.`;
+  // Each generator is told what it decorates, because run_optimization builds
+  // de novo and Mol2Mol only and refuses the other two by name: the request
+  // has to say run_generation_campaign for those, or it starts the wrong run.
+  const from =
+    settings.prior === "mol2mol"
+      ? ` from ${seedList(settings.seeds).join(" ")}`
+      : settings.prior === "libinvent"
+        ? ` decorating the scaffold ${settings.scaffold.trim()}`
+        : settings.prior === "linkinvent"
+          ? ` linking ${fragmentList(settings.scaffold).join(" and ")}`
+          : "";
+  const starter = NEEDS_ATTACHMENT.includes(settings.prior as Prior)
+    ? " Start it with run_generation_campaign."
+    : "";
+  return `Run REINVENT on the TTP "${ttp.name}" (${ttp.id}): ${modelLabel(model)} (${model})${from}, ${settings.maxSteps} steps, batch size ${settings.batchSize}.${starter}`;
 }
 
 /** The composer text asking for a run on a stored TTP. */
@@ -159,6 +188,8 @@ export interface PriorModel {
 export function modelLabel(key: string | null | undefined): string {
   if (!key) return "—";
   if (key === ".reinvent") return "Reinvent (de novo)";
+  if (key === ".libinvent") return "LibInvent (scaffold decoration)";
+  if (key === ".linkinvent") return "LinkInvent (linker design)";
   const m2m = /^\.m2m_(.+)$/.exec(key);
   if (m2m) return `Mol2Mol ${m2m[1].replace(/_/g, " ")}${["high", "medium"].includes(m2m[1]) ? " similarity" : ""}`;
   return key.replace(/^\./, "").split(/[\\/]/).pop() ?? key;

@@ -3,14 +3,12 @@
 
 import { useDeferredValue, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { Theme } from "../../hooks/useTheme";
-import { callTool, download, jobFileUrl } from "../../lib/api";
+import { download, jobFileUrl } from "../../lib/api";
 import { sameFile, type Artifacts } from "../../lib/artifacts";
 import { assetUrl } from "../../lib/assets";
 import { fileName } from "../../lib/csv";
-import { useCampaignJobs } from "../../hooks/useCampaignJobs";
-import { useJobOwners, useRunsKnown, useSessionRuns } from "../../hooks/useSessions";
-import { canResume, conversationJobs, isActive, parseJobs, resultsFile, toolError, type JobSummary } from "../../lib/jobs";
-import { scopedJob } from "../../lib/jobScope";
+import { canResume, isActive, resultsFile } from "../../lib/jobs";
+import { useJobScope } from "../JobPicker/useJobScope";
 import { openRunStructure, rowMetrics, rowMolecule, runStructurePanel } from "../../lib/jobStructures";
 import type { MoleculeContext } from "../../lib/moleculePage";
 import { loadRDKit, withMol } from "../../lib/rdkit";
@@ -29,7 +27,7 @@ import {
   type RunTable,
   type SortKey,
 } from "../../lib/runResults";
-import { useFocusedRun } from "../../lib/workbenchBus";
+import { usePanelShown } from "../../hooks/panelShownContext";
 import { DownloadIcon, ExportButtons, TextButton } from "../DataTable/ExportButtons";
 import { ContinueRun } from "../JobsPanel/ContinueRun";
 import { MoleculeThumb, StructureButton } from "../MoleculeTable/MoleculeTable";
@@ -79,21 +77,11 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
  * tens of thousands of rows scrolls as fast as one of ten.
  */
 export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk }: Props) {
-  const [jobs, setJobs] = useState<JobSummary[] | null>(null);
-  const [listError, setListError] = useState<string | null>(null);
-  const focused = useFocusedRun();
-  const sessionRuns = useSessionRuns(sessionId);
-  const owners = useJobOwners();
-  const known = useRunsKnown();
-  const campaignJobs = useCampaignJobs(sessionId);
-  const scoped = useMemo(() => {
-    // Until the list says who launched what, no job: the newest of all is often another conversation's.
-    if (!jobs || known === null) return null;
-    return scopedJob(jobs, known ? conversationJobs(jobs, sessionRuns, focused, owners, sessionId, campaignJobs).own : jobs, focused);
-  }, [jobs, known, sessionRuns, focused, owners, sessionId, campaignJobs]);
+  const { job: scoped, runs, error: listError } = useJobScope(sessionId ?? null);
   const job = scoped?.type === "optimization" ? scoped : null;
   const runId = job?.id ?? null;
 
+  const shown = usePanelShown();
   const [tick, setTick] = useState(0);
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const current = loaded && loaded.id === runId ? loaded : null;
@@ -120,23 +108,6 @@ export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk 
   const seeds = useMemo(() => (table ? runSeeds(table) : undefined), [table]);
   const session = sessionId ?? "new";
 
-  useEffect(() => {
-    let cancelled = false;
-    callTool("list_jobs")
-      .then(({ result }) => {
-        if (cancelled) return;
-        const error = toolError(result);
-        setListError(error);
-        if (!error) setJobs(parseJobs(result));
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) setListError(errorText(error));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId, tick]);
-
   const file = job ? resultsFile(job) : null;
   useEffect(() => {
     if (!runId || !file) return;
@@ -161,12 +132,12 @@ export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk 
 
   const running = job ? isActive(job.state) : false;
   useEffect(() => {
-    if (!running) return;
+    if (!running || !shown) return;
     const timer = window.setInterval(() => {
       if (!document.hidden) setTick((t) => t + 1);
     }, REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [running]);
+  }, [running, shown]);
 
   useEffect(() => {
     if (!scroller) return;
@@ -243,7 +214,7 @@ export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk 
     openRunStructure(session, panel, artifacts.structures.some(({ item }) => sameFile(item.path, panel.path)));
   }
 
-  if (jobs === null) {
+  if (runs === null) {
     return <Centered>{listError ? <p style={{ color: "var(--color-accent)" }}>Could not load the runs: {listError}</p> : <p className="text-faint">Loading runs…</p>}</Centered>;
   }
   if (!job) {
@@ -264,19 +235,19 @@ export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk 
             {running && " · live"}
           </span>
         )}
-        <button type="button" onClick={() => setTick((t) => t + 1)} title="Reload the results" aria-label="Reload" className="text-faint hover:text-body cursor-pointer p-0.5">
+        <button type="button" onClick={() => setTick((t) => t + 1)} aria-label="Reload" className="text-faint hover:text-body cursor-pointer p-0.5">
           <RefreshIcon />
         </button>
         {canResume(job) && (
-          <TextButton title="Run more steps from this run's checkpoint (asks first)" onClick={() => setContinuing(continuing === job.id ? null : job.id)}>
+          <TextButton onClick={() => setContinuing(continuing === job.id ? null : job.id)}>
             Continue…
           </TextButton>
         )}
         <span className="ml-auto flex items-center gap-0.5">
           {table && (
             <>
-              <ExportButtons name={`${job.id} results`} sheet={() => resultsSheet(table, rows)} scope={`the ${rows.length.toLocaleString()} rows shown`} />
-              <TextButton title={selected.size ? `Download the ${selected.size} selected molecules as an SD file` : `Download the top ${topN} scored molecules shown as an SD file`} onClick={() => void saveSdf()}>
+              <ExportButtons name={`${job.id} results`} sheet={() => resultsSheet(table, rows)} />
+              <TextButton onClick={() => void saveSdf()}>
                 <DownloadIcon /> SDF {selected.size ? `(${selected.size})` : `top`}
               </TextButton>
               {!selected.size && (
@@ -297,7 +268,7 @@ export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk 
 
       {continuing === job.id && canResume(job) && (
         <div className="shrink-0 px-3 pb-2">
-          <ContinueRun key={job.id} job={job} seeds={seeds} running={jobs.find((j) => j.type === "optimization" && isActive(j.state)) ?? null} onClose={() => setContinuing(null)} onAsk={onAsk} />
+          <ContinueRun key={job.id} job={job} seeds={seeds} running={runs.find((j) => isActive(j.state)) ?? null} onClose={() => setContinuing(null)} onAsk={onAsk} />
         </div>
       )}
 
@@ -323,10 +294,10 @@ export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk 
               className="bg-sunken border-subtle w-14 rounded-md border px-1.5 py-1 text-[11px] tabular-nums outline-none"
             />
           </label>
-          <Toggle checked={showFailed} onChange={setShowFailed} title="Rows with an invalid SMILES, a duplicate or a component that returned NaN">
+          <Toggle checked={showFailed} onChange={setShowFailed}>
             Failed{table.failed > 0 ? ` ${table.failed.toLocaleString()}` : ""}
           </Toggle>
-          <Toggle checked={unique} onChange={setUnique} title="One row per SMILES: its best scoring one">
+          <Toggle checked={unique} onChange={setUnique}>
             Unique
           </Toggle>
           <div className="relative">
@@ -350,7 +321,7 @@ export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk 
                       <div key={role} className="py-0.5">
                         <p className="text-faint px-3 pt-1 text-[10px] font-semibold tracking-wider uppercase">{ROLE_LABEL[role]}</p>
                         {group.map((c) => (
-                          <label key={c.key} className="hover:bg-sunken flex cursor-pointer items-center gap-2 px-3 py-1" title={c.key}>
+                          <label key={c.key} className="hover:bg-sunken flex cursor-pointer items-center gap-2 px-3 py-1">
                             <input type="checkbox" checked={visibleKeys.has(c.key)} onChange={() => toggleColumn(c.key)} className="accent-[var(--color-accent)]" />
                             <span className="truncate">{c.label}</span>
                           </label>
@@ -408,7 +379,6 @@ export function RunResults({ artifacts, theme, sessionId, onOpenMolecule, onAsk 
                 <SortHeader
                   key={column.key}
                   label={column.label}
-                  title={column.key}
                   align="right"
                   active={sortKey === index}
                   desc={sortDesc}
@@ -485,7 +455,6 @@ function Row({
     <div
       role="row"
       onClick={onOpen}
-      title={onOpen ? "Open the molecule" : undefined}
       className={`border-subtle absolute inset-x-0 grid items-center border-b ${onOpen ? "cursor-pointer" : ""} ${selected ? "bg-inset" : "hover:bg-sunken"} ${row.failure ? "text-faint" : ""}`}
       style={{ top, height: ROW_HEIGHT, gridTemplateColumns: template, boxShadow: row.failure ? "inset 2px 0 0 var(--color-accent)" : undefined }}
     >
@@ -499,9 +468,9 @@ function Row({
         <span className="flex items-center" onClick={(event) => event.stopPropagation()}>
           {row.structure && (
             <>
-              <StructureButton onClick={onOpenStructure} title={`Show ${row.structure} in the viewer`} />
+              <StructureButton onClick={onOpenStructure} />
               {url && (
-                <a href={url} download title="Download the structure file" className="text-faint hover:text-body rounded p-1" aria-label="Download the structure file">
+                <a href={url} download className="text-faint hover:text-body rounded p-1" aria-label="Download the structure file">
                   <DownloadIcon />
                 </a>
               )}
@@ -514,19 +483,18 @@ function Row({
           {formatCell(row.cells[index], integer)}
         </span>
       ))}
-      <span className="truncate px-2 text-[10px]" style={{ color: "var(--color-accent)" }} title={row.failure || undefined}>
+      <span className="truncate px-2 text-[10px]" style={{ color: "var(--color-accent)" }}>
         {row.failure}
       </span>
     </div>
   );
 }
 
-function SortHeader({ label, title, active, desc, align, onClick }: { label: string; title?: string; active: boolean; desc: boolean; align?: "right"; onClick: () => void }) {
+function SortHeader({ label, active, desc, align, onClick }: { label: string; active: boolean; desc: boolean; align?: "right"; onClick: () => void }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      title={title ? `${title} · click to sort` : "Click to sort"}
       aria-sort={active ? (desc ? "descending" : "ascending") : undefined}
       className={`hover:text-body flex h-full min-w-0 cursor-pointer items-center gap-0.5 px-2 ${align === "right" ? "justify-end text-right" : "text-left"} ${active ? "text-body" : ""}`}
     >
@@ -536,9 +504,9 @@ function SortHeader({ label, title, active, desc, align, onClick }: { label: str
   );
 }
 
-function Toggle({ checked, onChange, title, children }: { checked: boolean; onChange: (value: boolean) => void; title?: string; children: ReactNode }) {
+function Toggle({ checked, onChange, children }: { checked: boolean; onChange: (value: boolean) => void; children: ReactNode }) {
   return (
-    <label className="text-muted flex cursor-pointer items-center gap-1" title={title}>
+    <label className="text-muted flex cursor-pointer items-center gap-1">
       <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} className="accent-[var(--color-accent)]" />
       {children}
     </label>

@@ -421,7 +421,7 @@ export function weightRangeOf(all: Objective[]): { min: number; max: number; ste
 }
 
 /** First-class services from KNOWN_EXTERNAL_SERVICES in reinvent4_mcp/ttp/schema.py. */
-export const KNOWN_SERVICES = new Set(["boltz", "posebusters", "admet", "retrodmta", "interaction_profiler"]);
+export const KNOWN_SERVICES = new Set(["boltz", "posebusters", "admet", "retrodmta", "interaction_profiler", "synthesis_planner"]);
 
 /** "native" REINVENT4 component, a configured "service", or a custom "external" REST endpoint. */
 export function objectiveSource(o: Pick<Objective, "type" | "service">): "native" | "service" | "external" {
@@ -435,6 +435,7 @@ const SERVICE_LABELS: Record<string, string> = {
   admet: "ADMET",
   retrodmta: "RetroDMTA",
   interaction_profiler: "Interactions",
+  synthesis_planner: "AiZynthFinder",
 };
 
 /** Where a score comes from, in a word: "RDKit", "Boltz-2", "ADMET", ... */
@@ -577,8 +578,10 @@ export interface ServiceInfo {
   name: string;
   url: string;
   status: string;
-  /** ADMET endpoints. */
+  /** ADMET endpoints for the default (drug) model set, for backward compat. */
   endpoints: string[];
+  /** Per-model-set endpoint lists; present on ADMET only. */
+  model_sets: Record<string, string[]>;
   /** RetroDMTA endpoints by target. */
   targets: Record<string, string[]>;
 }
@@ -597,7 +600,15 @@ export function parseServices(value: unknown): Record<string, ServiceInfo> {
     } else {
       for (const target of strings(entry.targets)) targets[target] = [];
     }
-    services[name] = { name, url: entry.url, status: str(entry.status) ?? "unknown", endpoints: strings(entry.endpoints), targets };
+    // Per-model-set endpoint lists (ADMET only). The health response has
+    // model_sets: { drug: { endpoints: [...] }, agro: { endpoints: [...] } }.
+    const model_sets: Record<string, string[]> = {};
+    if (isRecord(entry.model_sets)) {
+      for (const [ms, detail] of Object.entries(entry.model_sets)) {
+        if (isRecord(detail)) model_sets[ms] = strings((detail as Record<string, unknown>).endpoints);
+      }
+    }
+    services[name] = { name, url: entry.url, status: str(entry.status) ?? "unknown", endpoints: strings(entry.endpoints), model_sets, targets };
   }
   return services;
 }
@@ -676,23 +687,66 @@ const NATIVE_TRANSFORMS: Record<string, Transform | null> = {
 };
 
 const ADMET_TRANSFORMS: Record<string, Transform> = {
+  // Physico-chemical
   logp: { type: "double_sigmoid", low: 1, high: 3, coef_div: 3, coef_si: 10, coef_se: 10 },
   logd: { type: "double_sigmoid", low: 1, high: 3, coef_div: 3, coef_si: 10, coef_se: 10 },
   aqueous_solubility: { type: "sigmoid", low: -6, high: -3, k: 0.5 },
   kinetic_solubility: { type: "sigmoid", low: -6, high: -3, k: 0.5 },
+  // Permeability / efflux
   caco2_permeability: { type: "sigmoid", low: -6.5, high: -4.5, k: 0.5 },
   efflux_mdck: { type: "reverse_sigmoid", low: 0.3, high: 1.3, k: 0.5 },
   efflux_caco2: { type: "reverse_sigmoid", low: 0.3, high: 1.3, k: 0.5 },
+  // CYP inhibition (high pIC50 = strong inhibitor = bad; reward non-inhibitor)
+  CYP1A2: { type: "reverse_sigmoid", low: 4.5, high: 6.0, k: 0.5 },
+  CYP2C9: { type: "reverse_sigmoid", low: 4.5, high: 6.0, k: 0.5 },
+  CYP2D6: { type: "reverse_sigmoid", low: 4.5, high: 6.0, k: 0.5 },
+  CYP3A4: { type: "reverse_sigmoid", low: 4.5, high: 6.0, k: 0.5 },
+  // Cardiac safety (hERG block IC50 as pIC50; reward non-blocker)
+  hERG: { type: "reverse_sigmoid", low: 4.0, high: 5.5, k: 0.5 },
+  // Half-life: predict log(h); reward longer
+  microsomal_half_life: { type: "sigmoid", low: -0.5, high: 1.5, k: 0.5 },
+  plasma_half_life: { type: "sigmoid", low: 0.5, high: 2.5, k: 0.5 },
+  // Plasma protein binding (fraction unbound; reward higher free fraction)
+  PPB: { type: "sigmoid", low: 0.01, high: 0.3, k: 0.5 },
+  // Agro — environmental endpoints
+  BCF: { type: "reverse_sigmoid", low: 1.0, high: 3.5, k: 0.5 },
+  IGC50: { type: "reverse_sigmoid", low: 2.0, high: 4.0, k: 0.5 },
+  bee_LD50: { type: "reverse_sigmoid", low: 1.0, high: 3.5, k: 0.5 },
+  mouse_LD50: { type: "reverse_sigmoid", low: 1.0, high: 3.5, k: 0.5 },
+  rat_LD50: { type: "reverse_sigmoid", low: 1.0, high: 3.5, k: 0.5 },
+  logKoc: { type: "double_sigmoid", low: 1.5, high: 3.5, coef_div: 3.5, coef_si: 10, coef_se: 10 },
 };
 
 const ENDPOINT_NAMES: Record<string, string> = {
+  // Physico-chemical
   logp: "LogP",
   logd: "LogD",
   aqueous_solubility: "Aqueous solubility",
   kinetic_solubility: "Kinetic solubility",
+  // Permeability / efflux
   caco2_permeability: "Caco-2 permeability",
   efflux_mdck: "MDCK efflux",
   efflux_caco2: "Caco-2 efflux",
+  // Metabolism / CYP
+  CYP1A2: "CYP1A2 inhibition",
+  CYP2C9: "CYP2C9 inhibition",
+  CYP2D6: "CYP2D6 inhibition",
+  CYP3A4: "CYP3A4 inhibition",
+  // Cardiac / binding
+  hERG: "hERG block",
+  PPB: "Plasma protein binding",
+  // Half-life
+  microsomal_half_life: "Microsomal half-life",
+  plasma_half_life: "Plasma half-life",
+  // Agro
+  BCF: "Bioconcentration factor",
+  boiling_point: "Boiling point",
+  IGC50: "Algal toxicity (IGC50)",
+  bee_LD50: "Bee LD50",
+  mouse_LD50: "Mouse LD50",
+  rat_LD50: "Rat LD50",
+  logKoc: "Soil adsorption (Koc)",
+  vapor_pressure: "Vapour pressure",
 };
 
 const COMPONENT_NAMES: Record<string, string> = {
@@ -713,6 +767,7 @@ export const DEFAULT_SERVICE_URLS: Record<string, string> = {
   admet: "http://admet-predictor:8084/score",
   retrodmta: "http://retrodmta-predictor:8085/score",
   interaction_profiler: "http://interaction-profiler:8080/score",
+  synthesis_planner: "http://synthesis-planner:8086/score",
 };
 
 const serviceUrl = (services: Record<string, ServiceInfo>, service: string) => services[service]?.url ?? DEFAULT_SERVICE_URLS[service] ?? "";
@@ -726,7 +781,7 @@ export function nativeObjective(component: string, weight = 1): Objective {
   return objective;
 }
 
-export function serviceObjective(services: Record<string, ServiceInfo>, service: string, selector?: string, target?: string): Objective {
+export function serviceObjective(services: Record<string, ServiceInfo>, service: string, selector?: string, target?: string, model_set?: string): Objective {
   const base = { type: "external" as const, service, service_url: serviceUrl(services, service), weight: 1 };
   switch (service) {
     case "boltz":
@@ -743,10 +798,27 @@ export function serviceObjective(services: Record<string, ServiceInfo>, service:
         transform: { type: "sigmoid", low: 0, high: 4, k: 0.5 },
       };
     case "admet": {
-      const endpoint = selector ?? services.admet?.endpoints[0] ?? "logp";
+      const ms = model_set ?? "drug";
+      const defaultEndpoint = services.admet?.model_sets[ms]?.[0] ?? services.admet?.endpoints[0] ?? "logp";
+      const endpoint = selector ?? defaultEndpoint;
       const transform = ADMET_TRANSFORMS[endpoint];
-      return { ...base, name: ENDPOINT_NAMES[endpoint] ?? endpoint, service_params: { endpoint }, transform: transform ? { ...transform } : null };
+      // Include model_set in service_params so the RL scorer uses the right stack.
+      // The drug stack is the default; agro endpoints live only on the agro stack.
+      const sp: Record<string, string> = { endpoint };
+      if (ms !== "drug") sp.model_set = ms;
+      return { ...base, name: ENDPOINT_NAMES[endpoint] ?? endpoint, service_params: sp, transform: transform ? { ...transform } : null };
     }
+    case "synthesis_planner":
+      // Already 0-1 (1.0 = <=2 steps from catalogue stock), so no transform.
+      // iteration_limit stays low: this runs an MCTS search every RL step.
+      return {
+        ...base,
+        name: "Synthesisability",
+        weight: 0.5,
+        service_params: { score_fn: "solved_steps", iteration_limit: 25 },
+        transform: null,
+        comment: "AiZynthFinder route quality, 0-1; real retrosynthesis, not SAScore",
+      };
     case "retrodmta": {
       const endpoint = selector ?? "";
       const potency = /_p(ki|kd|ic50|ec50)$/i.test(endpoint);
@@ -920,8 +992,27 @@ export function objectiveCatalogue(services: Record<string, ServiceInfo>, compon
       }),
     );
   }
-  const endpoints = services.admet?.endpoints.length ? services.admet.endpoints : has("admet") ? Object.keys(ADMET_TRANSFORMS) : [];
-  for (const endpoint of endpoints) entries.push(catalogueEntry("ADMET", ENDPOINT_NAMES[endpoint] ?? endpoint, () => serviceObjective(services, "admet", endpoint)));
+  // ADMET: generate one group per model set so drug and agro scorers are
+  // separate rather than a single mixed list (agro endpoints are meaningless
+  // as drug-discovery scorers, and drug endpoints are absent from the agro
+  // stack). When model_sets is populated use it; fall back to the flat
+  // endpoints list (all drug) for backward compatibility.
+  const admetSets = services.admet?.model_sets ?? {};
+  const admetSetNames = Object.keys(admetSets);
+  if (admetSetNames.length) {
+    for (const ms of admetSetNames) {
+      const groupName = ms === "drug" ? "ADMET" : `ADMET (${ms})`;
+      for (const endpoint of admetSets[ms]) {
+        entries.push(catalogueEntry(groupName, ENDPOINT_NAMES[endpoint] ?? endpoint, () => serviceObjective(services, "admet", endpoint, undefined, ms)));
+      }
+    }
+  } else {
+    const endpoints = services.admet?.endpoints.length ? services.admet.endpoints : has("admet") ? Object.keys(ADMET_TRANSFORMS) : [];
+    for (const endpoint of endpoints) entries.push(catalogueEntry("ADMET", ENDPOINT_NAMES[endpoint] ?? endpoint, () => serviceObjective(services, "admet", endpoint)));
+  }
+  if (has("synthesis_planner")) {
+    entries.push(catalogueEntry("Synthesis", "Synthesisability (AiZynthFinder)", () => serviceObjective(services, "synthesis_planner")));
+  }
   for (const [target, list] of Object.entries(services.retrodmta?.targets ?? {})) {
     for (const endpoint of list.length ? list : [""]) {
       entries.push(catalogueEntry("RetroDMTA", endpoint || target, () => serviceObjective(services, "retrodmta", endpoint || undefined, target)));
@@ -955,19 +1046,25 @@ export const GROUP_COLOURS: Record<string, string> = {
   Cofold: "var(--color-structure)",
   "Drug-likeness": "var(--color-ok)",
   ADMET: "var(--color-table)",
+  "ADMET (agro)": "var(--color-table)",
+  Synthesis: "var(--color-ok)",
   RetroDMTA: "var(--color-molecule)",
 };
 
 /** The picker group an objective belongs to, or null for a custom endpoint. */
-export function objectiveGroup(o: Pick<Objective, "type" | "service">): string | null {
+export function objectiveGroup(o: Pick<Objective, "type" | "service" | "service_params">): string | null {
   if (o.type === "native") return "Drug-likeness";
   switch (o.service) {
     case "boltz":
     case "posebusters":
     case "interaction_profiler":
       return "Cofold";
-    case "admet":
-      return "ADMET";
+    case "admet": {
+      const ms = (o.service_params as Record<string, unknown> | null | undefined)?.model_set;
+      return ms && ms !== "drug" ? `ADMET (${ms})` : "ADMET";
+    }
+    case "synthesis_planner":
+      return "Synthesis";
     case "retrodmta":
       return "RetroDMTA";
     default:

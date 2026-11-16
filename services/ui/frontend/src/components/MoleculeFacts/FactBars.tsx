@@ -40,7 +40,6 @@ export function DetailsColumns({ files, cofold, predictions, properties }: { fil
               <a
                 href={file.url}
                 download={file.name}
-                title={file.name}
                 className="bg-sunken hover:bg-inset text-body flex items-baseline gap-1.5 rounded-full px-2.5 py-0.5 no-underline"
               >
                 {file.label}
@@ -65,7 +64,7 @@ export function FactList({ title, facts, action }: BarGroup & { action?: ReactNo
       </h4>
       <dl>
         {facts.map((fact) => (
-          <div key={fact.label} className="grid grid-cols-[7rem_minmax(0,1fr)] items-center gap-2 leading-5" title={fact.title}>
+          <div key={fact.label} className="grid grid-cols-[7rem_minmax(0,1fr)] items-center gap-2 leading-5">
             <dt className="text-muted truncate">{fact.label}</dt>
             <dd className="flex min-w-0 items-center gap-2">
               <span aria-hidden="true" className={`h-1 w-12 shrink-0 overflow-hidden rounded-full ${fact.bar ? "bg-inset" : ""}`}>

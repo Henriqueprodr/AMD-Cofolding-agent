@@ -30,6 +30,11 @@ export function applyEvent(state: Transcript, event: ConversationEvent): Transcr
 
   switch (event.type) {
     case "user_message":
+      // Sent mid-turn: closing the turn here would strand the results of
+      // the calls still running in it.
+      if (event.interjected && hasOpenTurn(next.turns)) {
+        return withBlock(next, at, event.seq, { kind: "user", id: `u-${event.seq}`, content: event.content });
+      }
       return {
         ...next,
         turns: [...closeOpenTurn(next.turns, at), { role: "user", id: `u-${event.seq}`, content: event.content, at }],
@@ -98,6 +103,11 @@ export function applyEvents(state: Transcript, events: ConversationEvent[]): Tra
 
 function newAgentTurn(seq: number, at: number, auto = false): AgentTurn {
   return { role: "agent", id: `turn-${seq}`, at, blocks: [], done: false, ...(auto ? { auto: true } : {}) };
+}
+
+function hasOpenTurn(turns: Turn[]): boolean {
+  const last = turns[turns.length - 1];
+  return last !== undefined && last.role === "agent" && !last.done;
 }
 
 function closeOpenTurn(turns: Turn[], at: number): Turn[] {

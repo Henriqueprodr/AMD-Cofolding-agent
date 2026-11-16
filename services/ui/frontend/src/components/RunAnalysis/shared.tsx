@@ -3,7 +3,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
-export function Card({ title, actions, children, className = "" }: { title: string; actions?: ReactNode; children: ReactNode; className?: string }) {
+export function Card({ title, actions, children, className = "" }: { title: ReactNode; actions?: ReactNode; children: ReactNode; className?: string }) {
   return (
     <section className={`bg-raised border-subtle min-w-0 rounded-xl border px-3 py-2.5 ${className}`}>
       <div className="mb-1.5 flex min-h-6 flex-wrap items-center gap-x-2 gap-y-1">
@@ -15,7 +15,7 @@ export function Card({ title, actions, children, className = "" }: { title: stri
   );
 }
 
-export function Chip({ label, colour, on, title, onClick, onHover }: { label: string; colour: string; on: boolean; title?: string; onClick: () => void; onHover?: (on: boolean) => void }) {
+export function Chip({ label, colour, on, onClick, onHover }: { label: string; colour: string; on: boolean; onClick: () => void; onHover?: (on: boolean) => void }) {
   return (
     <button
       type="button"
@@ -23,7 +23,6 @@ export function Chip({ label, colour, on, title, onClick, onHover }: { label: st
       onPointerEnter={() => onHover?.(true)}
       onPointerLeave={() => onHover?.(false)}
       aria-pressed={on}
-      title={title ?? label}
       className={`inline-flex max-w-40 cursor-pointer items-center gap-1 rounded-full px-1.5 py-px text-[11px] transition-colors ${on ? "text-body" : "text-faint hover:text-muted"}`}
     >
       <span className="inline-block size-2 shrink-0 rounded-full transition-opacity" style={{ background: colour, opacity: on ? 1 : 0.25 }} />
@@ -69,7 +68,7 @@ export function PickMenu({ label, items, checked, onToggle }: { label: ReactNode
             return (
               <span key={item.key} className="contents">
                 {heading && <span className="text-faint px-1.5 pt-1.5 pb-0.5 text-[10px]">{heading}</span>}
-                <label className="hover:bg-inset flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-0.5" title={item.key}>
+                <label className="hover:bg-inset flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-0.5">
                   <input type="checkbox" checked={checked.has(item.key)} onChange={() => onToggle(item.key)} className="size-3 accent-[var(--color-accent)]" />
                   {item.colour && <span className="inline-block size-2 shrink-0 rounded-full" style={{ background: item.colour }} />}
                   <span className="truncate">{item.label}</span>

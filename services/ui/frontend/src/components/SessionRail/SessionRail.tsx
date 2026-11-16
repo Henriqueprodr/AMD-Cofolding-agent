@@ -4,7 +4,7 @@
 import { useMemo, useState, type ReactNode } from "react";
 import type { SessionRuns, SessionSummary } from "../../types/api";
 import type { AgentInfo } from "../../hooks/useSession";
-import { download, sessionEvents } from "../../lib/api";
+import { download, sessionEvents, stopSession } from "../../lib/api";
 import { downloadReport, printReport, sessionToMarkdown, slug } from "../../lib/exportSession";
 import { SessionDataDialog } from "../SessionData/SessionDataDialog";
 
@@ -68,20 +68,11 @@ export function SessionRail({ sessions, activeId, error, agent, onSelect, onNew,
 
   return (
     <nav aria-label="Conversations" className="border-subtle bg-sunken flex h-full w-60 shrink-0 flex-col border-r">
-      <div className="flex h-14 shrink-0 items-center justify-between px-4">
-        <span className="flex items-center gap-2" title="AI Cofolding Drug Design Agent">
-          <AmdLogo />
-          <span className="text-faint text-[10px] leading-tight font-semibold tracking-wide uppercase">
-            Cofolding
-            <br />
-            agent
-          </span>
-        </span>
+      <div className="flex h-14 shrink-0 items-center justify-end px-4">
         <button
           type="button"
           onClick={onClose}
           aria-label="Hide conversations"
-          title="Hide conversations"
           className="text-muted hover:text-body grid size-8 cursor-pointer place-items-center rounded-lg text-sm"
         >
           ‹
@@ -154,18 +145,6 @@ export function SessionRail({ sessions, activeId, error, agent, onSelect, onNew,
   );
 }
 
-/** The AMD wordmark with its arrow, drawn in the current text colour. */
-function AmdLogo() {
-  return (
-    <svg viewBox="0 0 120 30" className="text-body h-[18px] w-auto" aria-label="AMD" role="img">
-      <text x="0" y="25" fill="currentColor" fontFamily="Arial, Helvetica, sans-serif" fontWeight="700" fontSize="30" letterSpacing="-1">
-        AMD
-      </text>
-      <path d="M92 3h25v25l-7.5-7.5V10.5H99.5Z M92 13.5l6-6v13h13l-6 6H92Z" fill="currentColor" />
-    </svg>
-  );
-}
-
 function SessionItem({
   session,
   active,
@@ -185,6 +164,7 @@ function SessionItem({
   const [draft, setDraft] = useState(session.title);
   const [menu, setMenu] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [preparing, setPreparing] = useState(false);
   const title = session.title || "Untitled conversation";
   const runs = session.runs;
@@ -220,6 +200,19 @@ function SessionItem({
       fail(reason);
     } finally {
       setPreparing(false);
+    }
+  }
+
+  async function stop() {
+    if (!window.confirm(`Stop everything "${title}" set going? Its turn, its campaigns with their sub-agents, and its runs all stop.`)) return;
+    setProblem(null);
+    try {
+      const { campaigns, runs, problems } = await stopSession(session.id);
+      const what = [campaigns.length && `${campaigns.length} campaign${campaigns.length === 1 ? "" : "s"}`, runs.length && `${runs.length} run${runs.length === 1 ? "" : "s"}`].filter(Boolean);
+      setNotice(what.length ? `Stopped ${what.join(" and ")}.` : "Nothing else was running.");
+      if (problems.length) setProblem(problems.join(" "));
+    } catch (reason) {
+      fail(reason);
     }
   }
 
@@ -261,8 +254,7 @@ function SessionItem({
           setEditing(true);
         }}
         aria-current={active || undefined}
-        title={title}
-        className={`flex w-full cursor-pointer items-center gap-2 rounded-md py-1.5 pr-7 pl-2 text-left text-xs touch:min-h-11 ${
+        className={`flex w-full cursor-pointer items-center gap-2 rounded-md py-1.5 pr-7 pl-2 text-left text-xs group-hover:pr-13 touch:min-h-11 touch:pr-13 ${
           active ? "bg-raised shadow-card font-semibold" : "hover:bg-inset"
         }`}
       >
@@ -273,7 +265,6 @@ function SessionItem({
         </span>
         {session.busy || running ? (
           <span
-            title={session.busy ? "Working" : "Run in progress"}
             aria-label={session.busy ? "Working" : "Run in progress"}
             className="size-1.5 shrink-0 animate-pulse rounded-full"
             style={{ background: "var(--color-accent)" }}
@@ -281,6 +272,16 @@ function SessionItem({
         ) : (
           <span className="text-faint shrink-0 text-[10px] font-normal">{timeLabel(session.updated)}</span>
         )}
+      </button>
+
+      <button
+        type="button"
+        onClick={stop}
+        aria-label={`Stop everything ${title} set going`}
+        title="Stop everything it set going"
+        className="text-muted hover:text-body absolute top-1/2 right-7 grid size-6 -translate-y-1/2 cursor-pointer place-items-center rounded opacity-0 group-hover:opacity-100 focus:opacity-100 touch:opacity-100"
+      >
+        <span aria-hidden="true" className="size-2 rounded-[1px] bg-current" />
       </button>
 
       <button
@@ -331,6 +332,11 @@ function SessionItem({
       )}
 
       {preparing && <p className="text-faint px-2 pb-1 text-[10px]">Preparing the report…</p>}
+      {notice && (
+        <p role="status" className="text-faint px-2 pb-1 text-[10px]">
+          {notice}
+        </p>
+      )}
       {problem && (
         <p role="alert" className="px-2 pb-1 text-[10px]" style={{ color: "var(--color-accent)" }}>
           {problem}
@@ -344,7 +350,7 @@ function SessionItem({
 function RunCount({ runs }: { runs: SessionRuns }) {
   const label = `${runs.total} REINVENT run${runs.total === 1 ? "" : "s"}${runs.running ? `, ${runs.running} running` : ""}`;
   return (
-    <span className="text-faint inline-flex shrink-0 items-center gap-0.5 text-[10px] font-normal tabular-nums" title={label} aria-label={label}>
+    <span className="text-faint inline-flex shrink-0 items-center gap-0.5 text-[10px] font-normal tabular-nums" aria-label={label}>
       <svg viewBox="0 0 12 12" className="size-2.5" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
         <path d="M1.5 9.5 4.5 6l2 2 4-5" strokeLinecap="round" strokeLinejoin="round" />
       </svg>

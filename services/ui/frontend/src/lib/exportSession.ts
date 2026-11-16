@@ -41,6 +41,9 @@ export function sessionToMarkdown(session: SessionSummary, events: ConversationE
         case "cancelled":
           lines.push("> Stopped by the user.", "");
           break;
+        case "user":
+          lines.push("## Question (sent while the agent worked)", "", block.content, "");
+          break;
         case "thinking":
           break;
       }

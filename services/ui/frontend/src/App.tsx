@@ -10,6 +10,7 @@ import { SessionRail } from "./components/SessionRail/SessionRail";
 import { Transcript } from "./components/Transcript/Transcript";
 import { Composer, type ComposerHandle } from "./components/Composer/Composer";
 import { RunBar } from "./components/RunBar/RunBar";
+import { SubAgents } from "./components/SubAgents/SubAgents";
 import { Workbench, type WorkbenchTab } from "./components/Workbench/Workbench";
 import { CommandPalette, type PaletteItem } from "./components/CommandPalette/CommandPalette";
 import type { Effort, SessionSummary, StructurePanel } from "./types/api";
@@ -17,9 +18,12 @@ import { collectArtifacts, keepUnchanged, runOf, sameFile, structureTitle } from
 import { candidatesOf } from "./lib/candidates";
 import { availableCommands, VIEW_PREFIX } from "./lib/commands";
 import { onOpenRequest, sendToViewer } from "./lib/viewerBus";
-import { focusRun, onWorkbenchRequest } from "./lib/workbenchBus";
+import { focusAgent, focusRun, focusTask, onWorkbenchRequest, openAgentChat, useAgentChat } from "./lib/workbenchBus";
 import { parseViewerCommand, VIEWER_HELP, type ViewerAction } from "./lib/viewerCommands";
-import { download, sessionEvents } from "./lib/api";
+import { download, sendTaskMessage, sessionEvents } from "./lib/api";
+import { agentLabels, workingAgents } from "./lib/fleet";
+import { useCampaigns } from "./hooks/useCampaignJobs";
+import { reloadTaskConversation } from "./hooks/useTaskConversations";
 import { downloadReport, printReport, sessionToMarkdown, slug } from "./lib/exportSession";
 import { useUserStructures, withUserStructures } from "./lib/userStructures";
 import { setShortlistSession } from "./lib/shortlist";
@@ -90,15 +94,25 @@ export default function App() {
   const activeStructure = picked ?? artifacts.structures[0]?.item ?? null;
   const molecules = useMemo(() => candidatesOf(artifacts).map((c) => ({ smiles: c.smiles, label: c.name })), [artifacts]);
 
-  const hint = useCallback((message: string) => setHints((list) => [...list.slice(-2), { id: Date.now(), message }]), []);
+  // Counted, not clocked: two hints raised in the same millisecond -- a poll
+  // failing while the gateway is down, raised twice over a StrictMode double
+  // render -- took the same id from Date.now() and collided as React keys.
+  const nextHint = useRef(0);
+  const hint = useCallback((message: string) => {
+    const id = (nextHint.current += 1);
+    setHints((list) => [...list.slice(-2), { id, message }]);
+  }, []);
   const dismissHint = useCallback((id: number) => setHints((list) => list.filter((entry) => entry.id !== id)), []);
 
   const open = useCallback((id: string | null) => {
     setRequest((previous) => ({ id, nonce: previous.nonce + 1 }));
     setPicked(null);
     setSelectedSmiles(null);
-    // A job picked in one conversation is not the job of the next.
+    // A job or a task picked in one conversation is not the next one's.
     focusRun(null);
+    focusTask(null);
+    focusAgent(null);
+    openAgentChat(null);
     if (!wide()) setRailOpen(false);
   }, []);
 
@@ -142,11 +156,30 @@ export default function App() {
 
   const view = useCallback((action: ViewerAction) => sendToViewer({ action, source: "palette" }), []);
 
-  /** "/view …" runs on the viewer, here; everything else goes to the agent. */
+  const chattingWith = useAgentChat();
+  const { details: campaigns } = useCampaigns(session?.id ?? null);
+  const subagentTask = useMemo(
+    () => (chattingWith ? (workingAgents(campaigns, agentLabels(campaigns)).find((one) => one.agent === chattingWith)?.taskId ?? null) : null),
+    [chattingWith, campaigns],
+  );
+
+  /** "/view …" runs on the viewer, here; everything else goes to whichever agent's conversation is open. */
   const { send: sendToAgent } = chat;
   const send = useCallback(
     (text: string, effort?: Effort | null) => {
-      if (!text.toLowerCase().startsWith(VIEW_PREFIX)) return sendToAgent(text, effort);
+      if (!text.toLowerCase().startsWith(VIEW_PREFIX)) {
+        if (chattingWith) {
+          if (!subagentTask) {
+            hint(`${chattingWith} is not working on a task now, so nothing would read it. Go back to the conductor to send it there.`);
+            return false;
+          }
+          void sendTaskMessage(subagentTask, text)
+            .then(() => reloadTaskConversation(subagentTask))
+            .catch((reason) => hint(`Not sent to ${chattingWith}: ${reason instanceof Error ? reason.message : reason}`));
+          return true;
+        }
+        return sendToAgent(text, effort);
+      }
       const command = text.slice(VIEW_PREFIX.length).trim();
       const action = parseViewerCommand(command || "help");
       if (!action) {
@@ -156,7 +189,7 @@ export default function App() {
       sendToViewer({ action, source: "composer" });
       return true;
     },
-    [sendToAgent, hint],
+    [sendToAgent, hint, chattingWith, subagentTask],
   );
 
   const openMolecule = useCallback(
@@ -289,6 +322,7 @@ export default function App() {
     selectedSmiles,
     onSelectSmiles: setSelectedSmiles,
     onAsk: ask,
+    campaignLog: transcript.campaign,
   };
 
   const rail = (
@@ -329,13 +363,11 @@ export default function App() {
             agent={agent}
             gatewayError={chat.gatewayError}
             title={session?.title ?? ""}
-            busy={busy}
             onReconnect={chat.reconnect}
             railOpen={railOpen}
             onToggleRail={() => setRailOpen((value) => !value)}
             workbenchOpen={wide() ? workbenchOpen : sheetOpen}
             onToggleWorkbench={() => (wide() ? setWorkbenchOpen((value) => !value) : setSheetOpen((value) => !value))}
-            onOpenPalette={() => setPaletteOpen(true)}
           />
           {chat.gatewayError && (
             <p role="alert" className="border-subtle border-b px-4 py-1.5 text-center text-xs" style={{ background: "var(--color-accent-soft)" }}>
@@ -363,6 +395,7 @@ export default function App() {
               </button>
             )}
           </div>
+          <SubAgents sessionId={session?.id ?? null} steps={artifacts.steps} />
           <RunBar sessionId={session?.id ?? null} steps={artifacts.steps} turnAt={turnAt} onNotice={hint} />
           <Composer
             ref={composerRef}
@@ -370,7 +403,8 @@ export default function App() {
             onChange={setDraft}
             onSend={send}
             onStop={chat.cancel}
-            busy={busy}
+            busy={chattingWith ? false : busy}
+            recipient={chattingWith}
             connected={connected}
             tools={agent?.tools ?? NO_TOOLS}
             theme={theme}

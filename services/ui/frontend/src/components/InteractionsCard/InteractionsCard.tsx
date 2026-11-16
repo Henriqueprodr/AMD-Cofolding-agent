@@ -40,7 +40,7 @@ export function InteractionsCard({ panel }: { panel: InteractionsPanel }) {
       <header className="flex items-baseline gap-2 px-3 pt-2 pb-1">
         <span className="min-w-0 truncate text-xs font-semibold">{name ?? "Contacts"}</span>
         {structure && (
-          <span className="text-faint min-w-0 truncate text-[11px]" title={path ?? undefined}>
+          <span className="text-faint min-w-0 truncate text-[11px]">
             {structure}
           </span>
         )}
@@ -49,6 +49,8 @@ export function InteractionsCard({ panel }: { panel: InteractionsPanel }) {
         <p className={`px-3 pb-2.5 text-xs ${error.quiet ? "text-muted" : ""}`} style={error.quiet ? undefined : { color: "var(--color-accent)" }}>
           {error.text}
         </p>
+      ) : !path ? (
+        <p className="text-muted px-3 pb-2.5 text-xs">Profiled from the SMILES alone, without a structure, so there are no contacts to show.</p>
       ) : (
         <div className="space-y-1.5 px-3 py-1.5">
           <div className="flex flex-wrap gap-1">
@@ -57,7 +59,6 @@ export function InteractionsCard({ panel }: { panel: InteractionsPanel }) {
                 key={type}
                 type="button"
                 onClick={() => sendToViewer({ path, action: { kind: "contacts", type }, source: "chat" })}
-                title={`Show only the ${contactLabel(type).toLowerCase()} contacts on the structure`}
                 className="bg-sunken hover:bg-inset flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 text-[11px]"
               >
                 <span className="size-2 rounded-full" style={{ background: contactColor(type) }} />
@@ -81,7 +82,6 @@ export function InteractionsCard({ panel }: { panel: InteractionsPanel }) {
                         source: "chat",
                       })
                     }
-                    title={`${[...residue.types].map(contactLabel).join(", ")}${name.file !== null ? ` · residue ${name.file} in the file` : ""}`}
                     className="hover:bg-inset flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[11px]"
                   >
                     {[...residue.types].slice(0, 3).map((type) => (
@@ -95,7 +95,7 @@ export function InteractionsCard({ panel }: { panel: InteractionsPanel }) {
           )}
         </div>
       )}
-      {!error && (
+      {!error && path && (
         <footer className="flex gap-1 px-3 pt-0.5 pb-2">
           <button
             type="button"

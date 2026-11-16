@@ -6,6 +6,8 @@ import { callTool } from "../../lib/api";
 import { moleculesFromFile } from "../../lib/dropFiles";
 import { readSeedFile } from "../../lib/sharedFiles";
 import { useShortlist, useShortlistSession } from "../../lib/shortlist";
+import { fragmentList, fragmentProblems, numberFragments, scaffoldProblems } from "../../lib/attachment";
+import { sketchFor } from "../../lib/sketcherBus";
 import { asTtpList, type TtpSummary } from "../../lib/ttp";
 import {
   MAX_BATCH,
@@ -33,6 +35,8 @@ const int = (n: number) => n.toLocaleString("en");
 const PRIORS: [Prior, string][] = [
   ["reinvent", "From scratch"],
   ["mol2mol", "Analogues of my molecules"],
+  ["libinvent", "Decorate a scaffold"],
+  ["linkinvent", "Link two fragments"],
 ];
 
 interface FieldsProps {
@@ -107,6 +111,9 @@ export function RunFields({ run, models, cofold = false, mol2molOnly = false, mo
         )}
       </div>
       {run.prior === "mol2mol" && <Seeds seeds={run.seeds} molecules={molecules} onChange={(seeds) => onChange({ seeds })} />}
+      {(run.prior === "libinvent" || run.prior === "linkinvent") && (
+        <Scaffold prior={run.prior} value={run.scaffold} molecules={molecules} onChange={(scaffold) => onChange({ scaffold })} />
+      )}
     </>
   );
 }
@@ -114,6 +121,105 @@ export function RunFields({ run, models, cofold = false, mol2molOnly = false, mo
 type Reading = { state: "idle" } | { state: "busy" } | { state: "done"; text: string } | { state: "error"; text: string };
 
 /** Seed SMILES from the conversation's molecules, a file, or typed. */
+/**
+ * The structure LibInvent decorates or LinkInvent joins.
+ *
+ * Drawn rather than typed where possible: both refuse a bare `[*]`, and
+ * hand-numbering attachment points in a SMILES string is where this goes
+ * wrong. The sketcher numbers them on the way out.
+ */
+function Scaffold({
+  prior,
+  value,
+  molecules,
+  onChange,
+}: {
+  prior: "libinvent" | "linkinvent";
+  value: string;
+  molecules?: SeedMolecule[];
+  onChange: (value: string) => void;
+}) {
+  const linker = prior === "linkinvent";
+  const fragments = fragmentList(value);
+  const problems = linker ? fragmentProblems(fragments) : scaffoldProblems(value);
+  const [deriving, setDeriving] = useState(false);
+  const [deriveNote, setDeriveNote] = useState<string | null>(null);
+
+  const draw = () =>
+    sketchFor(linker ? "fragment" : "scaffold", undefined, (drawn) => {
+      if (!linker) {
+        onChange(drawn);
+        return;
+      }
+      // Renumbered across the pair: each fragment is drawn on its own, so
+      // both come back as [*:1] and LinkInvent cannot tell the ends apart.
+      onChange(numberFragments([...fragments, drawn]).join(" | "));
+    });
+
+  const derive = async () => {
+    const smiles = (molecules ?? []).map((m) => m.smiles).filter(Boolean);
+    if (!smiles.length) return;
+    setDeriving(true);
+    setDeriveNote(null);
+    try {
+      const res = await callTool("derive_scaffold_from_series", { smiles });
+      const data = res.result as Record<string, unknown>;
+      if (typeof data.error === "string") {
+        setDeriveNote(data.error);
+      } else if (typeof data.scaffold === "string") {
+        onChange(data.scaffold);
+        const note = typeof data.note === "string" ? data.note : null;
+        const cov = typeof data.coverage === "number" ? ` Coverage: ${Math.round(data.coverage * 100)}%.` : "";
+        setDeriveNote((note ?? "") + cov || null);
+      }
+    } catch (err) {
+      setDeriveNote(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeriving(false);
+    }
+  };
+
+  const canDerive = !linker && (molecules?.length ?? 0) >= 2;
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <input
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={linker ? "[*:1]CC | [*:2]OC" : "[*:1]c1ccccc1[*:2]"}
+          aria-label={linker ? "Fragments to link" : "Scaffold to decorate"}
+          spellCheck={false}
+          className={`${INPUT} min-w-40 flex-1 font-mono text-[10px]`}
+        />
+        <button type="button" onClick={draw} className={ACTION}>
+          {linker ? (fragments.length ? "Draw the other" : "Draw a fragment") : "Draw"}
+        </button>
+        {canDerive && (
+          <button type="button" onClick={() => void derive()} disabled={deriving} className={ACTION} title="Derive the common scaffold from this conversation's molecules">
+            {deriving ? "Deriving…" : "Derive from series"}
+          </button>
+        )}
+      </div>
+      <p className="text-faint text-[10px]">
+        {linker
+          ? "Two fragments, each with one attachment point where the linker joins."
+          : "Mark every position to decorate with a numbered attachment point."}
+      </p>
+      {deriveNote && (
+        <p className="text-faint text-[10px]" aria-live="polite">{deriveNote}</p>
+      )}
+      {problems.length > 0 && value.trim() !== "" && (
+        <ul className="text-[10px]" style={{ color: "var(--color-accent)" }}>
+          {problems.map((p) => (
+            <li key={p}>{p}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function Seeds({ seeds, molecules, onChange }: { seeds: string; molecules?: SeedMolecule[]; onChange: (seeds: string) => void }) {
   const shortlist = useShortlist(useShortlistSession());
   const chat = seedChoices(molecules, shortlist);
@@ -154,7 +260,6 @@ function Seeds({ seeds, molecules, onChange }: { seeds: string; molecules?: Seed
                 key={m.smiles}
                 type="button"
                 aria-pressed={on}
-                title={m.smiles}
                 onClick={() => onChange(on ? removeSeed(seeds, m.smiles) : addSeeds(seeds, [m.smiles]))}
                 className={`max-w-40 cursor-pointer truncate rounded-full border px-2 py-px text-[10px] ${on ? "border-strong bg-sunken text-body font-medium" : "border-subtle text-muted hover:text-body"} ${m.label ? "" : "font-mono"}`}
               >
@@ -316,7 +421,7 @@ export function RunCard({ ttp, preferTtpId, seeds, molecules, cofold, onAsk, onC
         <p className="min-w-0 flex-1 text-[11px]" style={{ color: "var(--color-accent)" }}>
           {shown}
         </p>
-        <button type="button" onClick={put} title="Put the run request in the message box" className={ACTION} style={{ borderColor: "var(--color-accent)", color: "var(--color-accent)" }}>
+        <button type="button" onClick={put} className={ACTION} style={{ borderColor: "var(--color-accent)", color: "var(--color-accent)" }}>
           Put in chat
         </button>
       </div>

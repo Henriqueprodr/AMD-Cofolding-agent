@@ -98,8 +98,7 @@ export function TransformCurve({ transform, width = 200, height = 56, weight = 1
           </g>
         );
       })}
-      <rect x={width - PAD - BAR} y={PAD} width={BAR} height={height - 2 * PAD} rx={1.5} fill="var(--surface-inset)">
-        <title>{`weight ${Math.round(w * 100)}% of the largest`}</title>
+      <rect x={width - PAD - BAR} y={PAD} width={BAR} height={height - 2 * PAD} rx={1.5} fill="var(--surface-inset)">
       </rect>
       <rect x={width - PAD - BAR} y={PAD + (1 - w) * (height - 2 * PAD)} width={BAR} height={w * (height - 2 * PAD)} rx={1.5} fill="var(--color-table)" />
       {!compact && (

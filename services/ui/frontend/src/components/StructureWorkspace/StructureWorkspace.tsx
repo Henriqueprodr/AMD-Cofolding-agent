@@ -17,8 +17,10 @@ import {
   type Comparison,
   type Picked,
   type Residue,
+  type Stacked,
   type ViewStyleName,
 } from "../../lib/molstar";
+import { basketColour, basketEntries, toggleShown, type BasketEntry } from "../../lib/basket";
 import { VIEWER_HELP, type ViewerAction } from "../../lib/viewerCommands";
 import { onViewerRequest } from "../../lib/viewerBus";
 import { contactColor, contactLabel, contactLines, matchesTypes, residuesOf, sortedTypes, toggleType } from "../../lib/contacts";
@@ -46,6 +48,8 @@ interface Props {
   properties?: Sourced<PropertiesPanel>[];
   /** The target's canonical UniProt sequence, when the conversation looked it up. */
   targetSequence?: string | null;
+  /** The target's PDB entries, best first, which the basket offers. */
+  targetPdbIds?: string[];
   /** The conversation, for structures the user brings in; null before it has an id. */
   sessionId?: string | null;
   theme: Theme;
@@ -79,6 +83,8 @@ const COLOR_LABELS: Record<ColorName, string> = {
 const OPEN_PDB = "\u0000open-pdb";
 type Side = "primary" | "other";
 
+const colourNumber = (colour: string | null) => Number.parseInt((colour ?? "#888888").slice(1), 16);
+
 const sameResidue = (r: { chain?: string | null; resnum: number }, c: Contact) =>
   c.resnum === r.resnum && (!r.chain || !c.chain || c.chain === r.chain);
 const residueKey = (chain: string | null | undefined, resnum: number | null) => `${chain ?? ""}:${resnum}`;
@@ -88,7 +94,7 @@ const residueKey = (chain: string | null | undefined, resnum: number | null) => 
  * conversation, with quick views on it, and its contacts, details and files
  * under it.
  */
-export function StructureWorkspace({ structures, active, onSelect, interactions, properties, targetSequence, sessionId, theme, onAsk }: Props) {
+export function StructureWorkspace({ structures, active, onSelect, interactions, properties, targetSequence, targetPdbIds, sessionId, theme, onAsk }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<StructureView | null>(null);
   const pendingRef = useRef<ViewerAction | null>(null);
@@ -119,6 +125,11 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
   const [compare, setCompare] = useState<{ primary: string; other: StructurePanel } | null>(null);
   const [comparison, setComparison] = useState<{ key: string; result: Comparison | null; error?: string } | null>(null);
   const [hiddenSides, setHiddenSides] = useState<{ key: string; sides: Side[] } | null>(null);
+  /** Shown with the active structure and superposed on it, in the order they were ticked. */
+  const [stacked, setStacked] = useState<string[]>([]);
+  /** PDB entries fetched from the basket, until the conversation's list has them. */
+  const [fetched, setFetched] = useState<StructurePanel[]>([]);
+  const [stackResult, setStackResult] = useState<{ key: string; placed: Stacked[] } | null>(null);
 
   const profile = useMemo(() => contactsFor(active, interactions), [active, interactions]);
   const numbering = useMemo(
@@ -294,9 +305,79 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
     viewRef.current?.setCompareVisible(side, !sides.includes(side));
   };
 
+  const say = (text: string, tone: "ok" | "bad" = "ok", ask?: string) => setMessage({ id: Date.now(), text, tone, ask });
+
   const compareWith = (panel: StructurePanel) => {
+    setStacked([]);
     setCompare({ primary: active.path, other: panel });
     setHiddenSides(null);
+  };
+
+  const panels = useMemo(() => {
+    const seen = new Set<string>();
+    return [...structures.map(({ item }) => item), active, ...fetched].filter((panel) => !seen.has(panel.path) && Boolean(seen.add(panel.path)));
+  }, [structures, active, fetched]);
+  const entries = useMemo(() => basketEntries(panels, targetPdbIds ?? [], structureTitle), [panels, targetPdbIds]);
+  const others = stacked.filter((path) => path !== active.path && panels.some((panel) => panel.path === path));
+  const shown = [active.path, ...others];
+  const stackKey = others.length ? shown.join("\u0000") : null;
+  const placed = stackResult && stackResult.key === stackKey ? stackResult.placed : null;
+
+  // Drawn again after each load, like the comparison: a load clears the viewport.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !loaded) return;
+    if (!stackKey) {
+      // A comparison being drawn takes the stack down itself; unstacking here would cancel it.
+      if (view.stacking && !comparing) void view.unstack();
+      return;
+    }
+    // others only names paths panels holds, so the results line up with it.
+    const items = others.map((path) => {
+      const panel = panels.find((one) => one.path === path) as StructurePanel;
+      return { url: panel.url, format: panel.format, label: structureTitle(panel), color: colourNumber(basketColour(shown, path)) };
+    });
+    let stale = false;
+    view
+      .stack(colourNumber(basketColour(shown, active.path)), items)
+      .then((result) => {
+        if (!stale && result) setStackResult({ key: stackKey, placed: result });
+      })
+      .catch((reason: unknown) => {
+        if (!stale) say(`Could not overlay them: ${reason instanceof Error ? reason.message : String(reason)}`, "bad");
+      });
+    return () => {
+      stale = true;
+    };
+    // others, panels and shown are what stackKey names.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, loads, stackKey]);
+
+  const tick = async (entry: BasketEntry) => {
+    let panel = entry.kind === "structure" ? entry.panel : null;
+    if (entry.kind === "pdb") {
+      say(`Fetching ${entry.id} from the PDB…`);
+      try {
+        const got = await fetchPdbEntry(entry.id, sessionId ?? "new");
+        setFetched((list) => [...list.filter((one) => one.path !== got.path), got]);
+        panel = got;
+      } catch (reason) {
+        say(reason instanceof Error ? reason.message : String(reason), "bad");
+        return;
+      }
+    }
+    if (!panel) return;
+    setCompare(null);
+    if (panel.path !== active.path) {
+      // From the latest list: another tick may have landed while this one fetched.
+      const path = panel.path;
+      setStacked((list) => toggleShown([active.path, ...list.filter((one) => one !== active.path)], path).slice(1));
+      return;
+    }
+    const next = toggleShown(shown, panel.path);
+    const first = panels.find((one) => one.path === next[0]);
+    if (first && first.path !== active.path) onSelect(first);
+    setStacked(next.slice(1));
   };
 
   const comparePdb = async (id: string) => {
@@ -316,8 +397,6 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
     const timer = window.setTimeout(() => setMessage(null), message.ask ? 9000 : 4500);
     return () => window.clearTimeout(timer);
   }, [message]);
-
-  const say = (text: string, tone: "ok" | "bad" = "ok", ask?: string) => setMessage({ id: Date.now(), text, tone, ask });
 
   const openDetails = (tab: DrawerTab) => {
     setDrawerTab(tab);
@@ -562,7 +641,6 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
               if (next) onSelect(next.item);
             }}
             aria-label="Structure"
-            title={active.path}
             className="hover:bg-inset text-body min-w-0 flex-1 cursor-pointer truncate rounded-md bg-transparent px-1 py-0.5 text-[13px] font-semibold outline-none"
           >
             {index < 0 && <option value={active.path}>{structureOption(title, active.path, runOf(active.path))}</option>}
@@ -576,7 +654,7 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
           </select>
         )}
         {kind && (
-          <span className="bg-inset text-muted shrink-0 rounded-full px-1.5 py-px text-[10px] whitespace-nowrap" title={STRUCTURE_KINDS[kind].hint}>
+          <span className="bg-inset text-muted shrink-0 rounded-full px-1.5 py-px text-[10px] whitespace-nowrap">
             {STRUCTURE_KINDS[kind].label}
           </span>
         )}
@@ -592,7 +670,6 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
               if (other) compareWith(other.item);
             }}
             aria-label="Compare with"
-            title="Overlay another structure, superposed by the protein"
             className={`w-[4.6rem] shrink-0 cursor-pointer rounded-md px-1 py-1 text-[11px] outline-none ${comparing ? "bg-inset text-body" : "text-muted hover:text-body hover:bg-inset bg-transparent"}`}
           >
             <option value="" disabled hidden>
@@ -613,11 +690,41 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
         </a>
         <HeadButton
           label="Display"
-          title="Show or hide the Mol* controls"
           pressed={controls}
           onClick={() => execute({ kind: "controls", on: !controls })}
         />
       </header>
+
+      {entries.length > 1 && (
+        <div role="group" aria-label="Basket" className="border-subtle flex shrink-0 items-center gap-1 overflow-x-auto border-b px-3 py-1">
+          <span className="text-faint shrink-0 pr-1 text-[10px] font-semibold tracking-wide uppercase">Basket</span>
+          {entries.map((entry) => {
+            const colour = basketColour(shown, entry.key);
+            const fit = placed?.[others.indexOf(entry.key)];
+            const note = fit ? (fit.superposed ? (fit.caRmsd !== null ? `${fit.caRmsd.toFixed(1)} Å` : null) : "not superposed") : null;
+            return (
+              <button
+                key={entry.key}
+                type="button"
+                aria-pressed={colour !== null}
+                onClick={() => void tick(entry)}
+                title={
+                  fit && !fit.superposed
+                    ? "Its protein shares too little with the first one's to superpose; it is drawn in its own frame."
+                    : colour
+                      ? "Shown; click to take it out"
+                      : "Show it with the others"
+                }
+                className={`flex max-w-[15rem] shrink-0 cursor-pointer items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] ${colour ? "border-strong text-body" : "border-subtle text-muted hover:text-body"}`}
+              >
+                <span aria-hidden="true" className="size-2.5 shrink-0 rounded-full border" style={{ background: colour ?? "transparent", borderColor: colour ?? "currentColor" }} />
+                <span className="truncate">{entry.label}</span>
+                {note && <span className="text-faint shrink-0 text-[10px]">{note}</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       <div className="relative min-h-[280px] flex-1 overflow-hidden" style={{ background: `#${backgroundValue.toString(16).padStart(6, "0")}` }}>
         <div ref={hostRef} className="molstar-host absolute inset-0" />
@@ -651,12 +758,12 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
         )}
 
         <div className="absolute top-2 left-2 z-20 flex flex-wrap gap-1">
-          <OverlayButton label="Fit" title="The whole complex" onClick={() => execute({ kind: "fit" })} />
-          <OverlayButton label="Ligand" title="Focus the ligand and its contacts" onClick={() => execute({ kind: "ligand" })} />
-          <OverlayButton label="Pocket" title="Residues within 5 Å of the ligand" onClick={() => execute({ kind: "pocket", radius: 5 })} />
-          <OverlayButton label="Details" title="Contacts and details" pressed={detailsOpen} onClick={() => setDetailsOpen((open) => !open)} />
+          <OverlayButton label="Fit" onClick={() => execute({ kind: "fit" })} />
+          <OverlayButton label="Ligand" onClick={() => execute({ kind: "ligand" })} />
+          <OverlayButton label="Pocket" onClick={() => execute({ kind: "pocket", radius: 5 })} />
+          <OverlayButton label="Details" pressed={detailsOpen} onClick={() => setDetailsOpen((open) => !open)} />
           <div className="relative">
-            <OverlayButton label="Style ▾" title="Representation, colours and background" pressed={menuOpen} onClick={() => setMenuOpen((open) => !open)} />
+            <OverlayButton label="Style ▾" pressed={menuOpen} onClick={() => setMenuOpen((open) => !open)} />
             {menuOpen && (
               <StyleMenu
                 style={style}
@@ -675,7 +782,6 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
         {comparing && loaded && (
           <CompareLegend
             names={{ primary: structureOption(title, active.path, runOf(active.path)), other: structureOption(structureTitle(comparing), comparing.path, runOf(comparing.path)) }}
-            paths={{ primary: active.path, other: comparing.path }}
             result={compared?.result ?? null}
             error={compared?.error ?? null}
             hidden={hidden}
@@ -692,7 +798,7 @@ export function StructureWorkspace({ structures, active, onSelect, interactions,
             {pickedContacts.length > 0 && (
               <span className="flex items-center gap-1">
                 {[...new Set(pickedContacts.map((c) => c.type))].map((type) => (
-                  <span key={type} className="size-2 rounded-full" title={contactLabel(type)} style={{ background: contactColor(type, theme) }} />
+                  <span key={type} className="size-2 rounded-full" style={{ background: contactColor(type, theme) }} />
                 ))}
                 <span className="text-muted">{pickedContacts.length} contact{pickedContacts.length === 1 ? "" : "s"}</span>
               </span>
@@ -834,7 +940,6 @@ const SIDE_COLORS: Record<Side, string> = { primary: "var(--color-molecule)", ot
 /** The two structures of an overlay, each a toggle, and how far apart they are. */
 function CompareLegend({
   names,
-  paths,
   result,
   error,
   hidden,
@@ -842,7 +947,6 @@ function CompareLegend({
   onClose,
 }: {
   names: Record<Side, string>;
-  paths: Record<Side, string>;
   result: Comparison | null;
   error: string | null;
   hidden: Side[];
@@ -861,7 +965,6 @@ function CompareLegend({
                 type="button"
                 aria-pressed={!off}
                 onClick={() => onToggle(side)}
-                title={`${off ? "Show" : "Hide"} ${paths[side]}`}
                 className="flex w-full min-w-0 cursor-pointer items-center gap-1.5 py-px text-left"
               >
                 <span
@@ -874,7 +977,7 @@ function CompareLegend({
             );
           })}
         </div>
-        <button type="button" aria-label="Stop comparing" title="Back to one structure" onClick={onClose} className="text-muted hover:text-body cursor-pointer px-1 leading-none">
+        <button type="button" aria-label="Stop comparing" onClick={onClose} className="text-muted hover:text-body cursor-pointer px-1 leading-none">
           ×
         </button>
       </div>
@@ -888,12 +991,12 @@ function CompareLegend({
         ) : (
           <>
             {result.ligandRmsd !== null && (
-              <span title="Ligand heavy atoms, symmetry-corrected, after superposing the proteins">
+              <span>
                 ligand RMSD <span className="text-body font-mono">{result.ligandRmsd.toFixed(2)} Å</span>
                 {" · "}
               </span>
             )}
-            <span title={`CA atoms of ${result.core} of ${result.aligned} residues aligned by sequence`}>
+            <span>
               CA <span className="font-mono">{result.caRmsd?.toFixed(2)} Å</span>
             </span>
           </>
@@ -932,11 +1035,10 @@ function PdbForm({ action, onOpen, onCancel }: { action: string; onOpen: (id: st
   );
 }
 
-function HeadButton({ label, title, onClick, pressed }: { label: string; title: string; onClick: () => void; pressed?: boolean }) {
+function HeadButton({ label, onClick, pressed }: { label: string; onClick: () => void; pressed?: boolean }) {
   return (
     <button
       type="button"
-      title={title}
       aria-pressed={pressed}
       onClick={onClick}
       className={`shrink-0 cursor-pointer rounded-md px-2 py-1 text-[11px] ${pressed ? "bg-inset text-body" : "text-muted hover:text-body hover:bg-inset"}`}
@@ -946,11 +1048,10 @@ function HeadButton({ label, title, onClick, pressed }: { label: string; title: 
   );
 }
 
-function OverlayButton({ label, title, onClick, pressed }: { label: string; title: string; onClick: () => void; pressed?: boolean }) {
+function OverlayButton({ label, onClick, pressed }: { label: string; onClick: () => void; pressed?: boolean }) {
   return (
     <button
       type="button"
-      title={title}
       aria-pressed={pressed}
       onClick={onClick}
       className={`bg-raised cursor-pointer rounded px-2 py-0.5 text-[11px] shadow-sm ${pressed ? "text-body" : "text-muted hover:text-body"}`}
@@ -987,11 +1088,10 @@ function StyleMenu({
   spinning: boolean;
   onAction: (action: ViewerAction) => void;
 }) {
-  const item = (label: string, active: boolean, action: ViewerAction, hint?: string) => (
+  const item = (label: string, active: boolean, action: ViewerAction) => (
     <button
       key={label}
       type="button"
-      title={hint}
       onClick={() => onAction(action)}
       className={`flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1 text-left text-[11px] ${active ? "bg-inset font-semibold" : "hover:bg-sunken"}`}
     >
@@ -1005,9 +1105,7 @@ function StyleMenu({
     <div className="bg-raised border-subtle shadow-card absolute top-full left-0 z-40 mt-1 grid w-64 grid-cols-2 gap-x-2 rounded-lg border p-2">
       <div>
         <p className="text-faint px-2 pb-1 text-[10px] font-semibold uppercase">Show as</p>
-        {(Object.keys(VIEW_STYLES) as ViewStyleName[]).map((name) =>
-          item(VIEW_STYLES[name].label, style === name, { kind: "style", style: name }, VIEW_STYLES[name].hint),
-        )}
+        {(Object.keys(VIEW_STYLES) as ViewStyleName[]).map((name) => item(VIEW_STYLES[name].label, style === name, { kind: "style", style: name }))}
         <p className="text-faint px-2 pt-2 pb-1 text-[10px] font-semibold uppercase">Background</p>
         {(Object.keys(BACKGROUNDS) as BackgroundName[]).map((name) => item(name[0].toUpperCase() + name.slice(1), background === name, { kind: "background", background: name }))}
       </div>
@@ -1128,7 +1226,6 @@ function ContactsTab({
                   type="button"
                   aria-pressed={on}
                   onClick={() => onToggleType(type)}
-                  title={on ? `Stop showing ${contactLabel(type).toLowerCase()} contacts` : types.length ? `Also show ${contactLabel(type).toLowerCase()} contacts` : `Show only ${contactLabel(type).toLowerCase()} contacts`}
                   className={`flex cursor-pointer items-center gap-1 rounded-full px-1.5 py-px text-[10px] transition-opacity ${on ? "text-body" : "text-muted hover:text-body"} ${dimmed ? "opacity-50 hover:opacity-100" : ""}`}
                   style={on ? { background: `color-mix(in oklch, ${contactColor(type, theme)} 18%, transparent)`, boxShadow: `inset 0 0 0 1px ${contactColor(type, theme)}` } : undefined}
                 >
@@ -1176,7 +1273,7 @@ function ContactsTab({
                     <strong>{name.label}</strong>
                     {contact.chain && <span className="text-faint">.{contact.chain}</span>}
                     {name.file !== null && (
-                      <span className="text-faint ml-1 text-[10px]" title="Number in the structure file">
+                      <span className="text-faint ml-1 text-[10px]">
                         {name.file}
                       </span>
                     )}

@@ -30,8 +30,9 @@ describe("answerTitle", () => {
     expect(answerTitle([], ["get_ttp"])).toBe("Reading the therapeutic target profile");
   });
 
-  it("says Answer when nothing tells", () => {
-    expect(answerTitle(["hello"], ["mystery_tool"])).toBe("Answer");
+  it("gives no title when nothing tells", () => {
+    expect(answerTitle(["hello"], ["mystery_tool"])).toBeNull();
+    expect(answerTitle(["## Answer\n\nhello"], [])).toBeNull();
   });
 });
 
@@ -55,7 +56,7 @@ describe("artifactLinks", () => {
       { kind: "interactions", tool: "profile_interactions", name: null, structurePath: "b.cif", smiles: null, error: null, counts: {}, contacts: [], totalContacts: 0 },
     ];
     const links = artifactLinks(panels, ["score_molecules", "profile_interactions"]);
-    expect(links.map((link) => link.label)).toEqual(["Open best pose", "Show contacts"]);
+    expect(links.map((link) => link.label)).toEqual(["Best pose", "Contacts"]);
     expect(links[0].target).toEqual({ kind: "viewer", request: { path: "b.cif", source: "answer" } });
   });
 
@@ -67,10 +68,10 @@ describe("artifactLinks", () => {
   it("links runs, ADMET and the TTP to workbench tabs", () => {
     const links = artifactLinks([], ["run_optimization", "predict_admet", "get_ttp"]);
     expect(links.map((link) => [link.label, link.target.kind === "workbench" ? link.target.tab : null])).toEqual([
-      ["Open candidates", "candidates"],
-      ["Open jobs", "jobs"],
-      ["Open ADMET", "properties"],
-      ["Open TTP", "ttp"],
+      ["Candidates", "candidates"],
+      ["Jobs", "jobs"],
+      ["ADMET", "properties"],
+      ["TTP", "ttp"],
     ]);
   });
 });

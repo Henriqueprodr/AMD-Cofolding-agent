@@ -26,9 +26,8 @@ export function ObjectivePicker({ groups, objectives, onToggle }: Props) {
               {shown.map((e) => {
                 const on = keys.has(e.key);
                 const blocked = !on && e.after !== undefined && !keys.has(e.after);
-                const needs = blocked ? group.entries.find((x) => x.key === e.after)?.label : undefined;
                 return (
-                  <Chip key={e.key} on={on} colour={colour} disabled={blocked} title={needs ? `Needs ${needs}` : group.name} onClick={() => onToggle(e, !on)}>
+                  <Chip key={e.key} on={on} colour={colour} disabled={blocked} onClick={() => onToggle(e, !on)}>
                     {e.label}
                   </Chip>
                 );
@@ -49,14 +48,13 @@ export function ObjectivePicker({ groups, objectives, onToggle }: Props) {
   );
 }
 
-function Chip({ on, colour, disabled, title, onClick, children }: { on: boolean; colour: string; disabled?: boolean; title?: string; onClick: () => void; children: string }) {
+function Chip({ on, colour, disabled, onClick, children }: { on: boolean; colour: string; disabled?: boolean; onClick: () => void; children: string }) {
   return (
     <button
       type="button"
       role="checkbox"
       aria-checked={on}
       disabled={disabled}
-      title={title}
       onClick={onClick}
       className={`flex cursor-pointer items-center gap-1 rounded-full border py-px pr-2 pl-1.5 text-[11px] disabled:cursor-default disabled:opacity-40 ${on ? "text-body" : "border-subtle text-muted hover:text-body"}`}
       style={on ? { borderColor: `color-mix(in oklab, ${colour} 45%, var(--border-subtle))`, background: `color-mix(in oklab, ${colour} 10%, transparent)` } : undefined}

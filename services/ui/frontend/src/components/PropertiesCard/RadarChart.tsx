@@ -19,8 +19,6 @@ const CY = HEIGHT / 2;
 const RADIUS = 92;
 const RINGS = [0.25, 0.5, 0.75, 1];
 
-const fmt = (v: number | null) => (v === null ? "no value" : String(+v.toPrecision(3)));
-
 /** One polygon per molecule over the endpoints scaled to 0-1, further out being better. */
 export function RadarChart({ axes, series, total }: Props) {
   const [hidden, setHidden] = useState<Set<number>>(() => new Set());
@@ -53,7 +51,6 @@ export function RadarChart({ axes, series, total }: Props) {
             <g key={axis.endpoint}>
               <line x1={CX} y1={CY} x2={x} y2={y} stroke="var(--border-strong)" strokeWidth={0.6} />
               <text x={lx} y={ly} dy="0.35em" textAnchor={anchor} fontSize={10} fill="var(--text-muted)">
-                <title>{`${axis.label}: ${describeRule(axis.rule)}`}</title>
                 {axis.label}
                 {axis.rule.relative ? "*" : ""}
               </text>
@@ -76,7 +73,6 @@ export function RadarChart({ axes, series, total }: Props) {
               />
               {points.map(([x, y], i) => (
                 <circle key={i} cx={x} cy={y} r={2.5} fill={s.scores[i] === null ? "var(--surface-raised)" : colour} stroke={colour}>
-                  <title>{`${s.label} · ${axes[i].label}: ${fmt(s.raw[i])}${s.scores[i] === null ? "" : ` → ${s.scores[i]?.toFixed(2)}`}`}</title>
                 </circle>
               ))}
             </g>
@@ -95,7 +91,6 @@ export function RadarChart({ axes, series, total }: Props) {
                 type="button"
                 onClick={() => toggle(index)}
                 aria-pressed={!hidden.has(index)}
-                title={s.smiles ?? s.label}
                 className={`hover:bg-inset flex w-full cursor-pointer items-center gap-2 rounded px-1 py-0.5 text-left ${hidden.has(index) ? "opacity-40" : ""}`}
               >
                 <span aria-hidden="true" className="h-0.5 w-3 shrink-0 rounded-full" style={{ background: COLOURS[index % COLOURS.length] }} />

@@ -202,7 +202,7 @@ function SavedTtps({ ttps, loaded, loading, onPick }: { ttps: TtpSummary[]; load
   return (
     <span className="flex shrink-0 items-center gap-1.5">
       {loading.state === "error" && (
-        <span className="max-w-40 truncate text-[11px]" style={{ color: "var(--color-accent)" }} title={loading.message}>
+        <span className="max-w-40 truncate text-[11px]" style={{ color: "var(--color-accent)" }}>
           {loading.message}
         </span>
       )}
@@ -211,7 +211,6 @@ function SavedTtps({ ttps, loaded, loading, onPick }: { ttps: TtpSummary[]; load
         onChange={(event) => event.target.value && onPick(event.target.value)}
         disabled={!loaded || loading.state === "busy"}
         aria-label="Start from a saved TTP"
-        title="Fill the form with a copy of a saved TTP"
         className={`${INPUT} text-muted max-w-44 truncate py-0.5 text-[11px]`}
       >
         <option value="">{!loaded ? "Loading…" : loading.state === "busy" ? "Loading TTP…" : "Start from saved…"}</option>
@@ -250,7 +249,9 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
   const [force, setForce] = useState(start?.templates?.[0]?.force ?? false);
   const [threshold, setThreshold] = useState(String(start?.templates?.[0]?.threshold ?? 2));
   const [msa, setMsa] = useState<FileRead<string | null>>(() => (start?.msaPath ? { state: "busy", path: start.msaPath } : { state: "idle" }));
-  const [objectives, setObjectives] = useState<Row[]>(() => rows(start?.objectives ?? defaultObjectives(objectiveCatalogue(catalog.services, catalog.components))));
+  const [objectives, setObjectives] = useState<Row[]>(() =>
+    rows(start?.objectives ?? (catalog.loaded ? defaultObjectives(objectiveCatalogue(catalog.services, catalog.components)) : [])),
+  );
   /** The objectives were picked by hand (or came with a stored TTP): the services loading late leaves them be. */
   const [handPicked, setHandPicked] = useState(Boolean(start));
   const [defaultsFor, setDefaultsFor] = useState(catalog);
@@ -332,7 +333,12 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
             : [];
   const problems = [...proteinProblems, ...formProblems(form, ids)];
   const runIssues = run.enabled ? runProblems(run) : [];
-  const catalogue = useMemo(() => objectiveCatalogue(catalog.services, catalog.components), [catalog]);
+  // Nothing is offered until the services have answered. Built from an empty
+  // catalog, objectiveCatalogue assumes every service is up and lists every
+  // ADMET endpoint it knows of, so the picker opened full and then shrank to
+  // whatever the node actually serves -- the endpoints that vanished a second
+  // after they appeared.
+  const catalogue = useMemo(() => (catalog.loaded ? objectiveCatalogue(catalog.services, catalog.components) : []), [catalog]);
   const groups = useMemo(() => objectiveGroups(catalogue), [catalogue]);
   if (defaultsFor !== catalog) {
     setDefaultsFor(catalog);
@@ -570,7 +576,7 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
                 </button>
               ))}
               {structured && (
-                <button type="button" onClick={clearStructure} aria-label="Clear the structure" title="Clear" className="text-faint hover:text-body cursor-pointer px-1 text-sm leading-none">
+                <button type="button" onClick={clearStructure} aria-label="Clear the structure" className="text-faint hover:text-body cursor-pointer px-1 text-sm leading-none">
                   ×
                 </button>
               )}
@@ -627,7 +633,7 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
             {structure.state === "error" && <p style={{ color: "var(--color-accent)" }}>{structure.message}</p>}
             {source && chains.length === 0 && <p className="text-faint text-[11px]">No protein chain in {sourceName(source.label)}.</p>}
             {chains.length === 1 && chain && (
-              <p className="text-muted text-[11px]" title={chain.source === "construct" ? "The deposited construct" : "The residues with coordinates"}>
+              <p className="text-muted text-[11px]">
                 Chain {chain.ids.join(", ")} · {aa(chain.sequence.length)}
               </p>
             )}
@@ -635,7 +641,7 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
               <div role="radiogroup" aria-label="Protein chain" className="flex flex-wrap items-center gap-1">
                 <span className="text-muted mr-1 text-[11px]">Chain</span>
                 {chains.map((c) => (
-                  <Pill key={c.ids.join()} on={chain === c} title={c.source === "construct" ? "The deposited construct" : "The residues with coordinates"} onClick={() => pickChain(c)}>
+                  <Pill key={c.ids.join()} on={chain === c} onClick={() => pickChain(c)}>
                     {chainLabel(c)}
                   </Pill>
                 ))}
@@ -651,7 +657,7 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
                 {template.state === "busy" && <span className="text-faint">Saving a cleaned copy…</span>}
                 {template.state === "error" && <span style={{ color: "var(--color-accent)" }}>{template.message}</span>}
                 {template.state === "ready" && (
-                  <span className="text-faint truncate" title={template.config.path}>
+                  <span className="text-faint truncate">
                     {[fileName(template.config.path), template.config.chain_id && `chain ${template.config.chain_id}`, template.atoms !== null && `${template.atoms.toLocaleString("en")} atoms`].filter(Boolean).join(" · ")}
                   </span>
                 )}
@@ -670,7 +676,6 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
                           value={threshold}
                           onChange={(event) => setThreshold(event.target.value)}
                           aria-label="Template threshold (Å)"
-                          title="How far the cofold may deviate from the template"
                           className={`${INPUT} w-14 px-1 py-0.5 font-mono text-[11px]`}
                         />
                         <span className="text-muted">Å</span>
@@ -731,7 +736,6 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
                               setMode("pdb");
                               fetchEntry(pdb);
                             }}
-                            title={`Fold the construct of ${pdb}`}
                             className="border-subtle text-muted hover:text-body cursor-pointer rounded-md border px-1.5 py-px font-mono text-[10px]"
                           >
                             {pdb}
@@ -873,7 +877,7 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
               </ul>
             )}
           </div>
-          <button type="button" onClick={() => void copyJson()} title="Copy the create_ttp JSON" className={GHOST}>
+          <button type="button" onClick={() => void copyJson()} className={GHOST}>
             {copied ? "Copied" : "Copy JSON"}
           </button>
           <button type="button" onClick={onClose} className={GHOST}>
@@ -883,7 +887,6 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
             type="button"
             onClick={() => void create()}
             disabled={busy}
-            title={run.enabled ? "Save the profile and put the run request in the chat" : "Save the profile and put it in the chat"}
             className={PRIMARY}
             style={{ background: "var(--color-accent)" }}
           >
@@ -926,7 +929,6 @@ function SharedList({ files, value, onPick }: { files?: Asset[]; value: string; 
                   type="button"
                   role="option"
                   aria-selected={a.path === value}
-                  title={a.path}
                   onClick={() => onPick(a.path)}
                   className={`w-full cursor-pointer truncate px-2.5 py-0.5 text-left font-mono text-[11px] ${a.path === value ? "bg-sunken text-body" : "text-muted hover:bg-inset hover:text-body"}`}
                 >
@@ -968,7 +970,7 @@ function FileSelect({
       {folders.map((f) => (
         <optgroup key={f.folder} label={f.folder}>
           {f.assets.map((a) => (
-            <option key={a.path} value={a.path} title={a.path}>
+            <option key={a.path} value={a.path}>
               {[shown(a), detail(a)].filter(Boolean).join(" · ")}
             </option>
           ))}
@@ -978,14 +980,13 @@ function FileSelect({
   );
 }
 
-function Pill({ on, disabled, title, onClick, children }: { on: boolean; disabled?: boolean; title?: string; onClick: () => void; children: ReactNode }) {
+function Pill({ on, disabled, onClick, children }: { on: boolean; disabled?: boolean; onClick: () => void; children: ReactNode }) {
   return (
     <button
       type="button"
       role="radio"
       aria-checked={on}
       disabled={disabled}
-      title={title}
       onClick={onClick}
       className={`cursor-pointer rounded-full border px-2 py-px text-[11px] disabled:cursor-default disabled:opacity-50 ${on ? "border-strong bg-sunken text-body font-medium" : "border-subtle text-muted hover:text-body"}`}
     >

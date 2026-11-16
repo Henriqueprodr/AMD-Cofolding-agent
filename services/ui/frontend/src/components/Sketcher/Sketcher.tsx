@@ -5,6 +5,20 @@ import { lazy, Suspense, useState } from "react";
 import { createPortal } from "react-dom";
 import type { Ketcher } from "ketcher-core";
 import type { Theme } from "../../hooks/useTheme";
+import { countAttachmentPoints, numberAttachmentPoints } from "../../lib/attachment";
+import type { SketchMode } from "../../lib/sketcherBus";
+
+// When a mode is pre-specified (scaffold / fragment) the toggle is hidden and
+// the mode is locked to what the caller asked for. When opened from the
+// generic Draw button (no mode), all three segments are shown so the user can
+// switch to scaffold or fragment mode and place attachment points for
+// LibInvent / LinkInvent without leaving the dialog.
+const MODE_LABELS: Record<SketchMode, string> = {
+  molecule: "Molecule",
+  scaffold: "Scaffold",
+  fragment: "Fragment",
+};
+const ALL_MODES: SketchMode[] = ["molecule", "scaffold", "fragment"];
 
 // Ketcher and its WebAssembly chemistry engine are several megabytes: they
 // load the first time the sketcher opens, never with the app.
@@ -13,16 +27,54 @@ const KetcherEditor = lazy(() => import("./KetcherEditor"));
 interface Props {
   /** The molecule to start from; an empty canvas when unset. */
   smiles?: string;
+  /** What is being drawn; a plain molecule when unset. */
+  mode?: SketchMode;
   theme: Theme;
   onUse: (smiles: string) => void;
   onClose: () => void;
 }
 
+const TITLE: Record<SketchMode, string> = {
+  molecule: "Sketch a molecule",
+  scaffold: "Sketch a scaffold",
+  fragment: "Sketch a linker fragment",
+};
+
+const HINT: Record<SketchMode, string> = {
+  molecule: "Use puts the SMILES in your message.",
+  scaffold: "Mark each position to decorate with an attachment point (R / *). They are numbered for you.",
+  fragment: "Mark the one position where the linker joins with an attachment point (R / *).",
+};
+
 /** A molecule editor in a dialog; "Use" hands back what was drawn, as SMILES. */
-export function Sketcher({ smiles, theme, onUse, onClose }: Props) {
+export function Sketcher({ smiles, mode = "molecule", theme, onUse, onClose }: Props) {
   const [ketcher, setKetcher] = useState<Ketcher | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [reading, setReading] = useState(false);
+  // When a specific mode was requested by the caller the toggle stays hidden.
+  // When opened from the generic Draw button (mode prop is undefined / "molecule"
+  // by default), the user can freely switch to scaffold or fragment to place
+  // attachment points for LibInvent / LinkInvent.
+  const callerLocked = smiles !== undefined || mode !== "molecule";
+  const [activeMode, setActiveMode] = useState<SketchMode>(mode);
+
+  function switchMode(next: SketchMode) {
+    setActiveMode(next);
+    setKetcher(null);  // remount KetcherEditor with the new toolbar
+    setProblem(null);
+  }
+
+  /** What the drawing has to be before it is worth handing back. */
+  function wrong(drawn: string): string | null {
+    const points = countAttachmentPoints(drawn);
+    if (activeMode === "scaffold" && points === 0) {
+      return "A scaffold needs at least one attachment point — the position to decorate.";
+    }
+    if (activeMode === "fragment" && points !== 1) {
+      return `A linker fragment needs exactly one attachment point, where the linker joins; this has ${points}.`;
+    }
+    return null;
+  }
 
   async function use() {
     if (!ketcher) return;
@@ -30,8 +82,18 @@ export function Sketcher({ smiles, theme, onUse, onClose }: Props) {
     setProblem(null);
     try {
       const drawn = (await ketcher.getSmiles()).trim();
-      if (drawn) onUse(drawn);
-      else setProblem("Draw a molecule first.");
+      if (!drawn) {
+        setProblem("Draw a molecule first.");
+        return;
+      }
+      const bad = wrong(drawn);
+      if (bad) {
+        setProblem(bad);
+        return;
+      }
+      // The sketcher draws the position but never its number, and both
+      // generators refuse a bare [*], so number it on the way out.
+      onUse(activeMode === "molecule" ? drawn : numberAttachmentPoints(drawn));
     } catch (reason) {
       setProblem(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -49,7 +111,26 @@ export function Sketcher({ smiles, theme, onUse, onClose }: Props) {
       >
         <header className="border-subtle flex h-11 shrink-0 items-center gap-2 border-b px-4">
           <span aria-hidden="true" className="size-2 rounded-full" style={{ background: "var(--color-molecule)" }} />
-          <h2 className="text-sm font-semibold">Sketch a molecule</h2>
+          <h2 className="text-sm font-semibold">{TITLE[activeMode]}</h2>
+          {/* Mode toggle — hidden when the caller locked the mode (e.g. TTP
+              scaffold picker). Shown when opened from the generic Draw button
+              so the user can switch to scaffold/fragment to place attachment
+              points for LibInvent / LinkInvent. */}
+          {!callerLocked && (
+            <div className="border-subtle ml-2 flex overflow-hidden rounded-md border text-[11px]">
+              {ALL_MODES.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => switchMode(m)}
+                  className={`cursor-pointer px-2.5 py-0.5 ${activeMode === m ? "bg-accent text-white" : "text-muted hover:text-body"}`}
+                  style={activeMode === m ? { background: "var(--color-accent)" } : undefined}
+                >
+                  {MODE_LABELS[m]}
+                </button>
+              ))}
+            </div>
+          )}
           <button
             type="button"
             onClick={onClose}
@@ -61,14 +142,17 @@ export function Sketcher({ smiles, theme, onUse, onClose }: Props) {
         </header>
 
         <div className={`ketcher-host relative min-h-0 flex-1 ${theme === "dark" ? "ketcher-dark" : ""}`}>
-          <Suspense fallback={<p className="text-muted grid h-full place-items-center text-xs">Loading the sketcher…</p>}>
-            <KetcherEditor initial={smiles} onReady={setKetcher} onError={setProblem} />
+          {/* key={activeMode} remounts KetcherEditor on mode switch so the
+              toolbar updates immediately. The drawing is intentionally cleared
+              because a molecule is not valid as a scaffold (and vice versa). */}
+          <Suspense key={activeMode} fallback={<p className="text-muted grid h-full place-items-center text-xs">Loading the sketcher…</p>}>
+            <KetcherEditor initial={smiles} mode={activeMode} onReady={setKetcher} onError={setProblem} />
           </Suspense>
         </div>
 
         <footer className="border-subtle flex shrink-0 items-center gap-2 border-t px-4 py-2.5">
           <span className="text-muted min-w-0 flex-1 truncate text-xs" role="status" style={problem ? { color: "var(--color-accent)" } : undefined}>
-            {problem ?? (ketcher ? "Use puts the SMILES in your message." : "")}
+            {problem ?? (ketcher ? HINT[activeMode] : "")}
           </span>
           <button
             type="button"

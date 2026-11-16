@@ -41,7 +41,6 @@ export function CopyButton({ value, label = "Copy", icon = false, className = ""
           event.stopPropagation();
           void copy();
         }}
-        title={copied ? "Copied" : label}
         aria-label={label}
         className={`text-faint hover:text-body hover:bg-inset relative grid size-5 shrink-0 cursor-pointer place-items-center rounded transition-colors touch:after:absolute touch:after:-inset-2 ${className}`}
       >
@@ -63,7 +62,6 @@ export function CopyButton({ value, label = "Copy", icon = false, className = ""
     <button
       type="button"
       onClick={copy}
-      title={label}
       aria-label={label}
       className={`text-muted hover:text-body hover:bg-inset shrink-0 cursor-pointer rounded-md px-2 py-1 text-[11px] transition-colors touch:min-h-11 touch:px-3 ${className}`}
     >

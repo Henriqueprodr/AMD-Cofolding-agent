@@ -117,7 +117,6 @@ export function MoleculeTable<R extends MoleculeRow>({ columns, rows, theme, sor
                   onClick={onOpen ? () => onOpen(row) : undefined}
                   onPointerEnter={onHover ? () => onHover(row.smiles) : undefined}
                   onPointerLeave={onHover ? () => onHover(null) : undefined}
-                  title={onOpen ? "Open the molecule" : undefined}
                   className={`group ${onOpen ? "cursor-pointer" : ""}`}
                 >
                   <td className={`${cell} sticky left-0 z-[5] p-0 ${active ? "" : "bg-raised"}`} style={{ width: THUMB_CELL, minWidth: THUMB_CELL }}>
@@ -127,7 +126,6 @@ export function MoleculeTable<R extends MoleculeRow>({ columns, rows, theme, sor
                     <td className={`${cell} px-1 text-center`}>
                       {row.complex && (
                         <StructureButton
-                          title={row.complex}
                           onClick={(event) => {
                             event.stopPropagation();
                             onOpenStructure?.(row);
@@ -141,7 +139,7 @@ export function MoleculeTable<R extends MoleculeRow>({ columns, rows, theme, sor
                     const score = value?.score;
                     if (c.text) {
                       return (
-                        <td key={c.key} title={value?.title} className={`${cell} max-w-44 px-2 text-left ${c.strong ? "font-semibold" : ""}`}>
+                        <td key={c.key} className={`${cell} max-w-44 px-2 text-left ${c.strong ? "font-semibold" : ""}`}>
                           {value?.text && <span className="block truncate font-medium">{value.text}</span>}
                           {value?.sub && <span className="text-faint block truncate text-[10px]">{value.sub}</span>}
                         </td>
@@ -150,12 +148,11 @@ export function MoleculeTable<R extends MoleculeRow>({ columns, rows, theme, sor
                     return (
                       <td
                         key={c.key}
-                        title={value?.title}
                         className={`${cell} px-2 text-right font-mono whitespace-nowrap tabular-nums ${c.strong ? "text-body font-semibold" : c.muted ? "text-muted" : ""}`}
                       >
                         {value?.text ?? "—"}
                         {score != null && Number.isFinite(score) && (
-                          <span className="bg-inset mt-0.5 ml-auto block h-[2px] w-10 overflow-hidden rounded-full" aria-hidden="true" title={`Score ${score.toFixed(2)}`}>
+                          <span className="bg-inset mt-0.5 ml-auto block h-[2px] w-10 overflow-hidden rounded-full" aria-hidden="true">
                             <span className="block h-full rounded-full" style={{ width: `${Math.round(Math.min(1, Math.max(0, score)) * 100)}%`, background: c.colour ?? "var(--color-structure)", opacity: 0.55 }} />
                           </span>
                         )}
@@ -187,7 +184,7 @@ function HeaderLabel({ column, sort, onSort }: { column: MoleculeColumn; sort?: 
   const layout = `flex w-full flex-col px-2 py-1 leading-tight ${column.text ? "items-start text-left" : "items-end text-right"}`;
   if (!onSort) {
     return (
-      <span title={column.title} className={`text-muted ${layout}`}>
+      <span className={`text-muted ${layout}`}>
         {body}
       </span>
     );
@@ -196,7 +193,6 @@ function HeaderLabel({ column, sort, onSort }: { column: MoleculeColumn; sort?: 
     <button
       type="button"
       onClick={() => onSort(column.key)}
-      title={column.title}
       aria-sort={active ? (sort.desc ? "descending" : "ascending") : undefined}
       className={`${layout} cursor-pointer ${active ? "text-body" : "text-muted hover:text-body"}`}
     >
@@ -205,9 +201,9 @@ function HeaderLabel({ column, sort, onSort }: { column: MoleculeColumn; sort?: 
   );
 }
 
-export function StructureButton({ title, onClick }: { title: string; onClick: (event: MouseEvent) => void }) {
+export function StructureButton({ onClick }: { onClick: (event: MouseEvent) => void }) {
   return (
-    <button type="button" onClick={onClick} title={title} className="hover:bg-inset cursor-pointer rounded px-1.5 py-0.5 text-[10px] font-semibold" style={{ color: "var(--color-structure)" }}>
+    <button type="button" onClick={onClick} className="hover:bg-inset cursor-pointer rounded px-1.5 py-0.5 text-[10px] font-semibold" style={{ color: "var(--color-structure)" }}>
       3D
     </button>
   );
@@ -251,7 +247,7 @@ export function MoleculeThumb({
   }, [seen, root]);
   return (
     <span className="flex h-full items-center">
-      <span ref={box} title={smiles || undefined} className={`grid shrink-0 place-items-center ${dim ? "opacity-60" : ""}`} style={{ width, height }}>
+      <span ref={box} className={`grid shrink-0 place-items-center ${dim ? "opacity-60" : ""}`} style={{ width, height }}>
         {seen && smiles && <MolDepiction smiles={smiles} theme={theme} width={width * 2} height={height * 2} className="size-full" />}
       </span>
       <span className="flex w-6 shrink-0 flex-col items-center gap-0.5">

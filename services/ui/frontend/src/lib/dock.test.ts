@@ -11,7 +11,7 @@ function memory() {
 
 describe("DOCK_TABS", () => {
   it("lists every tab, in order", () => {
-    expect(DOCK_TABS).toEqual(["structure", "molecules", "jobs", "campaign", "target", "ttp", "assets"]);
+    expect(DOCK_TABS).toEqual(["campaign", "structure", "target", "assets"]);
   });
 });
 
@@ -19,10 +19,18 @@ describe("dockTabOf", () => {
   it("maps views to the tab that shows them", () => {
     expect(dockTabOf("candidates")).toBe("molecules");
     expect(dockTabOf("properties")).toBe("molecules");
-    expect(dockTabOf("tables")).toBe("molecules");
-    expect(dockTabOf("activity")).toBe("jobs");
-    expect(dockTabOf("results")).toBe("jobs");
-    expect(dockTabOf("ttp")).toBe("ttp");
+  });
+
+  it("opens the runs inside the campaign", () => {
+    // They were a tab of their own; links, the palette and the monitor
+    // alerts still name them, and all of them have to land somewhere.
+    expect(dockTabOf("jobs")).toBe("campaign");
+    expect(dockTabOf("activity")).toBe("campaign");
+    expect(dockTabOf("results")).toBe("campaign");
+  });
+
+  it("opens the profile beside the target it was written for", () => {
+    expect(dockTabOf("ttp")).toBe("target");
   });
 });
 

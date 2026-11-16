@@ -1,285 +1,153 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 import type { Theme } from "../../hooks/useTheme";
-import type { CampaignDetail, FleetCampaign } from "../../types/api";
-import { ApiError, fetchCampaign, fetchCampaigns } from "../../lib/api";
-import { relativeTime } from "../../lib/campaign";
-import { campaignActive, campaignProgress, campaignStanding, STANDING_LABEL } from "../../lib/fleet";
-import type { CampaignStanding } from "../../lib/fleet";
-import { openRun, openWorkbench } from "../../lib/workbenchBus";
-import { Placeholder } from "../RunAnalysis/shared";
-import { CampaignResults } from "./CampaignResults";
+import type { Campaign } from "../../types/api";
+import { useCampaigns } from "../../hooks/useCampaignJobs";
+import { useJobList } from "../../hooks/useJobList";
+import { useStuckTasks } from "../../hooks/useTaskConversations";
+import { history } from "../../lib/activity";
+import { learnt } from "../../lib/atlas";
+import { campaignView } from "../../lib/campaign";
+import { agentLabels, knownAgent, taskPhase, taskReports } from "../../lib/fleet";
+import { focusTask, openRun, useFocusedAgent, useFocusedTask } from "../../lib/workbenchBus";
+import { Card, Placeholder } from "../RunAnalysis/shared";
+import { AgentConversation } from "../SubAgents/AgentConversation";
+import { IterationGraph } from "./IterationGraph";
 import { useNow } from "./shared";
 import { TaskDetail } from "./TaskDetail";
-import { TaskGraph } from "./TaskGraph";
+import { WhatWeKnow } from "./WhatWeKnow";
 
 interface Props {
-  /** The conversation on screen; its campaigns are listed first. */
+  /** The conversation on screen. */
   sessionId: string | null;
+  /** The log the conductor keeps of the conversation with campaign_log. */
+  log?: Campaign | null;
   theme: Theme;
   onOpenMolecule?: (smiles: string) => void;
+  onShowProperties: () => void;
+  /** Show a task's run, which is another view of this tab. */
+  onOpenRun: () => void;
 }
 
-/** While anything is still running. Nothing is polled once every campaign has settled. */
-const POLL_MS = 8_000;
-
-type View = "trajectory" | "results";
-
 /**
- * The campaigns of this conversation: what the conductor set going, how far
- * it has got, and what has come out.
+ * The overview, which is the conductor's page and the whole campaign's; or
+ * a sub-agent's conversation when one is picked under the trajectory.
  *
- * The multi-agent machinery is deliberately not the subject here. The tab
- * leads with the goal and the results; the sub-agents are a thing you can
- * look into, through the graph and the drill-down, when you want to know how
- * the search was run.
+ * The overview is the iteration graph, what was handed out, who took it
+ * and what came back across every campaign of the conversation, and under
+ * it every report, newest first. The molecules and the analysis are views
+ * of their own.
  */
-export function CampaignPanel({ sessionId, theme, onOpenMolecule }: Props) {
+export function CampaignPanel({ sessionId, log = null, theme, onOpenMolecule, onShowProperties, onOpenRun }: Props) {
   const now = useNow();
-  const [fetched, setCampaigns] = useState<FleetCampaign[] | null>(null);
-  // No conversation is not a conversation with no campaigns yet to arrive,
-  // so it answers now rather than leaving the panel reading the ledger.
-  const campaigns = useMemo(() => (sessionId ? fetched : []), [sessionId, fetched]);
-  const [listError, setListError] = useState<string | null>(null);
-  const [chosen, setChosen] = useState<string | null>(null);
-  const [detail, setDetail] = useState<CampaignDetail | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
-  const [view, setView] = useState<View>("trajectory");
-  const [task, setTask] = useState<string | null>(null);
-  const [tick, setTick] = useState(0);
+  const { details, events, error, loading } = useCampaigns(sessionId);
+  const labels = useMemo(() => agentLabels(details), [details]);
+  const focused = useFocusedTask();
+  const openAgent = useFocusedAgent();
 
-  // This conversation's campaigns and no others. A campaign belonging to
-  // somebody else's conversation answers a question nobody asked here, and
-  // showing one put a BRD4 campaign in front of a reader designing for JAK3.
-  useEffect(() => {
-    if (!sessionId) return;
-    let cancelled = false;
-    fetchCampaigns(sessionId)
-      .then((mine) => {
-        if (cancelled) return;
-        setCampaigns(mine);
-        setListError(null);
-      })
-      .catch((reason: unknown) => {
-        if (!cancelled) setListError(message(reason));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId, tick]);
+  const steps = useMemo(
+    () => history(details.map((detail) => ({ ...detail, events: events.get(detail.campaign.campaign_id) })), labels, campaignView(log)?.findings ?? []),
+    [details, events, labels, log],
+  );
+  const written = useMemo(
+    () =>
+      details
+        .flatMap((detail) => taskReports(detail).map((report) => ({ ...report, campaignId: detail.campaign.campaign_id })))
+        .sort((a, b) => (Date.parse(b.postedAt) || 0) - (Date.parse(a.postedAt) || 0)),
+    [details],
+  );
+  const reports = useMemo(() => new Map(written.map((report) => [report.taskId, report.excerpt] as const)), [written]);
+  const running = useMemo(() => details.flatMap((detail) => detail.tasks.filter((task) => taskPhase(task) === "running").map((task) => task.task_id)), [details]);
+  const stuck = useStuckTasks(running);
+  const jobs = useJobList().jobs;
+  const knownRuns = useMemo(() => new Set((jobs ?? []).map((job) => job.id)), [jobs]);
+  const showRun = (jobId: string) => {
+    openRun(jobId);
+    onOpenRun();
+  };
 
-  // The newest campaign, until the reader picks another; a campaign opened
-  // while they are reading an older one must not pull the panel away.
-  const current = useMemo(() => {
-    if (!campaigns?.length) return null;
-    return campaigns.find((c) => c.campaign_id === chosen) ?? campaigns[0];
-  }, [campaigns, chosen]);
-  const currentId = current?.campaign_id ?? null;
-
-  useEffect(() => {
-    if (!currentId) return;
-    let cancelled = false;
-    fetchCampaign(currentId)
-      .then((loaded) => {
-        if (cancelled) return;
-        setDetail(loaded);
-        setDetailError(null);
-      })
-      .catch((reason: unknown) => {
-        if (!cancelled) setDetailError(message(reason));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [currentId, tick]);
-
-  // Showing one campaign and then another must not show the first's tasks
-  // under the second's heading for a tick.
-  const shown = detail && detail.campaign.campaign_id === currentId ? detail : null;
-  const live = (campaigns ?? []).some(campaignActive);
-
-  useEffect(() => {
-    if (!live) return;
-    const timer = window.setInterval(() => setTick((t) => t + 1), POLL_MS);
-    return () => window.clearInterval(timer);
-  }, [live]);
-
-  if (listError) {
-    return <Notice>{listError}</Notice>;
-  }
-  if (campaigns === null) {
-    return <Placeholder height={120}>Reading the campaigns…</Placeholder>;
-  }
-  if (!campaigns.length) {
+  if (openAgent && knownAgent(openAgent, labels)) {
     return (
-      <Placeholder height={160}>
-        No campaign yet. Allow more than one sub-agent beside the message box, and the agent runs experiments side by side when the work divides.
-      </Placeholder>
+      <AgentConversation
+        sessionId={sessionId}
+        agent={openAgent}
+        taskId={focused?.taskId ?? null}
+        theme={theme}
+        onOpenMolecule={onOpenMolecule ?? NOTHING}
+        onShowProperties={onShowProperties}
+      />
+    );
+  }
+
+  const detail = focused ? details.find((one) => one.campaign.campaign_id === focused.campaignId) : undefined;
+  if (focused?.taskId && detail) {
+    return (
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <TaskDetail
+          detail={detail}
+          taskId={focused.taskId}
+          labels={labels}
+          theme={theme}
+          onBack={() => focusTask(null)}
+          onOpenMolecule={onOpenMolecule}
+          onOpenJob={showRun}
+        />
+      </div>
     );
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <Header
-        campaigns={campaigns}
-        current={current}
-        now={now}
-        standing={shown ? campaignStanding(shown) : null}
-        onChoose={(id) => {
-          setChosen(id);
-          setTask(null);
-        }}
-      />
-      {shown === null ? (
-        detailError ? (
-          <Notice>{detailError}</Notice>
+    <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto p-3">
+      <Card title="Iteration graph">
+        {error && !details.length ? (
+          <p className="text-faint py-6 text-center text-xs">{error}</p>
+        ) : loading && !details.length ? (
+          <Placeholder height={80}>Reading the campaigns…</Placeholder>
         ) : (
-          <Placeholder height={120}>Reading the campaign…</Placeholder>
-        )
-      ) : task ? (
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <TaskDetail
-            detail={shown}
-            taskId={task}
-            theme={theme}
-            onBack={() => setTask(null)}
-            onOpenMolecule={onOpenMolecule}
-            onOpenJob={(jobId) => {
-              openRun(jobId);
-              openWorkbench("jobs");
-            }}
+          <IterationGraph
+            steps={steps.steps}
+            reports={reports}
+            stuck={stuck}
+            now={now}
+            onOpenTask={(step) => step.campaignId && step.taskId && focusTask({ campaignId: step.campaignId, taskId: step.taskId })}
+            onOpenRun={showRun}
           />
-        </div>
-      ) : (
-        <>
-          <Overview detail={shown} />
-          <div role="group" aria-label="Campaign" className="border-subtle flex shrink-0 items-center gap-0.5 border-b px-2 py-1.5">
-            {(
-              [
-                ["trajectory", "Trajectory"],
-                ["results", "Results"],
-              ] as const
-            ).map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                aria-pressed={view === id}
-                onClick={() => setView(id)}
-                className={`cursor-pointer rounded-md px-2.5 py-1 text-xs touch:min-h-11 ${view === id ? "bg-inset text-body" : "text-muted hover:text-body"}`}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            {view === "trajectory" ? (
-              <div className="p-3">
-                <TaskGraph tasks={shown.tasks} selected={null} onSelect={(id) => id && setTask(id)} now={now} />
-                <p className="text-faint mt-2 text-[10.5px] leading-relaxed">
-                  Each dot is one task, placed when it started; lines show which results the conductor wrote it from. Click one to see how it went.
-                </p>
-              </div>
-            ) : (
-              <CampaignResults detail={shown} theme={theme} onOpenMolecule={onOpenMolecule} onOpenTask={setTask} />
-            )}
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-function Header({
-  campaigns,
-  current,
-  now,
-  standing,
-  onChoose,
-}: {
-  campaigns: readonly FleetCampaign[];
-  current: FleetCampaign | null;
-  now: number;
-  /** Null until the detail has loaded, when only the ledger's word is known. */
-  standing: CampaignStanding | null;
-  onChoose: (id: string) => void;
-}) {
-  if (!current) return null;
-  return (
-    <div className="border-subtle shrink-0 border-b px-3 py-2">
-      <div className="flex items-start gap-2">
-        <p className="min-w-0 flex-1 text-[12px] leading-snug">{current.goal}</p>
-        {campaigns.length > 1 && (
-          <select
-            value={current.campaign_id}
-            onChange={(event) => onChoose(event.target.value)}
-            aria-label="Campaign"
-            className="bg-sunken border-subtle text-muted max-w-36 shrink-0 cursor-pointer rounded-md border px-1.5 py-0.5 text-[11px] outline-none"
-          >
-            {campaigns.map((campaign) => (
-              <option key={campaign.campaign_id} value={campaign.campaign_id}>
-                {/* The ledger's word, not a claim about what is running:
-                    the list has no tasks to read that off. */}
-                {campaignActive(campaign) ? "Open" : "Closed"} · {relativeTime(campaign.created_at, now)}
-              </option>
-            ))}
-          </select>
         )}
-      </div>
-      <p className="text-faint mt-0.5 text-[10.5px]">
-        {standing ? STANDING_LABEL[standing] : current.state} · started {relativeTime(current.created_at, now)}
-        {current.base_ttp_id && ` · varying ${current.base_ttp_id}`}
-      </p>
-    </div>
-  );
-}
-
-/** How far along, in one line of numbers and one bar. */
-function Overview({ detail }: { detail: CampaignDetail }) {
-  const progress = campaignProgress(detail);
-  return (
-    <div className="border-subtle shrink-0 border-b px-3 py-2">
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 text-[11.5px]">
-        <Stat value={progress.molecules} label="molecules" />
-        <Stat value={progress.done} label="tasks done" />
-        {progress.running > 0 && <Stat value={progress.running} label="running" />}
-        {progress.failed > 0 && <Stat value={progress.failed} label="failed" />}
-        <span className="text-faint ml-auto" title={`${progress.concurrency} wanted at once`}>
-          {progress.agentsLive} of {progress.concurrency} sub-agents
-        </span>
-      </div>
-      {progress.fraction !== null && (
-        <div className="bg-inset mt-1.5 h-1 overflow-hidden rounded-full">
-          <span className="block h-full rounded-full transition-[width]" style={{ width: `${progress.fraction * 100}%`, background: "var(--color-ok)" }} />
-        </div>
+      </Card>
+      {details.map((one) => (
+        <WhatWeKnow
+          key={one.campaign.campaign_id}
+          campaignId={one.campaign.campaign_id}
+          goal={details.length > 1 ? one.campaign.goal : null}
+          learnt={learnt(events.get(one.campaign.campaign_id), one)}
+          labels={labels}
+          runs={knownRuns}
+          now={now}
+          onOpenRun={showRun}
+        />
+      ))}
+      {written.length > 0 && (
+        <Card title="Reports" actions={<span className="text-faint text-[11px]">{written.length}</span>}>
+          <ul className="flex flex-col gap-1.5">
+            {written.map((report) => (
+              <li key={report.taskId}>
+                <button
+                  type="button"
+                  onClick={() => focusTask({ campaignId: report.campaignId, taskId: report.taskId })}
+                  className="border-subtle hover:bg-inset grid w-full cursor-pointer grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-3 rounded-lg border px-2.5 py-2 text-left"
+                >
+                  <span className="min-w-0 truncate text-[11.5px] font-medium">{report.title}</span>
+                  <span className="text-muted line-clamp-3 text-[11px] leading-snug">{report.excerpt || "No summary written."}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </Card>
       )}
     </div>
   );
 }
 
-function Stat({ value, label }: { value: number; label: string }) {
-  return (
-    <span>
-      <span className="tabular-nums">{value}</span> <span className="text-faint">{label}</span>
-    </span>
-  );
-}
-
-function Notice({ children }: { children: React.ReactNode }) {
-  return <p className="text-faint flex-1 px-8 py-12 text-center text-xs leading-relaxed">{children}</p>;
-}
-
-/** A 503 is the ledger being away, which is not the same as an empty fleet. */
-function message(reason: unknown): string {
-  if (reason instanceof ApiError && reason.status === 503) {
-    return `The campaign ledger cannot be reached, so what is running is unknown. ${reason.message}`;
-  }
-  if (reason instanceof ApiError && reason.status === 404) {
-    // The route itself is absent, so this gateway is older than campaigns.
-    // Left as the bare "Not Found" it reads as "you have no campaigns",
-    // which sends the reader looking for a campaign that was never possible.
-    return "This gateway does not serve campaigns. It is running a build from before the fleet existed, so no campaign can be started or read until it is updated.";
-  }
-  return reason instanceof Error ? reason.message : String(reason);
-}
+const NOTHING = () => undefined;

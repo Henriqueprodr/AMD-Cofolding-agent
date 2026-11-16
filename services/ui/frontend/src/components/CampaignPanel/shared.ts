@@ -1,7 +1,19 @@
 // Copyright Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type { CampaignDetail } from "../../types/api";
+import { agentPage, knownAgent, type AgentPage } from "../../lib/fleet";
+import { useFocusedAgent, useFocusedTask } from "../../lib/workbenchBus";
+
+/** The open sub-agent and what its page shows; both null on the conductor's. */
+export function useAgentPage(details: readonly CampaignDetail[], labels: ReadonlyMap<string, string>): { agent: string | null; page: AgentPage | null } {
+  const focused = useFocusedAgent();
+  const picked = useFocusedTask()?.taskId ?? null;
+  const agent = knownAgent(focused, labels) ? focused : null;
+  const page = useMemo(() => (agent ? agentPage(details, labels, agent, picked) : null), [details, labels, agent, picked]);
+  return { agent, page };
+}
 
 /**
  * The clock, re-read every *everyMs*.

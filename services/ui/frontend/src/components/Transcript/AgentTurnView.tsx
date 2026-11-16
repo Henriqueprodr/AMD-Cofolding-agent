@@ -75,7 +75,7 @@ export const AgentTurnView = memo(function AgentTurnView({ turn, theme, openStru
   const stopped = texts.length === 0 && turn.blocks.some((block) => block.kind === "cancelled");
   const title = onlyAlerts ? "Monitor alert" : stopped ? "Stopped" : answerTitle(texts, tools);
   // Nothing has come back yet, so there is nothing to title: LiveStatus is the only progress line.
-  const titled = !(running && texts.length === 0 && steps.length === 0);
+  const titled = title !== null && !(running && texts.length === 0 && steps.length === 0);
   const firstText = turn.blocks.find((block) => block.kind === "text");
   const links = turn.done ? artifactLinks(panels, tools) : [];
   const failedGate = uniqueStructures(panels).filter((panel) => gate(panel.metrics).status === "fail");
@@ -86,12 +86,13 @@ export const AgentTurnView = memo(function AgentTurnView({ turn, theme, openStru
   return (
     <article className="flex flex-col gap-3" aria-busy={running}>
       {titled && (
-        <h3 className="text-body truncate text-sm leading-snug font-semibold" title={title}>
+        <h3 className="text-body truncate text-sm leading-snug font-semibold">
           {title}
         </h3>
       )}
 
-      {running && (
+      {/* Once there are steps they are the progress: a status line over them only repeated the running one. */}
+      {running && steps.length === 0 && (
         <LiveStatus
           steps={steps}
           thinking={lastThinking?.kind === "thinking" ? lastThinking.content : null}
@@ -102,7 +103,7 @@ export const AgentTurnView = memo(function AgentTurnView({ turn, theme, openStru
         />
       )}
 
-      {running && !traceOpen && steps.length > 0 && <StepLog steps={steps} running={running} />}
+      {running && steps.length > 0 && <LiveSteps steps={steps} />}
 
       {panels.length > 0 && (
         <TurnResults
@@ -136,6 +137,15 @@ export const AgentTurnView = memo(function AgentTurnView({ turn, theme, openStru
               <p key={block.id} className="text-faint text-xs">
                 Jobs it already launched keep running; stop them from the Jobs tab.
               </p>
+            );
+          case "user":
+            return (
+              <div key={block.id} className="flex flex-col items-end gap-0.5">
+                <p className="bg-inset max-w-[85%] rounded-2xl rounded-br-sm px-3.5 py-2 text-[13px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">
+                  {block.content}
+                </p>
+                <span className="text-faint text-[10px] italic">sent while it worked; read after its current step</span>
+              </div>
             );
           default:
             return null;
@@ -218,14 +228,15 @@ function TurnTrace({
         aria-expanded={open}
         className="text-faint hover:text-muted flex max-w-full cursor-pointer items-center gap-x-1.5 text-left touch:min-h-11"
       >
-        <span aria-hidden="true" className={`inline-block transition-transform ${open ? "rotate-90" : ""}`}>
-          ›
-        </span>
         <span className="font-medium">{steps > 0 ? `${steps} step${steps === 1 ? "" : "s"}` : "Details"}</span>
-        {failed > 0 && <span style={{ color: "var(--color-accent)" }}>· {failed} failed</span>}
       </button>
       {open && (
         <div className="mt-2 flex flex-col gap-2">
+          {failed > 0 && (
+            <p style={{ color: "var(--color-accent)" }}>
+              {failed} of the {steps} failed
+            </p>
+          )}
           <TurnMetaList meta={meta} />
           <TraceList entries={trace} follow={false} />
         </div>
@@ -333,35 +344,21 @@ function TurnMetaList({ meta }: { meta: TurnMeta }) {
   );
 }
 
-/** The tool calls of the turn, one line each, expandable to the full output. */
-function StepLog({ steps, running }: { steps: ToolStep[]; running: boolean }) {
-  // Open while the agent works, so progress is visible; a finished turn
-  // with many steps folds away behind its answer.
-  const [open, setOpen] = useState<boolean | null>(null);
-  const shown = open ?? (running || steps.length <= 3);
-
+/**
+ * The tool calls of the running turn, one line each, expandable to the full
+ * output; the running one has its spinner and clock. Between calls, while
+ * the agent reads what came back, a line under them says it is thinking.
+ */
+function LiveSteps({ steps }: { steps: ToolStep[] }) {
+  const thinking = steps.every((step) => step.result);
   return (
-    <div className="bg-sunken border-subtle overflow-hidden rounded-lg border">
-      <button
-        type="button"
-        onClick={() => setOpen(!shown)}
-        aria-expanded={shown}
-        className="text-muted hover:text-body flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-left text-[11px] font-medium"
-      >
-        <span aria-hidden="true" className={`inline-block transition-transform ${shown ? "rotate-90" : ""}`}>
-          ›
-        </span>
-        Steps
-        <span className="text-faint ml-auto font-normal">
-          {steps.map((step) => step.name).filter((name, index, all) => all.indexOf(name) === index).slice(0, 4).join(" · ")}
-        </span>
-      </button>
-      {shown && (
-        <ol className="border-subtle border-t">
-          {steps.map((step, index) => (
-            <StepRow key={step.id} step={step} index={index + 1} />
-          ))}
-        </ol>
+    <div className="flex flex-col gap-1.5">
+      <TraceList entries={steps} follow />
+      {thinking && (
+        <p role="status" className="text-muted flex items-center gap-2 text-xs italic">
+          <span aria-hidden="true" className="size-[7px] shrink-0 animate-pulse rounded-full" style={{ background: "var(--color-structure)" }} />
+          Thinking…
+        </p>
       )}
     </div>
   );
@@ -392,7 +389,12 @@ const StepRow = memo(function StepRow({ step, index }: { step: ToolStep; index: 
         <span className="shrink-0 font-mono font-semibold" style={{ color: failed ? "var(--color-accent)" : undefined }}>
           {step.name}
         </span>
-        <span className="text-faint min-w-0 flex-1 truncate font-mono text-[11px]" title={args}>
+        {step.repeats && step.repeats > 1 && (
+          <span title={`Sent ${step.repeats} times in a row, the same each time`} className="text-muted shrink-0 font-mono text-[10px] tabular-nums">
+            ×{step.repeats}
+          </span>
+        )}
+        <span className="text-faint min-w-0 flex-1 truncate font-mono text-[11px]">
           {args}
         </span>
         <span className={`shrink-0 font-mono text-[10px] ${result ? "text-faint" : "text-muted"}`}>
@@ -400,7 +402,7 @@ const StepRow = memo(function StepRow({ step, index }: { step: ToolStep; index: 
         </span>
       </button>
       {error && !open && (
-        <p className="-mt-1 truncate pr-3 pb-1.5 pl-10 text-[11px]" style={{ color: "var(--color-accent)" }} title={error}>
+        <p className="-mt-1 truncate pr-3 pb-1.5 pl-10 text-[11px]" style={{ color: "var(--color-accent)" }}>
           {error}
         </p>
       )}
@@ -487,7 +489,6 @@ function LiveStatus({
         type="button"
         onClick={onToggle}
         aria-expanded={open}
-        title={open ? "Hide the reasoning and steps" : "Show the reasoning and steps so far"}
         className="text-muted hover:text-body flex max-w-full cursor-pointer items-center gap-2 text-left text-xs touch:min-h-11"
       >
         <span
@@ -543,11 +544,11 @@ function TurnResults({
 }
 
 /** Links in answers; a residue link shows the residue in the 3D viewer instead of navigating. */
-function AnswerLink({ href, title, children }: AnchorHTMLAttributes<HTMLAnchorElement>) {
+function AnswerLink({ href, children }: AnchorHTMLAttributes<HTMLAnchorElement>) {
   const residue = residueFromHref(href);
   if (!residue) {
     return (
-      <a href={href} title={title} target="_blank" rel="noreferrer">
+      <a href={href} target="_blank" rel="noreferrer">
         {children}
       </a>
     );
@@ -557,7 +558,6 @@ function AnswerLink({ href, title, children }: AnchorHTMLAttributes<HTMLAnchorEl
     <button
       type="button"
       className="residue-link"
-      title="Show in the 3D viewer"
       onClick={() => sendToViewer({ path, ref, near, action: { kind: "residues", residues: [residue], mode: "focus" }, source: "answer" })}
     >
       {children}
@@ -594,7 +594,7 @@ const AnswerBlock = memo(function AnswerBlock({ content, linkResidues, structure
         </Markdown>
       </div>
       <div className="mt-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 touch:opacity-100">
-        <CopyButton value={content} label="Copy answer" />
+        <CopyButton value={content} label="Copy answer" icon />
       </div>
     </div>
   );

@@ -10,12 +10,10 @@ interface Props {
   sheet: () => Sheet;
   /** File name without extension. */
   name: string;
-  /** Said in the tooltips, e.g. "the first 200 rows". */
-  scope?: string;
 }
 
 /** "CSV" downloads the table, "Copy" puts it on the clipboard as tab-separated cells. */
-export function ExportButtons({ sheet, name, scope }: Props) {
+export function ExportButtons({ sheet, name }: Props) {
   const [copied, setCopied] = useState<"ok" | "failed" | null>(null);
 
   const copy = async () => {
@@ -32,7 +30,6 @@ export function ExportButtons({ sheet, name, scope }: Props) {
   return (
     <span className="flex shrink-0 items-center gap-0.5">
       <TextButton
-        title={`Download ${scope ?? "the table"} as CSV`}
         onClick={() => {
           const { columns, rows } = sheet();
           download(fileName(name, "csv"), toCsv(columns, rows), "text/csv");
@@ -40,19 +37,18 @@ export function ExportButtons({ sheet, name, scope }: Props) {
       >
         <DownloadIcon /> CSV
       </TextButton>
-      <TextButton title={`Copy ${scope ?? "the table"} (pastes into a spreadsheet)`} onClick={() => void copy()}>
+      <TextButton onClick={() => void copy()}>
         {copied === "ok" ? "Copied" : copied === "failed" ? "Copy failed" : "Copy"}
       </TextButton>
     </span>
   );
 }
 
-export function TextButton({ children, onClick, title, disabled }: { children: React.ReactNode; onClick: () => void; title?: string; disabled?: boolean }) {
+export function TextButton({ children, onClick, disabled }: { children: React.ReactNode; onClick: () => void; disabled?: boolean }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      title={title}
       disabled={disabled}
       className="text-faint hover:text-body hover:bg-inset inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium disabled:cursor-default disabled:opacity-40 touch:min-h-11"
     >

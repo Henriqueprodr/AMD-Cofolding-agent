@@ -4,7 +4,6 @@
 import { useEffect, useRef } from "react";
 import type { Turn } from "../../types/api";
 import type { Theme } from "../../hooks/useTheme";
-import { clock } from "../../lib/format";
 import { AgentTurnView } from "./AgentTurnView";
 
 interface Props {
@@ -53,7 +52,7 @@ export function Transcript({ turns, theme, openStructurePath, onOpenMolecule, on
 
         {turns.map((turn) =>
           turn.role === "user" ? (
-            <UserBubble key={turn.id} content={turn.content} at={turn.at} />
+            <UserBubble key={turn.id} content={turn.content} />
           ) : (
             <AgentTurnView
               key={turn.id}
@@ -72,13 +71,12 @@ export function Transcript({ turns, theme, openStructurePath, onOpenMolecule, on
   );
 }
 
-function UserBubble({ content, at }: { content: string; at: number }) {
+function UserBubble({ content }: { content: string }) {
   return (
-    <div className="flex flex-col items-end gap-1">
+    <div className="flex flex-col items-end">
       <p className="bg-inset max-w-[85%] rounded-2xl rounded-br-sm px-3.5 py-2 text-[13px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">
         {content}
       </p>
-      <span className="text-faint text-[10px]">{clock(at)}</span>
     </div>
   );
 }

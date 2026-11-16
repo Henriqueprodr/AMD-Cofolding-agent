@@ -36,21 +36,21 @@ export function CofoldRow({ status, at, calls, memory, finished = false }: Props
         className={`size-1.5 rounded-full ${finished ? "opacity-50" : "animate-pulse"}`}
         style={{ background: "var(--color-structure)" }}
       />
-      <span className="font-medium" title={view.title}>
+      <span className="font-medium">
         {view.label}
       </span>
-      <span className="text-faint min-w-0 truncate" title={view.title}>
+      <span className="text-faint min-w-0 truncate">
         {view.detail}
       </span>
       <Bar fraction={view.total > 0 ? view.fraction : null} />
-      <span className="text-muted text-right font-mono tabular-nums" title="Molecules cofolded / asked for">
+      <span className="text-muted text-right font-mono tabular-nums">
         {view.total > 0 ? `${view.done}/${view.total}` : ""}
       </span>
       <span className="text-faint">{view.note}</span>
-      <span className="text-faint text-right tabular-nums" title="Elapsed">
+      <span className="text-faint text-right tabular-nums">
         {view.elapsedMs !== null ? clock(view.elapsedMs) : ""}
       </span>
-      <span className="text-faint tabular-nums" title={view.remainingMs !== null ? "Estimated from recent molecule times" : undefined}>
+      <span className="text-faint tabular-nums">
         {view.remainingMs !== null && <Eta remainingMs={view.remainingMs} />}
       </span>
     </>

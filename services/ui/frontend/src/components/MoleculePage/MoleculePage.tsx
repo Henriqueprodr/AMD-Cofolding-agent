@@ -118,13 +118,13 @@ export function MoleculePage({ smiles, context, artifacts, theme, sessionId, onB
   return (
     <div className="flex min-h-0 flex-1 flex-col" aria-label="Molecule">
       <header className="border-subtle flex shrink-0 items-center gap-2 border-b px-2 py-1.5">
-        <button type="button" onClick={onBack} aria-label="Back to the list" title="Back" className="text-muted hover:text-body hover:bg-inset grid size-7 cursor-pointer place-items-center rounded-md text-sm">
+        <button type="button" onClick={onBack} aria-label="Back to the list" className="text-muted hover:text-body hover:bg-inset grid size-7 cursor-pointer place-items-center rounded-md text-sm">
           ←
         </button>
-        <h2 className="min-w-0 truncate text-xs font-semibold" title={view.name ?? smiles}>
+        <h2 className="min-w-0 truncate text-xs font-semibold">
           {view.name ?? "Molecule"}
         </h2>
-        <span className="text-faint min-w-0 truncate text-[11px]" title={view.tools.join(" · ") || undefined}>
+        <span className="text-faint min-w-0 truncate text-[11px]">
           {view.origin}
         </span>
         <StarButton smiles={smiles} label={view.name} source={run ?? candidate?.origin} session={session} values={scores} className="ml-auto" />

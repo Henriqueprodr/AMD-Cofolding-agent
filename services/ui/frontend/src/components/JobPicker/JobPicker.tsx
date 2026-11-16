@@ -3,14 +3,7 @@
 
 import { useState } from "react";
 import { isActive, jobTitle, stateTone, toneColor, type JobSummary } from "../../lib/jobs";
-import { focusRun } from "../../lib/workbenchBus";
-import { jobOptions, useJobScope, type JobGroup } from "./useJobScope";
-
-/** The job the Jobs tab is about, and "Other jobs" to pick another. */
-export function JobPicker({ sessionId }: { sessionId: string | null }) {
-  const { runs, own, seen, job, alerts, error } = useJobScope(sessionId);
-  return <JobPickerView runs={runs} own={own} seen={seen} job={job} alerts={alerts} error={error} onPick={focusRun} />;
-}
+import { jobOptions, type JobGroup } from "./useJobScope";
 
 interface ViewProps {
   runs: readonly JobSummary[] | null;
@@ -24,18 +17,20 @@ interface ViewProps {
   onPick: (id: string) => void;
   /** Start with the list shown. */
   initialOpen?: boolean;
+  /** Layout of the row, when it sits inside another one rather than on its own. */
+  className?: string;
 }
 
 const HINT: Partial<Record<JobGroup, string>> = { own: "this chat", seen: "seen here" };
 
-export function JobPickerView({ runs, own, seen = [], job, alerts, error, onPick, initialOpen = false }: ViewProps) {
+export function JobPickerView({ runs, own, seen = [], job, alerts, error, onPick, initialOpen = false, className = "shrink-0 px-3 pt-2 pb-0.5" }: ViewProps) {
   const [open, setOpen] = useState(initialOpen);
   const options = runs ? jobOptions(runs, own, seen) : [];
   const empty = runs === null ? (error ? `Could not load the jobs: ${error}` : "Loading jobs…") : "No job in this conversation yet.";
 
   return (
     <div
-      className="relative flex min-w-0 shrink-0 items-center gap-2 px-3 pt-2 pb-0.5 text-xs"
+      className={`relative flex min-w-0 items-center gap-2 text-xs ${className}`}
       onKeyDown={(event) => {
         if (event.key !== "Escape" || !open) return;
         event.stopPropagation();
@@ -43,7 +38,7 @@ export function JobPickerView({ runs, own, seen = [], job, alerts, error, onPick
       }}
     >
       {job ? (
-        <span className="flex min-w-0 items-center gap-2" title={`${jobTitle(job)} · ${job.id} · ${job.state}`}>
+        <span className="flex min-w-0 items-center gap-2">
           <StateDot job={job} />
           <span className="truncate">
             <span className="text-body">{jobTitle(job)}</span>
@@ -127,7 +122,7 @@ function AlertCount({ count }: { count: number }) {
   if (count <= 0) return null;
   const label = `${count} alert${count === 1 ? "" : "s"}`;
   return (
-    <span className="text-muted flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums" title={label} aria-label={label}>
+    <span className="text-muted flex shrink-0 items-center gap-0.5 text-[10px] tabular-nums" aria-label={label}>
       <span aria-hidden="true" className="size-1 rounded-full" style={{ background: toneColor("warn") }} />
       {count}
     </span>

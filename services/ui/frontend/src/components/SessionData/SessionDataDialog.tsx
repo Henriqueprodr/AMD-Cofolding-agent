@@ -100,7 +100,7 @@ export function SessionDataDialog({ session, onClose, onDelete }: Props) {
         <header className="border-subtle flex items-center gap-2 border-b px-4 py-2.5">
           <div className="min-w-0 flex-1">
             <h2 className="text-sm font-semibold">Conversation data</h2>
-            <p className="text-faint truncate text-[11px]" title={title}>
+            <p className="text-faint truncate text-[11px]">
               {title}
             </p>
           </div>
@@ -271,17 +271,16 @@ function Row({
         disabled={!item.deletable || disabled}
         onChange={(event) => onToggle([item.id], event.target.checked)}
         aria-label={`Delete ${item.name}`}
-        title={item.reason ?? undefined}
         className="mt-0.5 cursor-pointer disabled:cursor-not-allowed"
       />
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2">
           {item.url ? (
-            <a href={item.url} target="_blank" rel="noreferrer" className="truncate font-mono font-semibold hover:underline" title={item.path ?? item.name}>
+            <a href={item.url} target="_blank" rel="noreferrer" className="truncate font-mono font-semibold hover:underline">
               {item.name}
             </a>
           ) : (
-            <span className="truncate font-mono font-semibold" title={item.path ?? item.name}>
+            <span className="truncate font-mono font-semibold">
               {item.name}
             </span>
           )}

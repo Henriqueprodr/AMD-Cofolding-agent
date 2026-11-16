@@ -41,7 +41,7 @@ interface Run {
  * once, and again when a live run has moved on by two steps (ten if the last
  * map was slow) and the previous computation is done.
  */
-export function useUmap(jobId: string | null, molecules: Molecules | null): { layout: MapLayout | null; working: boolean } {
+export function useUmap(jobId: string | null, molecules: Pick<Molecules, "n" | "smiles" | "values" | "lastStep"> | null): { layout: MapLayout | null; working: boolean } {
   const run = useRef<Run | null>(null);
   const [version, setVersion] = useState(0);
   const [working, setWorking] = useState<string | null>(null);

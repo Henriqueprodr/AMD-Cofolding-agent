@@ -63,6 +63,24 @@ def _ago(minutes: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
 
 
+#: One conversation, so the Campaign tab has something to be about: its
+#: campaigns are read by session id, and a browser with none asks for
+#: nothing.
+MOCK_SESSION_ID = "s-20261109-090000-a1b2c3"
+
+#: Runs started in the conversation itself rather than by a sub-agent. The
+#: Campaign tab draws these as squares beside the sub-agents' circles, so the
+#: mock needs both to be worth looking at.
+MOCK_OWN_JOBS = [
+    {"job_id": "80999001", "ttp_id": "ttp-jq1-baseline", "ttp_version": 2, "job_type": "optimization",
+     "state": "completed", "created_at": _ago(140), "started_at": _ago(139), "finished_at": _ago(118),
+     "max_steps": 50, "has_checkpoint": True},
+    {"job_id": "80999002", "ttp_id": "ttp-jq1-polarity", "ttp_version": 1, "job_type": "optimization",
+     "state": "failed", "created_at": _ago(115), "started_at": _ago(114), "finished_at": _ago(112),
+     "max_steps": 50, "has_checkpoint": False, "error": "the ADMET scorer timed out"},
+]
+
+
 #: A campaign with no base TTP, which is the usual way round: each task
 #: writes its own profile from the conductor's intent.
 MOCK_CAMPAIGN = {
@@ -76,15 +94,25 @@ MOCK_CAMPAIGN = {
     "dispatch_until": None,
     "hard_stop_at": None,
     "finalized_at": None,
-    "session_id": None,
+    "session_id": MOCK_SESSION_ID,
 }
 
 
-def _task(task_id, state, minutes, intent, *, owner=None, parents=(), job=None, error=None):
+def _task(task_id, state, minutes, intent, *, kind="design", title=None, context=None,
+          deliverable=None, owner=None, parents=(), job=None, error=None):
+    spec = {"kind": kind, "intent": intent}
+    if title:
+        spec["title"] = title
+    if context:
+        spec["context"] = context
+    if deliverable:
+        spec["deliverable"] = deliverable
+    if parents:
+        spec["derived_from"] = list(parents)
     return {
         "task_id": task_id,
         "campaign_id": MOCK_CAMPAIGN["campaign_id"],
-        "spec": {"intent": intent, **({"derived_from": list(parents)} if parents else {})},
+        "spec": spec,
         "state": state,
         "attempts": 1,
         "created_at": _ago(minutes + 2),
@@ -97,13 +125,27 @@ def _task(task_id, state, minutes, intent, *, owner=None, parents=(), job=None, 
     }
 
 
+#: Tasks of several kinds, because a campaign is a team being given work and
+#: only some of it is a design run.
 MOCK_TASKS = [
-    _task("t-aaa1", "done", 90, "Hold the JQ1 triazolodiazepine core and vary the pendant aryl", owner="sup-1", job="81000001"),
-    _task("t-aaa2", "done", 86, "Scaffold-hop away from the diazepine; keep the acetyl-lysine mimic", owner="sup-2", job="81000002"),
-    _task("t-aaa3", "failed", 60, "Push logP below 3 on the best of the first round", owner="sup-1", parents=("t-aaa1",), error="the run stopped at step 4"),
-    _task("t-aaa4", "done", 48, "Merge what held affinity in the first task with the polarity of the second", owner="sup-3", parents=("t-aaa1", "t-aaa2"), job="81000004"),
-    _task("t-aaa5", "claimed", 12, "Grow into the ZA channel from the merged series", owner="sup-2", parents=("t-aaa4",), job="81000005"),
-    _task("t-aaa6", "queued", 2, "Re-score the merged series with a pose-quality gate", parents=("t-aaa4",)),
+    _task("t-aaa1", "done", 90, "Hold the JQ1 triazolodiazepine core and vary the pendant aryl",
+          title="Vary the pendant aryl", owner="sup-1", job="81000001"),
+    _task("t-aaa2", "done", 86, "Scaffold-hop away from the diazepine; keep the acetyl-lysine mimic",
+          title="Scaffold hop", owner="sup-2", job="81000002"),
+    _task("t-aaa7", "done", 84, "What is known about BRD4 BD1 selectivity over BD2, and which chemotypes achieve it?",
+          kind="research", title="BD1 over BD2 selectivity",
+          context="We are working the JQ1 series and have no selectivity data of our own.",
+          deliverable="The chemotypes that achieve it, with references.", owner="sup-3"),
+    _task("t-aaa3", "failed", 60, "Push logP below 3 on the best of the first round",
+          title="Drop the logP", owner="sup-1", parents=("t-aaa1",), error="the run stopped at step 4"),
+    _task("t-aaa4", "done", 48, "Merge what held affinity in the first task with the polarity of the second",
+          title="Merge the two series", owner="sup-3", parents=("t-aaa1", "t-aaa2"), job="81000004"),
+    _task("t-aaa8", "done", 40, "Plan a route to the merged series' best compound and check the building blocks are buyable",
+          kind="retrosynthesis", title="Route to the merged lead", owner="sup-1", parents=("t-aaa4",)),
+    _task("t-aaa5", "claimed", 12, "Grow into the ZA channel from the merged series",
+          title="Grow into the ZA channel", owner="sup-2", parents=("t-aaa4",), job="81000005"),
+    _task("t-aaa6", "queued", 2, "Re-score the merged series with a pose-quality gate",
+          kind="analysis", title="Re-score with a pose gate", parents=("t-aaa4",)),
 ]
 
 MOCK_RESULTS = [
@@ -117,6 +159,18 @@ MOCK_RESULTS = [
             {"smiles": LIGANDS[1][1], "score": 0.61},
         ],
         "summary": "The core tolerates a para-chloro; affinity held and QED slipped.",
+        "report": (
+            "## Report\n\n"
+            "Ran ttp-t-aaa1 for 50 steps against BRD4 BD1 and kept the triazolodiazepine "
+            "core fixed, varying only the pendant aryl.\n\n"
+            "The para-chloro analogue is the best of the round: Boltz affinity 0.71 with the "
+            "core intact. QED slipped to 0.58, which is the halogen and the extra ring, not "
+            "a scoring artefact.\n\n"
+            "**What I could not settle.** Nothing in the run distinguishes BD1 from BD2 — "
+            "the scoring profile has no selectivity term, so a selective and a pan-BET "
+            "compound score the same here."
+        ),
+        "job_ids": ["81000001"],
         "posted_at": _ago(80),
     },
     {
@@ -126,7 +180,44 @@ MOCK_RESULTS = [
         "objective_profile": {"Boltz affinity": 0.52, "QED": 0.77, "MW": 0.81},
         "candidates": [{"smiles": LIGANDS[2][1], "score": 0.66}, {"smiles": LIGANDS[3][1], "score": 0.49}],
         "summary": "Cleaner properties, a clear step down in affinity.",
+        "report": (
+            "## Report\n\n"
+            "Hopped to a 3,5-dimethylisoxazole head group, which keeps the acetyl-lysine "
+            "mimic and drops the diazepine.\n\n"
+            "Properties are cleaner across the board — QED 0.77, MW well inside range — and "
+            "affinity is a clear step down at 0.52. On this evidence the isoxazole is worth "
+            "keeping as the polar half of a merge rather than as a series of its own."
+        ),
+        "job_ids": ["81000002"],
         "posted_at": _ago(74),
+    },
+    {
+        "task_id": "t-aaa7",
+        "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+        "job_id": None,
+        # Research starts nothing and scores nothing: the report is the whole
+        # of what it produced, which is the case the tab has to read well.
+        "objective_profile": {},
+        "candidates": [],
+        "summary": "BD1 selectivity is achievable; the published handles are the ZA channel and the gatekeeper.",
+        "report": (
+            "## Report\n\n"
+            "BD1-selective BET inhibition is established but narrow. Three chemotypes carry "
+            "most of the published selectivity:\n\n"
+            "- **Dihydropteridinones** — up to 30-fold BD1 over BD2, from a substituent "
+            "reaching the ZA channel.\n"
+            "- **Tetrahydroquinolines** — around 10-fold, and the selectivity tracks the "
+            "gatekeeper contact rather than the acetyl-lysine mimic.\n"
+            "- **Isoxazole-azepines** — roughly equipotent; the selectivity reported for "
+            "these is within assay error.\n\n"
+            "The common handle is the ZA channel: BD1 is wider there. Our JQ1 series makes "
+            "no contact in it at all.\n\n"
+            "**What I could not settle.** I found no public structure of a BD1-selective "
+            "compound bound to BD2, so the selectivity is inferred from potency ratios "
+            "rather than seen."
+        ),
+        "job_ids": [],
+        "posted_at": _ago(70),
     },
     {
         "task_id": "t-aaa4",
@@ -135,7 +226,41 @@ MOCK_RESULTS = [
         "objective_profile": {"Boltz affinity": 0.79, "QED": 0.69, "MW": 0.7},
         "candidates": [{"smiles": LIGANDS[0][1], "score": 0.83}, {"smiles": LIGANDS[4][1], "score": 0.55}],
         "summary": "The merge is the best of the campaign so far on both counts.",
+        "report": (
+            "## Report\n\n"
+            "Merged the chlorophenyl of the first task onto the isoxazole head of the "
+            "second, which is the combination the two reports pointed at.\n\n"
+            "Best compound of the campaign so far: Boltz affinity 0.79 at QED 0.69, so the "
+            "merge recovers most of the affinity the hop cost without giving the properties "
+            "back. Both halves earn their place — removing either loses more than it saves.\n\n"
+            "**Next.** Nothing here reaches the ZA channel, which the selectivity work says "
+            "is where BD1 selectivity comes from. That is the obvious next variation."
+        ),
+        "job_ids": ["81000004"],
         "posted_at": _ago(35),
+    },
+    {
+        "task_id": "t-aaa8",
+        "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+        "job_id": None,
+        "objective_profile": {},
+        "candidates": [],
+        "summary": "Three routes under six steps; one is blocked on a building block nobody sells.",
+        "report": (
+            "## Report\n\n"
+            "Three routes to the merged lead, all under six steps:\n\n"
+            "1. **Suzuki last** (4 steps) — both partners are catalogue items, £180 for a "
+            "gram of the boronate. This is the one to run.\n"
+            "2. **Amide last** (5 steps) — cheaper starting materials, but the "
+            "isoxazole acid is made in two steps nobody has published a yield for.\n"
+            "3. **Convergent, SNAr first** (4 steps) — blocked: the fluoroarene is not "
+            "sold by any supplier I can see, and making it is three steps on its own.\n\n"
+            "**What I could not settle.** Route 2's yields are a guess. If route 1's "
+            "boronate goes out of stock, somebody should check route 2 properly before "
+            "committing to it."
+        ),
+        "job_ids": [],
+        "posted_at": _ago(30),
     },
 ]
 
@@ -145,7 +270,7 @@ MOCK_SUPERVISORS = [
         "state": "idle",
         "campaign_id": MOCK_CAMPAIGN["campaign_id"],
         "task_id": None,
-        "tasks_completed": 1,
+        "tasks_completed": 2,
         "tasks_failed": 1,
         "detail": None,
         "first_seen_at": _ago(95),
@@ -169,7 +294,7 @@ MOCK_SUPERVISORS = [
         "state": "gone",
         "campaign_id": MOCK_CAMPAIGN["campaign_id"],
         "task_id": None,
-        "tasks_completed": 1,
+        "tasks_completed": 2,
         "tasks_failed": 0,
         "detail": "finished its task and exited",
         "first_seen_at": _ago(70),
@@ -177,6 +302,50 @@ MOCK_SUPERVISORS = [
         "last_seen_seconds_ago": 1800,
     },
 ]
+
+
+def _finding(finding_id: str, branch: str, claim: str, minutes: int, notes: list | None = None, **fields) -> dict:
+    return {
+        "finding_id": finding_id, "campaign_id": MOCK_CAMPAIGN["campaign_id"], "branch": branch,
+        "claim": claim, "detail": fields.get("detail"), "evidence": fields.get("evidence", []),
+        "confidence": fields.get("confidence", "medium"), "tags": fields.get("tags", []),
+        "author": fields.get("author", "sup-1"), "task_id": fields.get("task_id"),
+        "created_at": _ago(minutes), "supersedes": None, "superseded_by": None, "notes": notes or [],
+    }
+
+
+# What the campaign knows: one branch settled, one argued over, one the plan
+# named that nobody has filed anything under yet.
+MOCK_FINDINGS = [
+    _finding("f-3", "potency", "A para-chloro on the phenyl holds Boltz affinity at 0.71", 20,
+             confidence="high", tags=["sar", "chloro"], task_id="t-aaa1",
+             evidence=["81000001", "CHEMBL1957266"],
+             detail="Seen in 14 of the top 20 of run 81000001; the unsubstituted core scored 0.64."),
+    _finding("f-2", "admet", "The morpholine tail costs QED but not affinity", 45, author="sup-2", tags=["qed"],
+             notes=[{"note_id": 1, "finding_id": "f-2", "body": "Run 81000003 lost affinity with it, 0.71 to 0.58.",
+                     "stance": "disputes", "author": "sup-3", "task_id": "t-aaa3", "created_at": _ago(30)}]),
+    _finding("f-1", "potency", "The triazolo core is needed; swapping it drops affinity below 0.5", 80,
+             confidence="high", tags=["sar", "core"], task_id="t-aaa1"),
+]
+
+MOCK_ATLAS = {
+    "campaign_id": MOCK_CAMPAIGN["campaign_id"],
+    "goal": MOCK_CAMPAIGN["goal"],
+    "findings": len(MOCK_FINDINGS),
+    "branches": [
+        {"branch": "potency", "name": "Potency", "in_plan": True, "findings": 2, "disputed": 0,
+         "latest": {"finding_id": "f-3", "claim": MOCK_FINDINGS[0]["claim"], "confidence": "high", "created_at": _ago(20)},
+         "tags": ["chloro", "core", "sar"]},
+        {"branch": "admet", "name": "ADMET", "in_plan": True, "findings": 1, "disputed": 1,
+         "latest": {"finding_id": "f-2", "claim": MOCK_FINDINGS[1]["claim"], "confidence": "medium", "created_at": _ago(45)},
+         "tags": ["qed"]},
+        {"branch": "selectivity", "name": "Selectivity over BRD2/3", "in_plan": True, "findings": 0, "disputed": 0,
+         "latest": None, "tags": []},
+    ],
+    "empty_branches": ["selectivity"],
+    "items": MOCK_FINDINGS,
+    "truncated": False,
+}
 
 
 def write_sample_structures() -> list[str]:
@@ -250,6 +419,41 @@ def make_app() -> FastAPI:
             "ready": True,
         }
 
+    # -- one conversation -----------------------------------------------------
+
+    def _summary() -> dict:
+        return {
+            "id": MOCK_SESSION_ID,
+            "title": "BRD4 — improving on JQ1",
+            "created": _ago(150),
+            "updated": _ago(1),
+            "turns": 6,
+            "busy": False,
+            "agents_allowed": 3,
+            "runs": {
+                "running": 0,
+                "total": len(MOCK_OWN_JOBS),
+                "jobs": [{"id": job["job_id"], "state": job["state"], "launched": True} for job in MOCK_OWN_JOBS],
+            },
+        }
+
+    @app.get("/api/sessions")
+    async def sessions() -> list[dict]:
+        return [_summary()]
+
+    @app.get("/api/sessions/{session_id}/events")
+    async def session_events(session_id: str) -> dict:
+        return {"session": _summary(), "events": []}
+
+    @app.post("/api/tools/{name}")
+    async def tool(name: str) -> dict:
+        """Only the reads the workbench makes on its own, without the agent."""
+        if name == "list_jobs":
+            return {"name": name, "result": MOCK_OWN_JOBS, "panels": []}
+        if name == "get_job_alerts":
+            return {"name": name, "result": [], "panels": []}
+        raise HTTPException(status_code=403, detail=f"{name} is not a direct tool in the mock")
+
     # -- the fleet ------------------------------------------------------------
     # A campaign part way through, so the Campaign tab has a shape to be
     # developed against: tasks at different stages, lineage between them, and
@@ -278,6 +482,12 @@ def make_app() -> FastAPI:
             "supervisors": MOCK_SUPERVISORS,
         }
 
+    @app.get("/api/fleet/campaigns/{campaign_id}/atlas")
+    async def fleet_atlas(campaign_id: str) -> dict:
+        if campaign_id != MOCK_CAMPAIGN["campaign_id"]:
+            raise HTTPException(status_code=404, detail=f"No campaign {campaign_id}")
+        return MOCK_ATLAS
+
     @app.get("/api/artifacts/{path:path}")
     async def artifact(path: str) -> FileResponse:
         candidate = (SHARED / path).resolve()
@@ -289,6 +499,10 @@ def make_app() -> FastAPI:
     async def chat(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.send_json({"type": "ready", "model": MODEL, "backend": "openai", "tools": TOOLS})
+        # Which conversation this socket is on. Without it the browser has no
+        # session id, and everything read per conversation — the campaigns
+        # above among them — asks for nothing.
+        await websocket.send_json({"type": "session", "lastSeq": 0, **_summary()})
 
         try:
             while True:
