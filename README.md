@@ -100,7 +100,7 @@ topology and the [campaign tools](#campaign-tools) that drive it.
 | 12 | RCSB PDB, ChEMBL, UniProt, InterPro, PubChem, and nucleic-acid annotation fetchers | Done |
 | 13 | Expanded ADMET and RetroDMTA ML endpoints for off-target, distribution, metabolism, elimination, and toxicity | Done |
 | 14 | REINVENT LibInvent/LinkInvent transformer support and unified Mol2Mol campaigns | Done |
-| 15 | Conductor + supervisor fleet on Kubernetes (campaign ledger, pooled scorers, Pareto-driven dispatch) | Done |
+| 15 | Conductor + supervisor fleet on Kubernetes (campaign ledger, pooled scorers, conductor-led dispatch) | Done |
 | 16 | Per-molecule evaluation detail tools for the Reviewer (`get_evaluation_detail`, `read_structure_file`) | Planned |
 | 17 | OpenTelemetry tracing of agent turns + tool calls | Planned |
 | 18 | Docker Compose parity for the fleet topology | Planned |
@@ -140,7 +140,7 @@ AMD-Cofolding-agent/
 │   │   ├── boltz_structure.py           # Structure-conditioned Boltz cofolding
 │   │   ├── synthesis.py                 # AiZynthFinder planning and availability tools
 │   │   ├── generation.py                # Reinvent/LibInvent/LinkInvent/Mol2Mol campaigns
-│   │   └── campaign.py                  # Fleet campaigns, dispatch, supervisors, Pareto front
+│   │   └── campaign.py                  # Fleet campaigns, dispatch, supervisors, results
 │   ├── runner_client.py                 # Forwards jobs and scoring to reinvent-runner
 │   ├── transforms.py                    # Shared transform construction
 │   ├── jobs/
@@ -172,7 +172,7 @@ AMD-Cofolding-agent/
 │   ├── env.sh
 │   ├── dd-agent/                        # Agent + MCP server image. CPU only, no REINVENT4
 │   ├── reinvent-runner/                 # REINVENT4, the priors and the compatibility patch
-│   ├── campaign-store/                  # Campaign ledger: task queue, leases, Pareto front
+│   ├── campaign-store/                  # Campaign ledger: task queue, leases, results
 │   ├── boltz-gateway/                   # Result cache + batch coalescing in front of Boltz
 │   ├── boltz2/                          # Cofolding, affinity, structure conditioning
 │   ├── posebusters/                     # Pose validation
@@ -878,40 +878,33 @@ Generation campaigns support the RNN and PubChem-trained transformer variants of
 
 ### Campaign tools
 
-A campaign is one goal explored in parallel: N supervisors each run a variant
-of the same TTP at different objective weights, and the Pareto front is what
-the campaign produces. These 13 tools are how a conductor opens one, watches
-it, steers it and closes it. The deployment topology is in
+A campaign is one goal explored in parallel: N supervisors each run a task the
+conductor dispatched, and each posts back what it found. These 12 tools are how
+a conductor opens one, watches it, steers it and closes it. The deployment topology is in
 [`k8s/README.md`](k8s/README.md#the-fleets-ledger-campaign-store).
 
 | Tool | Read-only | Description |
 |------|:---------:|-------------|
 | `start_campaign` | | Open a campaign: a goal, a base TTP, objectives, a pool size and a clock |
 | `list_campaigns` | | Every campaign newest first, with task counts, result counts and last activity |
-| `get_campaign_state` | | One campaign in full: task counts, who holds what, the front, time left |
+| `get_campaign_state` | | One campaign in full: task counts, who holds what, results in, time left |
 | `enqueue_task` | | Queue one weight vector by hand, optionally with an `intent` |
 | `list_supervisors` | | The pool: how many exist and how many could take work now |
-| `get_pool_capacity` | | Whether to dispatch, and which of the two limits says no |
+| `get_pool_capacity` | | Whether to dispatch, and which of the limits says no |
 | `set_concurrency` | | Change how many supervisors the campaign holds in flight |
 | `cancel_supervisor` | | Take a task back from the supervisor running it |
 | `get_supervisor_result` | | What one finished task achieved: profile and molecules |
-| `get_pareto_front` | | The non-dominated results, plus the ones left off for missing an objective |
 | `get_campaign_files` | | Where each task's output is on disk, so results can be opened |
 | `close_campaign` | | Stop dispatching; let in-flight tasks finish |
 | `finalize_campaign` | | Close the books and abandon anything outstanding |
 
-Two of these repay a closer look, because their answers are easy to
-misread:
-
-- **`get_pareto_front` also returns `ineligible`.** A result only reaches the
-  front if it reports *every* declared objective, so a scorer that failed
-  takes its whole result off the front rather than placing it badly. Those
-  results are listed separately with the objectives they are missing — an
-  empty front with six ineligible entries means a broken scorer, not six bad
-  trade-offs.
-- **`get_pool_capacity` reports two constraints.** A supervisor must be free
-  *and* the scorer must have queue room. Either number alone misleads: an idle
-  supervisor handed work while Boltz is saturated only moves the wait.
+One of these repays a closer look, because its answer is easy to misread:
+**`get_pool_capacity` reports two constraints.** A supervisor must be free
+*and* the scorer must have queue room. Either number alone misleads: an idle
+supervisor handed work while Boltz is saturated only moves the wait. Design
+tasks also need a run, and the run window — an AIMD limit on concurrent
+REINVENT runs that halves while Slurm is slow to start them and grows back
+as runs start promptly — is reported beside them.
 
 ---
 
@@ -1228,7 +1221,10 @@ On Compose and Apptainer these are set in `services/env.local.sh` and forwarded 
 | `REINVENT4_AGENT_NO_VERIFY_SSL` | `true` | Disable TLS verification |
 | `REINVENT4_AGENT_THINKING_BUDGET` | `1024` | Extended-thinking token budget (Anthropic) |
 | `REINVENT4_AGENT_REASONING_EFFORT` | — | `low`/`medium`/`high` for o-series deployments (OpenAI) |
-| `REINVENT4_AGENT_MAX_TOKENS` | `128000` for `gpt-5`, `100000` for the o-series, else `4096` | Maximum tokens per response. On reasoning models the cap also covers hidden reasoning tokens, so `env.sh` defaults it to the model's full output limit and the backend floors it at 32768 |
+| `REINVENT4_AGENT_MAX_TOKENS` | `128000` for `gpt-5`, `100000` for the o-series, else `4096` | Maximum tokens per response. On reasoning models the cap also covers hidden reasoning tokens, so `env.sh` defaults it to the model's full output limit and the backend floors it at 32768. It is also lowered automatically when a long prompt leaves the window less room than the cap asks for |
+| `REINVENT4_AGENT_CONTEXT_TOKENS` | read from `/v1/models` | Context the endpoint serves. Normally discovered (vLLM reports `max_model_len`, which is a serving choice and not the model's limit); set it for an endpoint that does not list its models. The conversation is condensed once it fills 70% of it |
+| `REINVENT4_AGENT_MAX_TOOL_ROUNDS` | `2000` | Tool calls one turn may make. A supervisor works a task for hours and a conductor runs a campaign across a whole budget, so what bounds a turn in practice is the autonomy budget and the context rather than this |
+| `REINVENT4_AGENT_MAX_TOOL_RESULT_CHARS` | `60000` | How much of one tool result the model is given. The head and the tail are kept and the middle is cut with a note; the browser and the JSONL transcript still get the whole thing |
 
 **Multi-agent**
 

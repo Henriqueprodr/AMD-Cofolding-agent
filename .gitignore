@@ -44,7 +44,9 @@ reinvent4_amd_helpers/
 PHASE3A_API_REQUIREMENTS.md
 /job_data*/
 SLIDES.md
-data/
+# Anchored: unanchored, this also matched test_rcsb/fixtures/data/, so the
+# metadata fixtures were never committed and 44 tests error on a missing file.
+/data/
 
 # Container images -- large build artifacts, NOT committed.
 # enroot squashfs images + cached base images (services/enroot/).

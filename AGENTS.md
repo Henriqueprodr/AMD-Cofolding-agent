@@ -196,7 +196,7 @@ its own terminal and monitor from a second shell.
 | `--start` | open a new campaign instead of attaching |
 | `--goal` | what the campaign is for, carried in the ledger |
 | `--base-ttp` | the TTP every task varies the weights of |
-| `--objectives` | names the front is computed over (default: all the TTP declares) |
+| `--objectives` | names each result is reported on (default: all the TTP declares) |
 | `--concurrency` | supervisors to hold in flight |
 | `--hours` / `--grace-hours` | dispatch window / drain window |
 | `--task-budget-hours` | per-task wall clock, capped by the hard stop |
@@ -332,24 +332,20 @@ shows the old count and looks like a failure.
 ```bash
 kubectl -n "${PROJECT}" exec -i deployment/dd-agentic-conductor -c dd-conductor -- python - <<'PY'
 from reinvent4_mcp.tools.campaign import (
-    get_campaign_state, get_pareto_front, get_supervisor_result,
+    get_campaign_state, get_supervisor_result,
     get_campaign_files, list_campaigns,
 )
 
 CID = "<campaign-id>"
-print(get_campaign_state(CID))     # counts, who holds what, front, time left
-print(get_pareto_front(CID))       # the non-dominated trade-offs
+print(get_campaign_state(CID))     # counts, who holds what, time left
 print(get_campaign_files(CID))     # where each task's output is on disk
 # print(get_supervisor_result(CID, "<task-id>"))   # one task: profile + molecules
 PY
 ```
 
-**Reading the front correctly matters more than any other single thing here.**
-A result reaches the front only if it reports *every* declared objective, so a
-scorer that failed takes its whole result off the front rather than placing it
-badly. Those results come back separately as `ineligible` with the objectives
-they are missing. **An empty front with six ineligible entries means a broken
-scorer, not six bad trade-offs.**
+A profile carries only the objectives its scorers actually reported. A result
+with molecules, an empty profile and "no per-objective scores were readable" in
+its summary means a broken scorer, not a bad run.
 
 The objective profile is the best *single molecule's* scores — not the best
 value seen per objective, which would mix molecules and describe a compound

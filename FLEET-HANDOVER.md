@@ -107,7 +107,7 @@ the ledger holds a queue of **tasks** — each one a weight vector over the
 campaign's objectives. Each supervisor claims a task on a lease, applies the
 weights to a variant of the base TTP, runs its own RL job on the shared
 runner, posts the achieved objective profile, and claims the next one. What
-the campaign produces is the **Pareto front** over those results.
+the campaign produces is those results, one per task.
 
 ```
 conductor ──opens/steers──> campaign-store (ledger, SQLite, 1 replica)
@@ -179,7 +179,7 @@ override naming an objective the base TTP does not have fails the task when a
 supervisor picks it up, so read the objectives before steering by hand.
 
 For a first run use **`brd4-bd1-lead-opt`**: three objectives, one external
-scorer plus ADMET, and the shortest path to a populated Pareto front.
+scorer plus ADMET, and the shortest path to a first set of results.
 `brd4-bd1-allscore` is the full nine-objective profile, and its last two
 campaigns failed every task — see §7 for why.
 
@@ -269,16 +269,13 @@ kubectl --namespace "${PROJECT}" exec deployment/dd-agentic -c dd-agent -- pytho
 The gateway should report `healthy_replicas: 4` and `upstream_reachable: true`.
 The runner reports `active_jobs` against `max_concurrent_jobs`.
 
-### Reading the Pareto front
+### Reading a result
 
-A result reaches the front only if it reports **every** declared objective, so
-a scorer that failed takes its whole result off the front rather than placing
-it badly. Those results are listed separately as `ineligible` with the
-objectives they are missing.
-
-**An empty front with six ineligible entries means a broken scorer, not six
-bad trade-offs.** This is the single most important thing to know when reading
-a campaign that looks like it produced nothing.
+A profile carries only the objectives its scorers actually reported. **A
+profile missing an objective, or an empty one with "no per-objective scores
+were readable" in the summary, means a broken scorer, not a bad run.** This is
+the single most important thing to know when reading a campaign that looks
+like it produced nothing.
 
 ---
 
@@ -316,7 +313,7 @@ AIMServices, so scaling their Deployments would simply be undone.
 
 ## 7. Known failure modes
 
-**An empty Pareto front with everything ineligible.** A scorer is down or not
+**Every result is missing the same objective.** A scorer is down or not
 deployed. The scoring component turns a connection error into `NaN` for every
 molecule — correct for a flaky service mid-campaign, but with one down for a
 whole run you get a completed job full of `NaN` and a geometric mean built on
