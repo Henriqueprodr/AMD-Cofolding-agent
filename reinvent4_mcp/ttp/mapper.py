@@ -642,6 +642,23 @@ def _map_external_objective(
     # Inject protein target info for structure prediction (Boltz)
     if ttp.target and objective.service in ("boltz",):
         params["protein_sequence"] = ttp.target.protein_sequence
+        if ttp.target.templates:
+            # The builder stores target templates in a service-neutral shape.
+            # Boltz accepts one structure template per score request, so use
+            # the first one just as the builder does when editing a profile.
+            template = ttp.target.templates[0]
+            chain = template.chain_id or ttp.target.structure_chain
+            if chain:
+                params.setdefault(
+                    "structure_template",
+                    {
+                        "structure_path": template.path,
+                        "chain_ids": [chain],
+                        "template_ids": None,
+                        "force": template.force,
+                        "threshold": template.threshold or 2.0,
+                    },
+                )
         if ttp.target.msa_path:
             params["msa_path"] = ttp.target.msa_path
             # A precomputed MSA and the colabfold server are mutually

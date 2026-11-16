@@ -10,12 +10,12 @@ const catalogue = objectiveCatalogue({}, []);
 const render = () => renderToStaticMarkup(<ObjectivePicker groups={objectiveGroups(catalogue)} objectives={defaultObjectives(catalogue)} onToggle={() => undefined} />);
 
 describe("ObjectivePicker", () => {
-  it("shows one row per group, untitled, without a group checkbox", () => {
+  it("labels every endpoint group without adding a group checkbox", () => {
     const html = render();
     expect(html).not.toContain('type="checkbox"');
     for (const name of ["Cofold", "Drug-likeness", "ADMET"]) {
       expect(html).toContain(`aria-label="${name}"`);
-      expect(html).not.toContain(`>${name}</span>`);
+      expect(html).toContain(`>${name}</span>`);
     }
     const checkboxes = html.match(/role="checkbox"/g) ?? [];
     expect(checkboxes).toHaveLength(catalogue.filter((e) => !e.extra).length);

@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_RUN,
+  generationSection,
   RUN_KEY,
   addSeeds,
   loadRunSettings,
@@ -32,7 +33,7 @@ describe("run settings", () => {
     const store = memory();
     expect(loadRunSettings(store)).toEqual(DEFAULT_RUN);
     expect(DEFAULT_RUN.prior).toBeNull();
-    saveRunSettings({ enabled: true, maxSteps: 100, batchSize: 32, prior: "mol2mol", model: ".m2m_high", seeds: "CCO" }, store);
+    saveRunSettings({ enabled: true, maxSteps: 100, batchSize: 32, prior: "mol2mol", model: ".m2m_high", seeds: "CCO", scaffold: "" }, store);
     expect(loadRunSettings(store)).toEqual({ enabled: true, maxSteps: 100, batchSize: 32, prior: null, model: ".m2m_high", seeds: "CCO", scaffold: "" });
     store.setItem(RUN_KEY, JSON.stringify({ maxSteps: -3, batchSize: 1.5, prior: "x", model: "/etc/passwd" }));
     expect(loadRunSettings(store)).toEqual(DEFAULT_RUN);
@@ -92,6 +93,16 @@ describe("run settings", () => {
       'Run REINVENT on the TTP "Solubility" (sol): Mol2Mol medium similarity (.m2m_medium) from CCO c1ccccc1 CCN, 300 steps, batch size 16.',
     );
     expect(seedList("  ")).toEqual([]);
+  });
+
+  it("persists the exact molecule count per step in the generation contract", () => {
+    expect(generationSection({ ...DEFAULT_RUN, enabled: true, prior: "mol2mol", maxSteps: 4, batchSize: 4, seeds: "CCO\nCCN" })).toEqual({
+      mode: "mol2mol",
+      model: ".m2m_medium",
+      batch_size: 4,
+      n_steps: 4,
+      mol2mol_input: { seed_smiles: ["CCO", "CCN"] },
+    });
   });
 
   it("asks for a run on a stored TTP whatever the builder switch says", () => {

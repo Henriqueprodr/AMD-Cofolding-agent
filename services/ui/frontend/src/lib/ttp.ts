@@ -865,7 +865,8 @@ export function objectiveKey(o: Pick<Objective, "type" | "component" | "service"
   if (o.type === "native") return `native:${o.component ?? ""}`;
   const p = o.service_params ?? {};
   const selector = [p.target, p.endpoint, p.interaction_type].filter((v) => typeof v === "string" && v).join(":");
-  return `${o.service ?? ""}:${selector}`;
+  const modelSet = o.service === "admet" && typeof p.model_set === "string" && p.model_set !== "drug" ? `:${p.model_set}` : "";
+  return `${o.service ?? ""}:${selector}${modelSet}`;
 }
 
 /** Windows for scores that are already 0-1, used once a curve is chosen for them. */
@@ -1003,7 +1004,11 @@ export function objectiveCatalogue(services: Record<string, ServiceInfo>, compon
     for (const ms of admetSetNames) {
       const groupName = ms === "drug" ? "ADMET" : `ADMET (${ms})`;
       for (const endpoint of admetSets[ms]) {
-        entries.push(catalogueEntry(groupName, ENDPOINT_NAMES[endpoint] ?? endpoint, () => serviceObjective(services, "admet", endpoint, undefined, ms)));
+        entries.push(catalogueEntry(groupName, ENDPOINT_NAMES[endpoint] ?? endpoint, () => serviceObjective(services, "admet", endpoint, undefined, ms), {
+          // Therapeutic profiles lead with the drug stack. Agro endpoints are
+          // still available, but no longer look like an accidental duplicate.
+          extra: ms !== "drug",
+        }));
       }
     }
   } else {
@@ -1176,11 +1181,11 @@ export function formProblems(form: TtpForm, existingIds: string[] = []): string[
   else if (!TTP_ID.test(form.id)) problems.push("The id may only hold lowercase letters, digits, - and _, starting with a letter or digit.");
   else if (existingIds.includes(form.id)) problems.push(`A TTP with id "${form.id}" already exists.`);
   const structure = form.structurePath?.trim() ?? "";
-  const sequence = structure ? "" : normaliseSequence(form.sequence);
+  const sequence = normaliseSequence(form.sequence);
   const seqProblem = sequenceProblem(sequence);
   if (seqProblem) problems.push(seqProblem);
   if (structure && !TEMPLATE_FILE.test(structure)) problems.push(`${structure.split("/").pop()} is not a .cif or .pdb file.`);
-  const protein = Boolean(structure || sequence);
+  const protein = Boolean(sequence);
   if (form.objectives.length === 0) problems.push("Add at least one objective.");
   const names = form.objectives.map((o) => o.name.trim());
   if (names.some((n) => !n)) problems.push("Every objective needs a name.");
@@ -1199,7 +1204,7 @@ export function formProblems(form: TtpForm, existingIds: string[] = []): string[
       if (typeof o.transform?.[key] !== "number" || !Number.isFinite(o.transform[key])) problems.push(`${o.name}: the transform's ${key} is not a number.`);
     }
   }
-  if (form.objectives.some((o) => o.service === "boltz") && !protein) problems.push("Cofolding needs the protein: a structure or a sequence.");
+  if (form.objectives.some((o) => o.service === "boltz") && !protein) problems.push("Cofolding needs the protein sequence; selecting a structure fills it from the chosen chain.");
   else if (form.msaPath?.trim() && !protein) problems.push("An MSA needs the protein it was built for.");
   for (const t of form.templates ?? []) {
     const name = t.path.split("/").pop() ?? t.path;
@@ -1234,9 +1239,10 @@ export function buildTtp(form: TtpForm): Record<string, unknown> {
   };
   const structure = form.structurePath?.trim();
   if (structure || sequence) {
-    const target: Record<string, unknown> = structure
-      ? { structure_path: structure, ...(form.structureChain?.trim() ? { structure_chain: form.structureChain.trim() } : {}) }
-      : { protein_sequence: sequence };
+    const target: Record<string, unknown> = {
+      ...(sequence ? { protein_sequence: sequence } : {}),
+      ...(structure ? { structure_path: structure, ...(form.structureChain?.trim() ? { structure_chain: form.structureChain.trim() } : {}) } : {}),
+    };
     if (form.pdbId.trim()) target.pdb_id = form.pdbId.trim().toUpperCase();
     if (form.msaPath?.trim()) target.msa_path = form.msaPath.trim();
     if (form.proteinPdbPath?.trim()) target.protein_pdb_path = form.proteinPdbPath.trim();

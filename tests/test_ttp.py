@@ -332,6 +332,23 @@ class TestTargetConfig:
         t = TargetConfig(protein_sequence="acdefghiklmnpqrstvwy")
         assert t.protein_sequence == "ACDEFGHIKLMNPQRSTVWY"
 
+    def test_structure_selection_metadata_is_accepted(self):
+        t = TargetConfig(
+            protein_sequence="ACDEFGHIKLMNPQRSTVWY",
+            structure_path="uploads/session/target.cif",
+            structure_chain="A",
+            templates=[
+                {
+                    "path": "uploads/session/target_A.cif",
+                    "chain_id": "A",
+                    "force": True,
+                    "threshold": 2,
+                }
+            ],
+        )
+        assert t.structure_path == "uploads/session/target.cif"
+        assert t.templates and t.templates[0].chain_id == "A"
+
 
 # ---------------------------------------------------------------------------
 # PreScoringComponent tests
@@ -790,6 +807,36 @@ class TestTTPToScorerConfig:
         assert boltz_params["protein_sequence"] == ttp.target.protein_sequence
         assert boltz_params["msa_path"] == "/data/msa/jak2.a3m"
         assert boltz_params["protein_pdb_path"] == "/data/structures/3KRR_protein.pdb"
+
+    def test_structure_template_is_translated_for_boltz(self):
+        data = {
+            **FULL_TTP,
+            "target": {
+                **FULL_TTP["target"],
+                "structure_path": "uploads/session/target.cif",
+                "structure_chain": "A",
+                "templates": [
+                    {
+                        "path": "uploads/session/target_A.cif",
+                        "chain_id": "A",
+                        "force": True,
+                        "threshold": 1.5,
+                    }
+                ],
+            },
+        }
+        config = ttp_to_scorer_config(TTP.model_validate(data))
+        external = [
+            c for c in config["component"] if "ExternalRESTScorer" in c
+        ]
+        params = external[0]["ExternalRESTScorer"]["endpoint"][0]["params"]
+        assert params["structure_template"] == {
+            "structure_path": "uploads/session/target_A.cif",
+            "chain_ids": ["A"],
+            "template_ids": None,
+            "force": True,
+            "threshold": 1.5,
+        }
 
     def test_msa_path_disables_msa_server(self):
         # A precomputed msa_path must force use_msa_server=False so boltz

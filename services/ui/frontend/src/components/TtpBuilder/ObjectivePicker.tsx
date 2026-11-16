@@ -22,7 +22,8 @@ export function ObjectivePicker({ groups, objectives, onToggle }: Props) {
         const shown = group.entries.filter((e) => open || !e.extra || keys.has(e.key));
         const colour = groupColour(group.name);
         return (
-          <div key={group.name} role="group" aria-label={group.name} className="flex flex-wrap gap-1">
+          <div key={group.name} role="group" aria-label={group.name} className="flex flex-wrap items-center gap-1">
+              <span className="text-faint mr-1 min-w-20 text-[10px] font-medium uppercase tracking-wide">{group.name}</span>
               {shown.map((e) => {
                 const on = keys.has(e.key);
                 const blocked = !on && e.after !== undefined && !keys.has(e.after);

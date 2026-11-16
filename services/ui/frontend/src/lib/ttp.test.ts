@@ -471,6 +471,7 @@ describe("objectives", () => {
       expect(objectiveKey(renamed)).toBe("native:QED");
       expect(toggleObjective([renamed], pick("native:QED"), false)).toEqual([]);
       expect(objectiveKey(serviceObjective(services, "admet", "logd"))).toBe("admet:logd");
+      expect(objectiveKey(serviceObjective(services, "admet", "logd", undefined, "agro"))).toBe("admet:logd:agro");
     });
 
     it("adds pose checks only after Boltz, and drops them with it", () => {
@@ -523,7 +524,7 @@ describe("formProblems and buildTtp", () => {
   it("explains what the server would reject", () => {
     expect(formProblems(form({ id: "Bad id" }))[0]).toMatch(/lowercase/);
     expect(formProblems(form(), ["brd4-cofold"])[0]).toMatch(/already exists/);
-    expect(formProblems(form({ sequence: "" }))).toContain("Cofolding needs the protein: a structure or a sequence.");
+    expect(formProblems(form({ sequence: "" }))).toContain("Cofolding needs the protein sequence; selecting a structure fills it from the chosen chain.");
     expect(formProblems(form({ objectives: [] }))).toContain("Add at least one objective.");
     const objectives = presetObjectives("cofolding", services);
     expect(formProblems(form({ objectives: objectives.slice(1) })).join(" ")).toMatch(/runs after "Boltz affinity"/);
@@ -568,12 +569,16 @@ describe("formProblems and buildTtp", () => {
     expect(formProblems(form({ sequence: "", objectives: [nativeObjective("QED")], msaPath: "msas/brd4.a3m" }))).toEqual(["An MSA needs the protein it was built for."]);
   });
 
-  it("sends a structure's chain instead of the sequence", () => {
-    const structured = form({ sequence: "not sent", structurePath: " uploads/s-1/1M17.cif ", structureChain: "A", pdbId: "1m17", msaPath: "msas/egfr.a3m" });
+  it("sends a structure's chain together with its sequence", () => {
+    const structured = form({ sequence: SEQ, structurePath: " uploads/s-1/1M17.cif ", structureChain: "A", pdbId: "1m17", msaPath: "msas/egfr.a3m" });
     expect(formProblems(structured)).toEqual([]);
-    expect(buildTtp(structured).target).toEqual({ structure_path: "uploads/s-1/1M17.cif", structure_chain: "A", pdb_id: "1M17", msa_path: "msas/egfr.a3m" });
+    expect(buildTtp(structured).target).toEqual({ protein_sequence: SEQ, structure_path: "uploads/s-1/1M17.cif", structure_chain: "A", pdb_id: "1M17", msa_path: "msas/egfr.a3m" });
     expect(buildTtp(form({ sequence: "", structurePath: "x.pdb", structureChain: null })).target).toEqual({ structure_path: "x.pdb" });
-    expect(formProblems(form({ sequence: "", structurePath: "msas/x.a3m" }))).toEqual(["x.a3m is not a .cif or .pdb file."]);
+    expect(formProblems(form({ sequence: "", structurePath: "x.pdb" }))).toContain("Cofolding needs the protein sequence; selecting a structure fills it from the chosen chain.");
+    expect(formProblems(form({ sequence: "", structurePath: "msas/x.a3m" }))).toEqual([
+      "x.a3m is not a .cif or .pdb file.",
+      "Cofolding needs the protein sequence; selecting a structure fills it from the chosen chain.",
+    ]);
     expect(buildTtp(form({ structurePath: "" })).target).toEqual({ protein_sequence: SEQ });
   });
 

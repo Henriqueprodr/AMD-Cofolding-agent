@@ -137,6 +137,20 @@ export const removeSeed = (text: string, smiles: string) => seedList(text).filte
 export const runModel = (settings: RunSettings) =>
   settings.prior === "mol2mol" ? settings.model : `.${settings.prior ?? "reinvent"}`;
 
+/** Persist the builder's exact run contract in the TTP, not only in prose. */
+export function generationSection(settings: RunSettings): Record<string, unknown> {
+  const base: Record<string, unknown> = {
+    mode: settings.prior,
+    model: runModel(settings),
+    batch_size: settings.batchSize,
+    n_steps: settings.maxSteps,
+  };
+  if (settings.prior === "mol2mol") base.mol2mol_input = { seed_smiles: seedList(settings.seeds) };
+  if (settings.prior === "libinvent") base.libinvent_input = { scaffold: settings.scaffold.trim() };
+  if (settings.prior === "linkinvent") base.linkinvent_input = { fragments: fragmentList(settings.scaffold) };
+  return base;
+}
+
 /** What the composer gets after a TTP is created: use it, or also start a run on it with these settings. */
 export function ttpRequest(ttp: { id: string; name: string }, settings: RunSettings): string {
   if (!settings.enabled) return `Use the TTP "${ttp.name}" (${ttp.id})`;

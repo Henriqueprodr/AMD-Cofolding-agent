@@ -3,7 +3,7 @@
 
 import { lazy, Suspense, useState } from "react";
 import { createPortal } from "react-dom";
-import type { Ketcher } from "ketcher-core";
+import { Atom, Bond, Vec2, type Ketcher } from "ketcher-core";
 import type { Theme } from "../../hooks/useTheme";
 import { countAttachmentPoints, numberAttachmentPoints } from "../../lib/attachment";
 import type { SketchMode } from "../../lib/sketcherBus";
@@ -42,8 +42,8 @@ const TITLE: Record<SketchMode, string> = {
 
 const HINT: Record<SketchMode, string> = {
   molecule: "Use puts the SMILES in your message.",
-  scaffold: "Mark each position to decorate with an attachment point (R / *). They are numbered for you.",
-  fragment: "Mark the one position where the linker joins with an attachment point (R / *).",
+  scaffold: "Select an atom, then click Add * for every position to decorate. They are numbered for you.",
+  fragment: "Select the atom where the linker joins, then click Add * once.",
 };
 
 /** A molecule editor in a dialog; "Use" hands back what was drawn, as SMILES. */
@@ -101,6 +101,34 @@ export function Sketcher({ smiles, mode = "molecule", theme, onUse, onClose }: P
     }
   }
 
+  function addAttachmentPoint() {
+    if (!ketcher) return;
+    const selected = ketcher.editor.selection()?.atoms ?? [];
+    if (selected.length !== 1) {
+      setProblem("Select exactly one atom, then click Add *.");
+      return;
+    }
+    const next = ketcher.editor.struct().clone();
+    const parent = next.atoms.get(selected[0]);
+    if (!parent) {
+      setProblem("The selected atom is no longer in the drawing.");
+      return;
+    }
+    const distance = next.getAvgBondLength() || 1;
+    const star = next.atoms.add(
+      new Atom({
+        label: "*",
+        fragment: parent.fragment,
+        pp: new Vec2(parent.pp.x + distance, parent.pp.y),
+      }),
+    );
+    next.bonds.add(new Bond({ begin: selected[0], end: star, type: Bond.PATTERN.TYPE.SINGLE }));
+    next.markFragments();
+    ketcher.editor.struct(next, true);
+    ketcher.editor.selection({ atoms: [star] });
+    setProblem(null);
+  }
+
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-6" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div
@@ -154,6 +182,16 @@ export function Sketcher({ smiles, mode = "molecule", theme, onUse, onClose }: P
           <span className="text-muted min-w-0 flex-1 truncate text-xs" role="status" style={problem ? { color: "var(--color-accent)" } : undefined}>
             {problem ?? (ketcher ? HINT[activeMode] : "")}
           </span>
+          {activeMode !== "molecule" && (
+            <button
+              type="button"
+              onClick={addAttachmentPoint}
+              disabled={!ketcher}
+              className="border-subtle text-body hover:bg-sunken h-8 cursor-pointer rounded-lg border px-3 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Add *
+            </button>
+          )}
           <button
             type="button"
             onClick={onClose}

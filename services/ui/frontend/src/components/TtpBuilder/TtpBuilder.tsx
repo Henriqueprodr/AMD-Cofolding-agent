@@ -46,6 +46,7 @@ import {
   type TtpSummary,
 } from "../../lib/ttp";
 import {
+  generationSection,
   loadRunSettings,
   mol2molChoices,
   parseMol2MolModels,
@@ -246,6 +247,7 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
   const [template, setTemplate] = useState<Template>(() =>
     start?.templates?.length ? { state: "ready", key: "kept", config: start.templates[0], atoms: null } : { state: "off" },
   );
+  const [curate, setCurate] = useState(() => !start?.templates?.length || start.templates[0].path !== start.structurePath);
   const [force, setForce] = useState(start?.templates?.[0]?.force ?? false);
   const [threshold, setThreshold] = useState(String(start?.templates?.[0]?.threshold ?? 2));
   const [msa, setMsa] = useState<FileRead<string | null>>(() => (start?.msaPath ? { state: "busy", path: start.msaPath } : { state: "idle" }));
@@ -310,7 +312,9 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
     name,
     id: id ?? freeSlug(name, ids),
     description: start?.description ?? "",
-    sequence: structured ? "" : sequence,
+    // Boltz always needs a sequence, even when a structure supplies the
+    // template. The selected chain is the authoritative sequence in that case.
+    sequence: structured ? (chain?.sequence ?? "") : sequence,
     structurePath: structure.state === "ready" ? structure.path : "",
     structureChain: chosenChain,
     pdbId: structured ? (source?.pdb ?? "") : keptPdb,
@@ -377,8 +381,12 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
     saveRunSettings(next);
   };
 
-  const makeTemplate = async (key: string, from: Loaded, chainOf: string) => {
+  const makeTemplate = async (key: string, from: Loaded, chainOf: string, shouldCurate = curate) => {
     latest.current.template = key;
+    if (!shouldCurate) {
+      setTemplate({ state: "ready", key, config: { path: key.split("#")[0], chain_id: chainOf }, atoms: null });
+      return;
+    }
     setTemplate({ state: "busy", key });
     try {
       const file = templateName(from.label, chainOf);
@@ -444,6 +452,11 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
     else setTemplate({ state: "off" });
   };
 
+  const toggleCuration = (on: boolean) => {
+    setCurate(on);
+    if (template.state !== "off" && source && templateKey && chosenChain) void makeTemplate(templateKey, source, chosenChain, on);
+  };
+
   const applyRange = (from: string, to: string) => {
     setRange({ from, to });
     const next = reference ? sliceRegion(reference, Number(from), Number(to)) : null;
@@ -497,7 +510,9 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
   };
 
   const createOnly = async (): Promise<CreatedTtp | null> => {
-    const response = await callTool("create_ttp", { ttp: buildTtp(form) });
+    const ttp = buildTtp(form);
+    if (run.enabled) ttp.generation = generationSection(effective);
+    const response = await callTool("create_ttp", { ttp });
     const created = createdTtp(response.result);
     if ("error" in created) {
       setSubmit({ state: "error", message: created.error, forbidden: false });
@@ -654,7 +669,14 @@ function BuilderForm({ onClose, onCreated, initial, molecules, catalog, saved }:
                   <Switch on={template.state !== "off"} label="Use as template" disabled={template.state === "off" && !templateKey} onChange={toggleTemplate} />
                   <span className={template.state === "off" ? "text-muted" : "text-body"}>Use as template</span>
                 </span>
-                {template.state === "busy" && <span className="text-faint">Saving a cleaned copy…</span>}
+                {template.state !== "off" && (
+                  <span className="flex items-center gap-1.5" title="Keep the chosen protein chain and remove waters, ligands, hydrogens and alternate locations.">
+                    <Switch on={curate} label="Curate structure" onChange={toggleCuration} />
+                    <span className="text-body">Curate structure</span>
+                    <span className="text-faint">(recommended)</span>
+                  </span>
+                )}
+                {template.state === "busy" && <span className="text-faint">Saving a curated copy…</span>}
                 {template.state === "error" && <span style={{ color: "var(--color-accent)" }}>{template.message}</span>}
                 {template.state === "ready" && (
                   <span className="text-faint truncate">

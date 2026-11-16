@@ -199,6 +199,33 @@ class TransformConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class StructureTemplateConfig(BaseModel):
+    """A protein structure used to condition Boltz ligand placement."""
+
+    model_config = {"extra": "forbid"}
+
+    path: str = Field(description="Shared-volume path to a PDB or mmCIF template")
+    chain_id: Optional[str] = Field(
+        default=None,
+        description="Protein chain to use from the template",
+    )
+    force: bool = Field(
+        default=False,
+        description="Apply the template as a forced rather than soft constraint",
+    )
+    threshold: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="Maximum backbone deviation in Angstrom when force is true",
+    )
+
+    @model_validator(mode="after")
+    def _forced_template_has_threshold(self) -> "StructureTemplateConfig":
+        if self.force and self.threshold is None:
+            raise ValueError("A forced structure template requires a threshold")
+        return self
+
+
 class TargetConfig(BaseModel):
     """Protein target information for structure-based scoring.
 
@@ -210,6 +237,18 @@ class TargetConfig(BaseModel):
 
     protein_sequence: str = Field(
         description="Full amino-acid sequence of the target protein",
+    )
+    structure_path: Optional[str] = Field(
+        default=None,
+        description="Shared-volume path of the structure selected for this target",
+    )
+    structure_chain: Optional[str] = Field(
+        default=None,
+        description="Protein chain selected from structure_path",
+    )
+    templates: Optional[list[StructureTemplateConfig]] = Field(
+        default=None,
+        description="Structures used to condition Boltz ligand placement",
     )
     pdb_id: Optional[str] = Field(
         default=None,
