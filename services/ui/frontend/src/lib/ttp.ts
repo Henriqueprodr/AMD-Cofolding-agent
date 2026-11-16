@@ -999,11 +999,20 @@ export function objectiveCatalogue(services: Record<string, ServiceInfo>, compon
   // stack). When model_sets is populated use it; fall back to the flat
   // endpoints list (all drug) for backward compatibility.
   const admetSets = services.admet?.model_sets ?? {};
-  const admetSetNames = Object.keys(admetSets);
+  // The drug stack leads, so the shared endpoints always come from it and the
+  // other stacks are read against what it already offers.
+  const admetSetNames = Object.keys(admetSets).sort((a, b) => Number(b === "drug") - Number(a === "drug"));
   if (admetSetNames.length) {
+    // agro is a superset of drug, not a separate stack: it is the same 17
+    // pharmaceutical endpoints plus 8 agrochemical ones. Listing each set in
+    // full therefore showed every shared endpoint twice, which is the
+    // duplication seen in the builder. A non-default set contributes only the
+    // endpoints the default one does not already have.
+    const inDefault = new Set(admetSets[admetSetNames[0]] ?? []);
     for (const ms of admetSetNames) {
       const groupName = ms === "drug" ? "ADMET" : `ADMET (${ms})`;
-      for (const endpoint of admetSets[ms]) {
+      const endpoints = ms === admetSetNames[0] ? admetSets[ms] : admetSets[ms].filter((endpoint) => !inDefault.has(endpoint));
+      for (const endpoint of endpoints) {
         entries.push(catalogueEntry(groupName, ENDPOINT_NAMES[endpoint] ?? endpoint, () => serviceObjective(services, "admet", endpoint, undefined, ms), {
           // Therapeutic profiles lead with the drug stack. Agro endpoints are
           // still available, but no longer look like an accidental duplicate.

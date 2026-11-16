@@ -41,6 +41,12 @@ const UNREAD: CampaignsRead = { details: NO_CAMPAIGNS, events: NO_EVENTS, error:
  */
 const read = new Map<string, CampaignsRead>();
 const reading = new Map<string, Promise<void>>();
+// Tracks sessions that need a follow-up fetch once the current in-flight one
+// settles. Without this a campaign-bootstrap event that arrives during an
+// in-flight read is lost: load() returns the same in-flight promise, and when
+// it resolves it may show an empty campaign list from just before the backend
+// created the new campaign.
+const pendingRefresh = new Set<string>();
 const watchers = new Set<() => void>();
 
 function announce(): void {
@@ -49,7 +55,12 @@ function announce(): void {
 
 async function load(sessionId: string): Promise<void> {
   const pending = reading.get(sessionId);
-  if (pending) return pending;
+  if (pending) {
+    // A read is already running. Record that we want a fresh one the moment it
+    // finishes so the caller's refresh is never silently dropped.
+    pendingRefresh.add(sessionId);
+    return pending;
+  }
 
   const run = (async () => {
     try {
@@ -84,6 +95,12 @@ async function load(sessionId: string): Promise<void> {
     } finally {
       reading.delete(sessionId);
       announce();
+      // If a refresh was requested while this read was in-flight, honour it
+      // now. We clear the flag first so a concurrent second in-flight read does
+      // not loop infinitely.
+      if (pendingRefresh.delete(sessionId)) {
+        void load(sessionId);
+      }
     }
   })();
 

@@ -70,6 +70,7 @@ import {
   isSameVersion,
   type ToolEvent,
   type Objective,
+  type ServiceInfo,
   type Ttp,
   type TtpForm,
 } from "./ttp";
@@ -406,6 +407,35 @@ describe("objectives", () => {
     for (const e of catalogue) expect(objectiveKey(e.make())).toBe(e.key);
     expect(catalogue.find((e) => e.key === "native:Csp3")).toMatchObject({ extra: true });
     expect(catalogue.find((e) => e.key === "posebusters:")).toMatchObject({ after: "boltz:" });
+  });
+
+  it("lists each ADMET endpoint once when the agro stack contains the drug one", () => {
+    // Mirrors the real service: agro is the drug endpoints (17) plus 8 agro-only
+    // ones. Listing every set in full used to show shared endpoints twice.
+    const drugEndpoints = ["logp", "logd", "caco2_permeability"];
+    const agroOnlyEndpoints = ["koc_soil"];
+    const svc: Record<string, ServiceInfo> = {
+      admet: {
+        name: "admet",
+        url: "http://localhost:8084/score",
+        status: "ok",
+        endpoints: drugEndpoints,
+        model_sets: {
+          drug: drugEndpoints,
+          agro: [...drugEndpoints, ...agroOnlyEndpoints],
+        },
+        targets: {},
+      },
+    };
+    const catalogue = objectiveCatalogue(svc, []);
+    const admetKeys = catalogue.filter((e) => e.group === "ADMET" || e.group.startsWith("ADMET (")).map((e) => e.key);
+    // Every key must appear exactly once — no duplicates from the shared endpoints.
+    expect(admetKeys.length).toBe(new Set(admetKeys).size);
+    // The drug endpoints appear under "ADMET"; agro-only appear under "ADMET (agro)".
+    expect(admetKeys).toContain("admet:logd");
+    expect(admetKeys).toContain("admet:koc_soil:agro");
+    // Shared endpoints must NOT appear a second time under the agro group.
+    expect(admetKeys.filter((k) => k === "admet:logd").length).toBe(1);
   });
 
   it("matches REINVENT's class names to the usual metrics, whatever their case", () => {
