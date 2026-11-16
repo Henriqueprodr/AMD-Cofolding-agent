@@ -11,7 +11,7 @@ function memory() {
 
 describe("DOCK_TABS", () => {
   it("lists every tab, in order", () => {
-    expect(DOCK_TABS).toEqual(["campaign", "structure", "target", "ttp", "assets"]);
+    expect(DOCK_TABS).toEqual(["campaign", "structure", "target", "ttp", "basket", "assets"]);
   });
 });
 

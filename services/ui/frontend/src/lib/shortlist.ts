@@ -91,12 +91,18 @@ export function clearShortlist(session: string): void {
   write(session, []);
 }
 
+// Rendered on the server there is no storage to read and no star to show,
+// so both hooks answer with what an untouched list holds.
 export function useShortlistSession(): string {
-  return useSyncExternalStore(subscribe, shortlistSession);
+  return useSyncExternalStore(subscribe, shortlistSession, shortlistSession);
 }
 
 export function useShortlist(session: string): ShortlistEntry[] {
-  return useSyncExternalStore(subscribe, () => read(session));
+  return useSyncExternalStore(
+    subscribe,
+    () => read(session),
+    () => EMPTY,
+  );
 }
 
 // -- Backup ------------------------------------------------------------------

@@ -10,6 +10,7 @@ import { useJobScope } from "../JobPicker/useJobScope";
 import { short } from "../RunAnalysis/plotUtils";
 import { Card, Placeholder } from "../RunAnalysis/shared";
 import { MoleculeTable, type MoleculeRow } from "../MoleculeTable/MoleculeTable";
+import { StarButton } from "../Shortlist/StarButton";
 import { useRunCandidates } from "./useConversationSpace";
 import { shortId, useAgentPage } from "./shared";
 
@@ -125,6 +126,14 @@ export function CampaignMolecules({ sessionId, theme, onOpenMolecule }: Props) {
             theme={theme}
             onOpen={onOpenMolecule && ((row) => onOpenMolecule(row.smiles))}
             onOpenStructure={openComplex}
+            actions={(row) => (
+              <StarButton
+                smiles={row.smiles}
+                source={row.pooled.jobId ?? row.pooled.taskId}
+                values={() => (row.pooled.score === null ? undefined : { total_score: row.pooled.score })}
+                session={sessionId ?? undefined}
+              />
+            )}
             maxHeight={520}
             footer={
               pooled.length > SHOWN && (

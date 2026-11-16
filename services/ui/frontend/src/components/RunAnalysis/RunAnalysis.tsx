@@ -359,6 +359,7 @@ export function RunAnalysis({ sessionId, theme, onOpenMolecule }: Props) {
               onHover={onHover}
               onOpen={open}
               onOpenStructure={openStructure}
+              source={job.id}
               theme={theme}
             />
           </Card>

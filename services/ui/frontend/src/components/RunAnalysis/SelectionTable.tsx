@@ -6,6 +6,7 @@ import type { Theme } from "../../hooks/useTheme";
 import { sortedIndices, TOTAL, type Endpoint, type Molecules } from "../../lib/runAnalysis";
 import { endpointCells, endpointColumn } from "../MoleculeTable/columns";
 import { MoleculeTable, type MoleculeColumn, type MoleculeRow } from "../MoleculeTable/MoleculeTable";
+import { StarButton } from "../Shortlist/StarButton";
 
 interface Props {
   molecules: Molecules;
@@ -18,6 +19,8 @@ interface Props {
   onOpen: (index: number) => void;
   /** Show the molecule's cofolded complex in the viewer. */
   onOpenStructure?: (index: number) => void;
+  /** The run these molecules are of, kept with a molecule starred here. */
+  source?: string;
   theme: Theme;
 }
 
@@ -32,7 +35,7 @@ interface Row extends MoleculeRow {
  * page at a time: raw values in their units, each with a hairline of its
  * 0–1 score.
  */
-export const SelectionTable = memo(function SelectionTable({ molecules, mask, columns, colours, hovered, onHover, onOpen, onOpenStructure, theme }: Props) {
+export const SelectionTable = memo(function SelectionTable({ molecules, mask, columns, colours, hovered, onHover, onOpen, onOpenStructure, source, theme }: Props) {
   const [sort, setSort] = useState<{ key: string; desc: boolean }>({ key: TOTAL, desc: true });
   const [paging, setPaging] = useState<{ mask: Uint8Array | null; page: number }>({ mask, page: 0 });
   const page = paging.mask === mask ? paging.page : 0;
@@ -66,6 +69,7 @@ export const SelectionTable = memo(function SelectionTable({ molecules, mask, co
         onHover={(smiles) => onHover(smiles === null ? null : (molecules.index.get(smiles) ?? null))}
         onOpen={(row) => onOpen(row.index)}
         onOpenStructure={onOpenStructure && ((row) => onOpenStructure(row.index))}
+        actions={(row) => <StarButton smiles={row.smiles} source={source} values={() => starValues(molecules, columns, row.index)} />}
         empty="No molecule matches the selection."
         scrollKey={at}
       />
@@ -85,6 +89,16 @@ export const SelectionTable = memo(function SelectionTable({ molecules, mask, co
     </div>
   );
 });
+
+/** The values to keep with a molecule starred here: what the table was showing. */
+function starValues(molecules: Molecules, columns: readonly Endpoint[], index: number): Record<string, number> | undefined {
+  const values: Record<string, number> = {};
+  for (const column of columns) {
+    const value = molecules.values.get(column.key)?.[index];
+    if (value !== undefined && Number.isFinite(value)) values[column.key] = value;
+  }
+  return Object.keys(values).length ? values : undefined;
+}
 
 function PageButton({ label, disabled, onClick, children }: { label: string; disabled: boolean; onClick: () => void; children: string }) {
   return (

@@ -10,12 +10,12 @@ export const DOCK_DEFAULT_WIDTH = "clamp(520px, 56vw, calc(100vw - 680px))";
 const WIDTH_KEY = "cofold.dock.width";
 
 /** The tabs of the dock, always all shown. */
-export type DockTab = "structure" | "molecules" | "campaign" | "target" | "ttp" | "assets";
+export type DockTab = "structure" | "molecules" | "campaign" | "target" | "ttp" | "basket" | "assets";
 /** What can be asked for: a tab, or a view inside one (e.g. "properties" is a view of the molecules tab). */
 export type DockView = DockTab | "jobs" | "candidates" | "properties" | "results" | "activity" | "pooled" | "space";
 
 /** Molecules is held back from the bar for now; what asks for it still opens it. */
-export const DOCK_TABS: readonly DockTab[] = ["campaign", "structure", "target", "ttp", "assets"];
+export const DOCK_TABS: readonly DockTab[] = ["campaign", "structure", "target", "ttp", "basket", "assets"];
 
 /** Views shown inside another tab; some were tabs of their own once, and links still name them. */
 const MERGED: Partial<Record<DockView, DockTab>> = {

@@ -8,6 +8,7 @@ import { runOf, structureTitle } from "../../lib/artifacts";
 import { STRUCTURE_KINDS, structureKind } from "../../lib/poses";
 import { sendToViewer } from "../../lib/viewerBus";
 import { MolDepiction } from "../MolDepiction/MolDepiction";
+import { KeepButton } from "../Shortlist/KeepButton";
 import { structureFacts, verdictLabel } from "./structureFacts";
 
 interface Props {
@@ -50,6 +51,7 @@ export function StructureCard({ panel, theme, isOpen, compact = false }: Props) 
           <span className="min-w-0 truncate text-xs font-semibold">{structureTitle(panel)}</span>
           {kind && <span className="text-faint shrink-0 text-[11px]">{STRUCTURE_KINDS[kind].label}</span>}
         </button>
+        <KeepButton panel={panel} source="chat" />
         <DownloadLink panel={panel} />
       </figure>
     );
@@ -112,6 +114,7 @@ export function StructureCard({ panel, theme, isOpen, compact = false }: Props) 
           {isOpen ? (compact ? "Showing" : "Showing in viewer") : "Open viewer"}
         </button>
         <span className="ml-auto" />
+        <KeepButton panel={panel} source="chat" />
         <DownloadLink panel={panel} />
       </div>
     </figure>

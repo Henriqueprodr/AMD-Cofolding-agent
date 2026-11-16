@@ -20,6 +20,7 @@ import { RunAnalysis } from "../RunAnalysis/RunAnalysis";
 import { TtpPanel } from "../TtpPanel/TtpPanel";
 import { TargetPanel } from "../TargetCard/TargetPanel";
 import { AssetsPanel } from "../AssetsPanel/AssetsPanel";
+import { BasketPanel } from "../BasketPanel/BasketPanel";
 import { CampaignPanel } from "../CampaignPanel/CampaignPanel";
 import { JobTimeline } from "../CampaignPanel/JobTimeline";
 import { CampaignNav } from "../CampaignPanel/CampaignNav";
@@ -59,6 +60,7 @@ const LABEL: Record<DockTab, string> = {
   campaign: "Campaign",
   target: "Target",
   ttp: "Profile",
+  basket: "Basket",
   assets: "Assets",
 };
 /** Tabs a molecule page opens over; from any other, it opens over Molecules. */
@@ -262,6 +264,9 @@ export const Workbench = memo(function Workbench(props: Props) {
           </Kept>
           <Kept shown={active === "ttp"} className="flex min-h-0 flex-1 flex-col">
             <ContextTab {...props} tab="ttp" />
+          </Kept>
+          <Kept shown={active === "basket"} className="flex min-h-0 flex-1 flex-col">
+            <BasketPanel sessionId={sessionId} theme={props.theme} />
           </Kept>
           <Kept shown={active === "assets"}>
             <ContextTab {...props} tab="assets" />
