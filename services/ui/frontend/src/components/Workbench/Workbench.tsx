@@ -58,6 +58,7 @@ const LABEL: Record<DockTab, string> = {
   molecules: "Molecules",
   campaign: "Campaign",
   target: "Target",
+  ttp: "Profile",
   assets: "Assets",
 };
 /** Tabs a molecule page opens over; from any other, it opens over Molecules. */
@@ -70,11 +71,6 @@ interface Page {
   context?: MoleculeContext;
 }
 type Show = (smiles: string, context?: MoleculeContext) => void;
-
-const TARGET_VIEWS = [
-  { id: "target", label: "Target" },
-  { id: "ttp", label: "Profile" },
-] as const;
 
 /**
  * Everything the conversation produced, in one place: the complexes, the
@@ -125,7 +121,6 @@ export const Workbench = memo(function Workbench(props: Props) {
   const viewOf = (id: DockTab): WorkbenchTab => lastView[id] ?? id;
   // A tab kept behind another still needs to know which of its views to hold.
   const campaignView = active === "campaign" ? tab : viewOf("campaign");
-  const targetView = active === "target" ? tab : viewOf("target");
   const show: Show = (smiles, context) => {
     const here = PAGE_TABS.includes(active) ? active : "molecules";
     setPage({ tab: here, smiles, ...(context ? { context } : {}) });
@@ -263,8 +258,10 @@ export const Workbench = memo(function Workbench(props: Props) {
             </Kept>
           </Kept>
           <Kept shown={active === "target"}>
-            <ViewSwitch label="Target" views={TARGET_VIEWS} value={targetView} onChange={onTabChange} />
-            <ContextTab {...props} tab={targetView} />
+            <ContextTab {...props} tab="target" />
+          </Kept>
+          <Kept shown={active === "ttp"} className="flex min-h-0 flex-1 flex-col">
+            <ContextTab {...props} tab="ttp" />
           </Kept>
           <Kept shown={active === "assets"}>
             <ContextTab {...props} tab="assets" />
@@ -356,38 +353,6 @@ function Kept({ shown, className = "contents", children }: { shown: boolean; cla
   return (
     <div className={shown ? className : "hidden"}>
       <PanelShown shown={shown}>{children}</PanelShown>
-    </div>
-  );
-}
-
-/** The quiet switch between the views a merged tab holds. */
-function ViewSwitch({
-  label,
-  views,
-  value,
-  onChange,
-}: {
-  label: string;
-  views: readonly { id: WorkbenchTab; label: string }[];
-  value: WorkbenchTab;
-  onChange: (view: WorkbenchTab) => void;
-}) {
-  return (
-    <div role="group" aria-label={label} className="border-subtle flex shrink-0 items-center gap-0.5 border-b px-2 py-1.5">
-      {views.map((view) => {
-        const selected = view.id === value;
-        return (
-          <button
-            key={view.id}
-            type="button"
-            aria-pressed={selected}
-            onClick={() => onChange(view.id)}
-            className={`cursor-pointer rounded-md px-2.5 py-1 text-xs touch:min-h-11 ${selected ? "bg-inset text-body" : "text-muted hover:text-body"}`}
-          >
-            {view.label}
-          </button>
-        );
-      })}
     </div>
   );
 }

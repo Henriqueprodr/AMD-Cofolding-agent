@@ -11,7 +11,7 @@ function memory() {
 
 describe("DOCK_TABS", () => {
   it("lists every tab, in order", () => {
-    expect(DOCK_TABS).toEqual(["campaign", "structure", "target", "assets"]);
+    expect(DOCK_TABS).toEqual(["campaign", "structure", "target", "ttp", "assets"]);
   });
 });
 
@@ -29,8 +29,10 @@ describe("dockTabOf", () => {
     expect(dockTabOf("results")).toBe("campaign");
   });
 
-  it("opens the profile beside the target it was written for", () => {
-    expect(dockTabOf("ttp")).toBe("target");
+  it("gives the profile a tab of its own", () => {
+    // It was a view inside Target, which is the dossier of every target the
+    // conversation touched; the profile is of the run, not of a target.
+    expect(dockTabOf("ttp")).toBe("ttp");
   });
 });
 
