@@ -18,6 +18,7 @@ import os
 import sys
 import signal
 import subprocess
+import threading
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -2004,6 +2005,98 @@ class TestRestoringAJobWhoseWorkerIsStillAlive:
 
         on_disk = json.loads((job_dir / "job_metadata.json").read_text())
         assert on_disk["state"] == "running"
+
+
+class TestTheJobListBringsARelayedRunUpToDate:
+    """A run that had finished was still listed as running.
+
+    The job list trusted each Slurm run's monitor thread to write its terminal
+    state, and skipped polling it. The thread is one daemon thread in one
+    process: any manager holding the job without one reported the run as
+    running for as long as that process lived, while get_optimization_status,
+    which does poll, said it had finished.
+    """
+
+    def _relayed(self, config, state="RUNNING", exit_code=None, job_id="relay1"):
+        job_dir = Path(config.jobs.working_dir) / f"job_{job_id}"
+        job_dir.mkdir(parents=True)
+        (job_dir / "job_metadata.json").write_text(json.dumps({
+            "job_id": job_id, "ttp_id": "test", "ttp_version": 1,
+            "model": ".reinvent", "state": "running", "launcher": "slurm",
+            "slurm_job_id": "4242", "working_dir": str(job_dir),
+        }))
+        (job_dir / "slurm.json").write_text(json.dumps({
+            "slurm_id": "4242", "state": state, "exit_code": exit_code,
+        }))
+        return job_dir
+
+    def _unmonitored(self, config, monkeypatch, **kwargs):
+        """A manager that adopts the run but never follows it, as a second one does."""
+        self._relayed(config, **kwargs)
+        monkeypatch.setattr(JobManager, "_monitor_slurm", lambda self, job: None)
+        return JobManager(config)
+
+    def test_a_finished_run_is_not_listed_as_running(self, config, monkeypatch):
+        manager = self._unmonitored(config, monkeypatch, state="COMPLETED", exit_code=0)
+
+        assert manager.list_jobs()[0]["state"] == "completed"
+
+    def test_a_run_still_in_the_queue_stays_running(self, config, monkeypatch):
+        manager = self._unmonitored(config, monkeypatch)
+
+        assert manager.list_jobs()[0]["state"] == "running"
+
+    def test_a_run_slurm_no_longer_accounts_for_fails_with_the_reason(
+        self, config, monkeypatch
+    ):
+        """What the relay writes once sacct has stopped naming the job."""
+        manager = self._unmonitored(config, monkeypatch, state="UNKNOWN")
+
+        listed = manager.list_jobs()[0]
+        assert listed["state"] == "failed"
+        assert "4242" in listed["error"]
+
+    def test_the_list_can_be_read_while_a_run_is_brought_up_to_date(
+        self, config, monkeypatch
+    ):
+        """Applying the state takes the manager's lock, which the list holds."""
+        manager = self._unmonitored(config, monkeypatch, state="COMPLETED", exit_code=0)
+
+        # A plain lock would deadlock here rather than fail.
+        done = threading.Event()
+        thread = threading.Thread(target=lambda: (manager.list_jobs(), done.set()))
+        thread.start()
+        thread.join(timeout=10)
+        assert done.is_set(), "list_jobs deadlocked applying a relayed run's state"
+
+    def test_a_pass_that_raises_does_not_end_the_monitor(self, config, monkeypatch):
+        """The thread is the only writer of the terminal state.
+
+        Letting one bad read kill it left the run running for the life of the
+        process, with nothing said anywhere.
+        """
+        monitor = JobManager._monitor_slurm
+        # Adopted without being followed, so the real thread cannot end the run
+        # before the loop under test runs.
+        manager = self._unmonitored(config, monkeypatch, state="COMPLETED", exit_code=0)
+        job = manager._jobs["relay1"]
+        job.state = JobState.RUNNING
+
+        calls = []
+
+        def flaky(self, job):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("Lustre hiccup")
+            job.state = JobState.COMPLETED
+
+        monkeypatch.setattr(JobManager, "_apply_slurm_state", flaky)
+        monkeypatch.setattr("reinvent4_mcp.jobs.manager.RELAY_POLL_SECONDS", 0)
+
+        monitor(manager, job)
+
+        assert job.state == JobState.COMPLETED
+        assert len(calls) == 2
 
 
 class TestAReaderThatDropsRowsSaysSo:

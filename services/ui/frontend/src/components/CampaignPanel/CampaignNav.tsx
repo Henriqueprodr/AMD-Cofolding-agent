@@ -50,14 +50,14 @@ export function CampaignNav({ sessionId, view, onView }: Props) {
 
   useEffect(() => {
     if (listing && agent) focusAgent(null);
-    // Results and Run analysis are of one run: the one they show, picked, so Summary shows it too.
+    // Results and Analysis are of one run: the one they show, picked, so Summary shows it too.
     else if (runView && !listing && picked === null && job) focusRun(job.id);
   }, [listing, agent, runView, picked, job]);
 
-  const views: { id: DockView; label: string }[] = [
+  const views: { id: DockView; label: string; hint?: string }[] = [
     { id: "campaign", label: agent ? "Conversation" : "Overview" },
-    { id: "pooled", label: "Molecules" },
-    { id: "space", label: "Analysis" },
+    { id: "pooled", label: "Molecules", hint: "Pooled across this conversation" },
+    { id: "space", label: "Analysis", hint: "Every run of this conversation" },
   ];
   if (!agent) views.push({ id: "jobs", label: "Jobs" });
 
@@ -84,6 +84,7 @@ export function CampaignNav({ sessionId, view, onView }: Props) {
             key={one.id}
             type="button"
             aria-pressed={on}
+            title={one.hint}
             onClick={() => pick(one.id)}
             className={`cursor-pointer rounded-md px-2.5 py-0.5 text-[11px] touch:min-h-11 ${on ? "bg-inset text-body" : "text-muted hover:text-body"}`}
           >
@@ -183,6 +184,7 @@ export function CampaignNav({ sessionId, view, onView }: Props) {
               key={one.id}
               type="button"
               aria-pressed={one.id === view}
+              title={one.hint}
               onClick={() => onView(one.id)}
               className={`shrink-0 cursor-pointer rounded-md px-2.5 py-0.5 text-[11px] touch:min-h-11 ${one.id === view ? "bg-inset text-body" : "text-muted hover:text-body"}`}
             >
@@ -196,10 +198,13 @@ export function CampaignNav({ sessionId, view, onView }: Props) {
   );
 }
 
-const RUN_TABS: { id: DockView; label: string }[] = [
-  { id: "jobs", label: "Summary" },
-  { id: "results", label: "Results" },
-  { id: "activity", label: "Run analysis" },
+// The row above carries an Analysis of its own, across the conversation. Both
+// are named for what they show rather than for their scope, so each says which
+// it is on hover; the rows are already labelled apart for a screen reader.
+const RUN_TABS: { id: DockView; label: string; hint: string }[] = [
+  { id: "jobs", label: "Summary", hint: "How this run is going" },
+  { id: "results", label: "Results", hint: "Every molecule this run wrote" },
+  { id: "activity", label: "Analysis", hint: "This run's scores and chemical space" },
 ];
 
 function Pill({ on, onClick, children }: { on: boolean; onClick: () => void; children: React.ReactNode }) {

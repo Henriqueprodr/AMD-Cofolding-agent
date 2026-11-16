@@ -307,6 +307,10 @@ PY
     # can be matched back to runs. Declared outside the loop so bash does not
     # re-declare it on every iteration (harmless, but noisy with set -x).
     declare -A SID_TO_RUN
+    # Passes a run has been out of squeue and unnamed by sacct, and how many
+    # to allow before finalising it anyway.
+    declare -A UNACCOUNTED
+    local RUN_RELAY_GRACE=${RUN_RELAY_GRACE:-6}
 
     while true; do
         # --- submit new runs -------------------------------------------------
@@ -396,18 +400,40 @@ PY
             # One sacct call for all finished jobs.
             if [[ ${#finished_ids[@]} -gt 0 ]]; then
                 fin_csv=$(IFS=,; echo "${finished_ids[*]}")
+                # Emptied each pass, as LIVE_STATE above is and for the same
+                # reason: a sid sacct named last time must not count as named now.
+                unset named; declare -A named
                 while IFS='|' read -r sid_col st_raw code_raw; do
                     sid=${sid_col%%[^0-9]*}; [[ -n $sid ]] || continue
                     id=${SID_TO_RUN[$sid]:-}; [[ -n $id ]] || continue
                     dir=$DATA_DIR/jobs/job_$id
                     state=${st_raw%% *}; code=${code_raw%%:*}
+                    named[$sid]=1
                     # An squeue that missed a live run must not end it here.
                     case $state in PENDING|CONFIGURING|REQUEUED|RESIZING|SUSPENDED|RUNNING|COMPLETING) continue ;; esac
                     run_state "$dir" "$sid" "$state" "$code" ""
                     echo "relay: run $id (Slurm $sid) ended $state, exit $code"
                     rm -f "$RUN_RELAY_DIR/active/$id"
+                    unset "UNACCOUNTED[$sid]"
                 done < <(sacct --noheader --parsable2 --allocations \
                               --jobs "$fin_csv" --format JobID,State,ExitCode 2>/dev/null)
+
+                # A job out of squeue that sacct does not name is usually a
+                # transient accounting hiccup, but it can also be a purged
+                # record -- and then nothing ever finalises the run, so it
+                # reads as running forever. Give sacct a few passes, then say
+                # what is actually known: Slurm no longer accounts for it.
+                for sid in "${finished_ids[@]}"; do
+                    if [[ -n ${named[$sid]:-} ]]; then continue; fi
+                    id=${SID_TO_RUN[$sid]:-}; [[ -n $id ]] || continue
+                    UNACCOUNTED[$sid]=$(( ${UNACCOUNTED[$sid]:-0} + 1 ))
+                    if (( ${UNACCOUNTED[$sid]} < RUN_RELAY_GRACE )); then continue; fi
+                    run_state "$DATA_DIR/jobs/job_$id" "$sid" UNKNOWN "" \
+                        "Slurm job $sid left the queue and sacct does not account for it"
+                    echo "relay: run $id (Slurm $sid) left the queue unaccounted for"
+                    rm -f "$RUN_RELAY_DIR/active/$id"
+                    unset "UNACCOUNTED[$sid]"
+                done
             fi
         fi
 

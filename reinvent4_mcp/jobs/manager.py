@@ -341,7 +341,11 @@ class JobManager:
     def __init__(self, config: Optional[ProcessConfig] = None):
         self._config = config or get_config()
         self._jobs: dict[str, JobInfo] = {}
-        self._lock = threading.Lock()
+        # Reentrant so a caller holding it can still bring a job up to date:
+        # list_jobs does, and a plain lock meant it had to skip Slurm runs and
+        # trust their monitor threads, which left a finished run reading as
+        # running whenever one of those threads was not there.
+        self._lock = threading.RLock()
         self._window = RunWindow(self._config.jobs.max_concurrent_jobs)
 
         self._working_root = Path(self._config.jobs.working_dir)
@@ -980,10 +984,18 @@ class JobManager:
     def list_jobs(self) -> list[dict[str, Any]]:
         """Return summary info for all tracked jobs."""
         with self._lock:
-            # A Slurm run is not polled here: its monitor keeps it current,
-            # and applying its state takes this lock.
+            # A Slurm run is polled here as well as by its monitor thread: the
+            # thread is the only writer of the terminal state, so a manager
+            # holding the job without one -- or whose thread died -- reported
+            # the run as running for as long as the process lived, while
+            # get_optimization_status, which does poll, said it had finished.
             for job in self._jobs.values():
-                if job.state == JobState.RUNNING and job.launcher != "slurm":
+                # A relayed run is polled from QUEUED too: it holds that state
+                # until the relay reports it started, so RUNNING alone would
+                # never pick up one that was submitted and finished between
+                # two reads of the list.
+                active = ACTIVE_JOB_STATES if job.launcher == "slurm" else {JobState.RUNNING}
+                if job.state in active:
                     self._poll_process(job)
             return [j.to_dict() for j in self._jobs.values()]
 
@@ -1143,7 +1155,13 @@ class JobManager:
         """Background thread: follow a relayed job until it ends."""
 
         while job.state in ACTIVE_JOB_STATES:
-            self._apply_slurm_state(job)
+            try:
+                self._apply_slurm_state(job)
+            except Exception:
+                # This thread is the only writer of the run's terminal state,
+                # so letting one bad pass end it leaves the run reading as
+                # running for the life of the process. Log it and try again.
+                logger.exception("Could not read Slurm state for job %s", job.job_id)
             if job.state not in ACTIVE_JOB_STATES:
                 break
             threading.Event().wait(RELAY_POLL_SECONDS)

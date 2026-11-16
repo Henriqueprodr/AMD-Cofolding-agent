@@ -18,12 +18,25 @@ interface SessionsState {
 
 /** The last list read, for the parts of the page that only need one conversation's runs; null before the first. */
 let latest: SessionSummary[] | null = null;
+/** Whether a read has come back at all, so a failed one can be told from one still in flight. */
+let probed = false;
 let refreshLatest: (() => void) | null = null;
 const listeners = new Set<() => void>();
 
+function announce() {
+  for (const listener of listeners) listener();
+}
+
 function publish(list: SessionSummary[]) {
   latest = list;
-  for (const listener of listeners) listener();
+  probed = true;
+  announce();
+}
+
+/** A read came back without a list. Says so, so readers can stop waiting on one. */
+function publishFailure() {
+  probed = true;
+  announce();
 }
 
 const subscribe = (listener: () => void) => {
@@ -35,6 +48,7 @@ const subscribe = (listener: () => void) => {
 export const refreshSessionList = () => refreshLatest?.();
 
 const useLatest = () => useSyncExternalStore(subscribe, () => latest);
+const useProbed = () => useSyncExternalStore(subscribe, () => probed);
 
 /** The REINVENT jobs of one conversation, as the last list read said; null for none. */
 export function useSessionRuns(sessionId: string | null | undefined): SessionRuns | null {
@@ -47,8 +61,20 @@ export function useSessionRuns(sessionId: string | null | undefined): SessionRun
  * the list is read, false for a gateway too old to (no conversation has `runs`).
  */
 export function useRunsKnown(): boolean | null {
-  const list = useLatest();
-  return list === null ? null : list.length === 0 || list.some((s) => s.runs !== undefined);
+  return runsKnown(useLatest(), useProbed());
+}
+
+/**
+ * Whether the gateway says which conversation launched which run, given the
+ * last list read and whether a read has come back at all.
+ *
+ * A read that came back empty-handed counts as "does not say", not as "not
+ * read yet": null holds Summary, Results and Analysis on their loading state
+ * for as long as the gateway is unreachable, which reads as three blank panels.
+ */
+export function runsKnown(list: SessionSummary[] | null, probed: boolean): boolean | null {
+  if (list === null) return probed ? false : null;
+  return list.length === 0 || list.some((s) => s.runs !== undefined);
 }
 
 /** Job id → the conversation that launched it, as the last list read said. */
@@ -73,7 +99,10 @@ export function useSessions(): SessionsState {
         publish(list);
         setError(null);
       })
-      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)));
+      .catch((reason: unknown) => {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        publishFailure();
+      });
   }, []);
 
   useEffect(() => {

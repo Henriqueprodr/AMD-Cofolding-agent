@@ -82,7 +82,7 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
  * agent through onAsk.
  */
 export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
-  const { job: summary, error: listError } = useJobScope(sessionId ?? null);
+  const { job: summary, runs, own, error: listError } = useJobScope(sessionId ?? null);
   const { jobs: allJobs, alerts } = useJobList();
   const shown = usePanelShown();
   const [tick, setTick] = useState(0);
@@ -208,7 +208,10 @@ export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
     }
   }
 
-  if (summary === undefined) {
+  // Null while the list is in flight. The scope never returns undefined, so
+  // testing for that left the error and its Retry unreachable: a gateway that
+  // could not be read showed the "no job yet" placeholder and no way back.
+  if (runs === null) {
     return (
       <Centered>
         {listError ? (
@@ -224,9 +227,17 @@ export function JobsPanel({ sessionId, theme, onAsk, onOpenMolecule }: Props) {
   }
 
   if (!job) {
+    // Runs the gateway did not attribute to any conversation (a sub-agent's,
+    // started in another container) are still pickable: say so, rather than
+    // claiming there are none.
+    const unattributed = own.length === 0 && runs.length > 0;
     return (
       <Centered>
-        <p className="text-muted">No job in this conversation yet.</p>
+        <p className="text-muted">
+          {unattributed
+            ? `No job in this conversation yet. ${runs.length} run${runs.length === 1 ? "" : "s"} elsewhere: pick one above to read it.`
+            : "No job in this conversation yet."}
+        </p>
         <ActionButton onClick={() => onAsk("List the stored TTPs and help me start a REINVENT optimization run.")}>
           Ask the agent to start one
         </ActionButton>
