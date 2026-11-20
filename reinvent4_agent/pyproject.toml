@@ -17,6 +17,14 @@ dependencies = [
     "prompt_toolkit>=3.0",
 ]
 
+[project.optional-dependencies]
+# `--backend claude-code`: drives the locally installed, logged-in
+# Claude CLI instead of a paid API key.  Needs the `claude` binary too
+# (npm i -g @anthropic-ai/claude-code).
+claude-code = [
+    "claude-agent-sdk>=0.1",
+]
+
 [project.scripts]
 dd-agent = "reinvent4_agent.cli:main"
 dd-coscientist = "reinvent4_agent.cli:coscientist_main"

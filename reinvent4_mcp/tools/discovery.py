@@ -79,6 +79,10 @@ def list_scoring_components() -> list[dict[str, Any]]:
     from reinvent.scoring.importer import get_registry
 
     registry = get_registry()
+    if isinstance(registry, tuple):
+        # Newer REINVENT4 returns (registry, import_failures); older
+        # releases returned the registry dict alone.
+        registry = registry[0]
     components: list[dict[str, Any]] = []
 
     for name, (component_cls, param_cls) in sorted(registry.items()):

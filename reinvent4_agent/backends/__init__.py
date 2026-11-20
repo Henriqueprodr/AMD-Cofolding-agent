@@ -23,6 +23,10 @@ from urllib.parse import urlsplit
 #: only run on the error path, but the user is waiting on them.
 _PROBE_TIMEOUT = 3.0
 
+#: The CLI's own fallback model name.  Backends that have a sensible
+#: default of their own (claude-code) treat it as "unset".
+_DEFAULT_MODEL = "claude-sonnet-4"
+
 
 class EndpointError(ConnectionError):
     """The LLM endpoint is unreachable or misconfigured.
@@ -351,6 +355,20 @@ def create_backend(
             system_prompt=system_prompt,
         )
 
+    if backend_type in ("claude-code", "claude_code"):
+        from reinvent4_agent.backends.claude_code_backend import (
+            ClaudeCodeBackend,
+        )
+
+        return ClaudeCodeBackend(
+            # The CLI has its own default; only override when asked.
+            model=model if model and model != _DEFAULT_MODEL else None,
+            system_prompt=system_prompt,
+            # --api-key doubles as the `claude setup-token` token here.
+            oauth_token=api_key or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"),
+            cli_path=os.environ.get("CLAUDE_CODE_CLI_PATH"),
+        )
+
     if backend_type == "openai":
         from reinvent4_agent.backends.openai_backend import OpenAIBackend
 
@@ -366,5 +384,6 @@ def create_backend(
         )
 
     raise ValueError(
-        f"Unknown backend '{backend_type}'. Use 'anthropic' or 'openai'."
+        f"Unknown backend '{backend_type}'. "
+        "Use 'anthropic', 'openai' or 'claude-code'."
     )

@@ -42,11 +42,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # -- LLM backend ---------------------------------------------------
     parser.add_argument(
         "--backend",
-        choices=["anthropic", "openai"],
+        choices=["anthropic", "openai", "claude-code"],
         default=os.environ.get("REINVENT4_AGENT_BACKEND", "anthropic"),
         help=(
-            "LLM backend: 'anthropic' (Anthropic Messages API) or "
-            "'openai' (OpenAI-compatible Chat Completions API) "
+            "LLM backend: 'anthropic' (Anthropic Messages API), "
+            "'openai' (OpenAI-compatible Chat Completions API), or "
+            "'claude-code' (the local Claude CLI you are logged in to — "
+            "runs on a Claude subscription, no API key) "
             "(default: anthropic, or REINVENT4_AGENT_BACKEND env var)"
         ),
     )
@@ -275,7 +277,10 @@ async def run_agent(args: argparse.Namespace) -> None:
     print_welcome()
 
     endpoint_label = args.base_url or "default"
-    if args.backend == "openai":
+    if args.backend == "claude-code":
+        endpoint_label = "local claude CLI (subscription)"
+        thinking_label = "CLI default"
+    elif args.backend == "openai":
         thinking_label = args.reasoning_effort or "off"
     else:
         thinking_label = (
@@ -679,6 +684,10 @@ def _resolve_api_key(args: argparse.Namespace) -> str | None:
     from reinvent4_agent.display import print_error
 
     api_key = args.api_key
+    if args.backend == "claude-code":
+        # The Claude CLI carries its own login; a token is only needed
+        # where no interactive login exists (containers, CI).
+        return api_key or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
     if not api_key and not args.gateway_key:
         fallback_var = (
             "ANTHROPIC_API_KEY"

@@ -1,0 +1,69 @@
+# Local (laptop) variant of services/dd-agent/Dockerfile.
+#
+# The upstream image is built on rocm/pytorch (AMD GPU, linux/amd64) and only
+# runs on a ROCm cluster node. This one builds the same two packages
+# (dd-mcp + dd-agent) plus REINVENT4 on a plain CPU Python base, so the agent
+# and all native scoring components work on an Apple Silicon Mac under
+# OrbStack. GPU-only paths (Boltz2 cofolding, ROCm RL) are not available.
+#
+# Build from the repo root:
+#   docker build -f services/dd-agent/Dockerfile.local-cpu -t dd-agent:local .
+
+FROM python:3.12-slim-bookworm
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# CPU-only torch. The default PyPI aarch64 wheels now drag in the CUDA
+# runtime (several GB, useless here), so take them from the cpu index.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+        "torch" "torchvision"
+
+# --- Install REINVENT4 (torch already present; strip the CUDA-pinned lines) ---
+COPY REINVENT4/ /app/REINVENT4/
+WORKDIR /app/REINVENT4
+RUN sed -i.bak '/torch==/d' pyproject.toml && \
+    sed -i.bak '/torchvision/d' pyproject.toml && \
+    python install.py cpu -d none && \
+    pip install --no-cache-dir --upgrade "numpy>=2,<3" "scipy>=1.13" && \
+    python -c "import numpy, scipy; from scipy.stats import gaussian_kde; import rdkit, xxhash, tomllib, pandas, pydantic; print('REINVENT4 deps OK; numpy', numpy.__version__, 'scipy', scipy.__version__)"
+
+# --- Prior model (only used by RL optimization runs) ---
+RUN mkdir -p /app/REINVENT4/priors && \
+    wget --tries=3 -q -O /app/REINVENT4/priors/reinvent.prior \
+      "https://zenodo.org/records/15641297/files/reinvent.prior?download=1" && \
+    echo "f268eb072f4fca69ca9434768d3cd461  /app/REINVENT4/priors/reinvent.prior" | md5sum -c -
+
+# --- Install MCP server + agent on top ---
+WORKDIR /app
+COPY reinvent4_mcp/ /app/reinvent4_mcp/
+COPY reinvent4_agent/ /app/reinvent4_agent/
+COPY reinvent4_mcp_config.local.yaml /app/reinvent4_mcp_config.yaml
+
+RUN pip install --no-cache-dir /app/reinvent4_mcp /app/reinvent4_agent && \
+    pip install --no-cache-dir --upgrade "numpy>=2,<3" "scipy>=1.13" && \
+    python -c "import numpy, scipy; from scipy.stats import gaussian_kde; import reinvent; \
+import reinvent4_mcp.utils as u; u.ensure_reinvent4_importable(); \
+from reinvent.scoring.importer import get_registry; r = get_registry(); \
+names = [k if isinstance(k, str) else str(k) for k in (r.keys() if hasattr(r, 'keys') else r)]; \
+print('registry entries:', len(names)); \
+assert any('externalrest' in n.lower() for n in names), names[:40]; \
+print('FINAL env OK; externalrestscorer registered; numpy', numpy.__version__, 'scipy', scipy.__version__)"
+
+ENV REINVENT4_ROOT=/app/REINVENT4
+ENV REINVENT4_MCP_CONFIG=/app/reinvent4_mcp_config.yaml
+ENV PYTHONPATH=/app/reinvent4_mcp/_plugins:${PYTHONPATH}
+
+ENV REINVENT4_AGENT_BACKEND=anthropic
+ENV REINVENT4_AGENT_MODEL=claude-sonnet-4-5
+ENV REINVENT4_AGENT_NO_VERIFY_SSL=false
+ENV REINVENT4_AGENT_THINKING_BUDGET=1024
+ENV REINVENT4_AGENT_LOG_DIR=/logs
+
+COPY services/dd-agent/entrypoint.sh /usr/local/bin/dd-agent-entrypoint.sh
+RUN chmod +x /usr/local/bin/dd-agent-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/dd-agent-entrypoint.sh"]
+CMD ["dd-agent"]
