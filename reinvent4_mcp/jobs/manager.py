@@ -584,30 +584,11 @@ class JobManager:
     def _start_process(self, job: JobInfo) -> None:
         """Launch the REINVENT4 worker subprocess."""
 
-        from reinvent4_mcp.utils import custom_plugins_path, find_reinvent4_root
+        from reinvent4_mcp.utils import subprocess_env
 
         worker_script = str(Path(__file__).parent / "_run_worker.py")
 
-        env = os.environ.copy()
-        try:
-            r4_root = str(find_reinvent4_root())
-            env["REINVENT4_ROOT"] = r4_root
-            if r4_root not in env.get("PYTHONPATH", ""):
-                env["PYTHONPATH"] = r4_root + os.pathsep + env.get("PYTHONPATH", "")
-        except RuntimeError:
-            pass
-
-        # Put the custom-plugins dir (reinvent_plugins/components namespace layout)
-        # on the worker's PYTHONPATH so REINVENT4 discovers ExternalRESTScorer
-        # natively -- a stable sys.path entry, not a fragile runtime __path__ append.
-        plugins_dir = custom_plugins_path()
-        env["DD_MCP_PLUGINS_DIR"] = plugins_dir
-        if plugins_dir not in env.get("PYTHONPATH", ""):
-            env["PYTHONPATH"] = plugins_dir + os.pathsep + env.get("PYTHONPATH", "")
-
-        mcp_package_dir = str(Path(__file__).resolve().parent.parent.parent)
-        if mcp_package_dir not in env.get("PYTHONPATH", ""):
-            env["PYTHONPATH"] = mcp_package_dir + os.pathsep + env.get("PYTHONPATH", "")
+        env = subprocess_env()
 
         log_path = str(job.log_path)
 

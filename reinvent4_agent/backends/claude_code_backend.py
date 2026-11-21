@@ -32,6 +32,7 @@ exchange :class:`queue.Queue` messages.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import threading
@@ -39,6 +40,7 @@ import uuid
 from typing import Any
 
 from reinvent4_agent.backends import (
+    BuiltinToolUse,
     ChatResult,
     EndpointError,
     LLMBackend,
@@ -47,6 +49,9 @@ from reinvent4_agent.backends import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Built-in tool results are context, not evidence; keep them short.
+_MAX_RESULT_CHARS = 2000
 
 #: Name the in-process MCP server is mounted under.  Tool names the
 #: model sees are ``mcp__<SERVER_NAME>__<tool>``.
@@ -72,6 +77,10 @@ class ClaudeCodeBackend(LLMBackend):
         in as, which is the normal case on a developer machine.
     cli_path:
         Explicit path to the ``claude`` binary, when it is not on PATH.
+    web_tools:
+        Enable Claude's own WebSearch / WebFetch.  They are the general
+        "what's new" layer only -- the chemistry tools stay authoritative
+        for chemistry facts, which the system prompt spells out.
     """
 
     def __init__(
@@ -81,8 +90,10 @@ class ClaudeCodeBackend(LLMBackend):
         system_prompt: str,
         oauth_token: str | None = None,
         cli_path: str | None = None,
+        web_tools: bool = True,
     ) -> None:
         self.model = model
+        self._web_tools = web_tools
         self.base_url = None  # for CLI reporting parity with the others
         self._system_prompt = system_prompt
         self._cli_path = cli_path
@@ -131,21 +142,23 @@ class ClaudeCodeBackend(LLMBackend):
         kind, payload = self._to_caller.get()
 
         if kind == "tool_call":
-            call, text, thinking = payload
+            call, text, thinking, builtin = payload
             return ChatResult(
                 text=text or None,
                 thinking=thinking or None,
                 tool_calls=[call],
                 needs_tool_response=True,
+                builtin_tool_uses=builtin,
             )
         if kind == "end":
-            text, thinking, usage = payload
+            text, thinking, usage, builtin = payload
             self._turn_active = False
             return ChatResult(
                 text=text or None,
                 thinking=thinking or None,
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
+                builtin_tool_uses=builtin,
             )
         if kind == "error":
             self._turn_active = False
@@ -216,12 +229,8 @@ class ClaudeCodeBackend(LLMBackend):
     ) -> None:
         try:
             from claude_agent_sdk import (  # noqa: PLC0415 - optional dep
-                AssistantMessage,
                 ClaudeAgentOptions,
                 ClaudeSDKClient,
-                ResultMessage,
-                TextBlock,
-                ThinkingBlock,
                 create_sdk_mcp_server,
             )
             from claude_agent_sdk import tool as sdk_tool  # noqa: PLC0415
@@ -235,19 +244,30 @@ class ClaudeCodeBackend(LLMBackend):
 
         self._loop = asyncio.get_running_loop()
 
-        # Text/thinking seen so far in the current assistant message,
-        # flushed to the caller with the next tool call or at turn end.
-        buf = {"text": [], "thinking": []}
+        # Text / thinking / built-in tool uses seen so far in the current
+        # assistant message, flushed to the caller with the next tool call
+        # or at turn end.
+        buf: dict[str, list] = {"text": [], "thinking": [], "builtin": []}
+        # Built-in tool_use id -> the record awaiting its result.
+        pending: dict[str, BuiltinToolUse] = {}
+
+        def _flush() -> tuple[str, str, list[BuiltinToolUse]]:
+            out = (
+                "".join(buf["text"]).strip(),
+                "".join(buf["thinking"]).strip(),
+                list(buf["builtin"]),
+            )
+            buf["text"].clear()
+            buf["thinking"].clear()
+            buf["builtin"].clear()
+            return out
 
         def make_handler(tool_name: str):
             async def handler(args: dict[str, Any]) -> dict[str, Any]:
                 call_id = f"cc_{uuid.uuid4().hex[:12]}"
                 fut: asyncio.Future = self._loop.create_future()
                 self._waiting[call_id] = fut
-                text = "".join(buf["text"]).strip()
-                thinking = "".join(buf["thinking"]).strip()
-                buf["text"].clear()
-                buf["thinking"].clear()
+                text, thinking, builtin = _flush()
                 self._to_caller.put((
                     "tool_call",
                     (
@@ -256,6 +276,7 @@ class ClaudeCodeBackend(LLMBackend):
                         ),
                         text,
                         thinking,
+                        builtin,
                     ),
                 ))
                 result: ToolResult = await fut
@@ -279,13 +300,21 @@ class ClaudeCodeBackend(LLMBackend):
         )
         allowed = [f"mcp__{SERVER_NAME}__{t['name']}" for t in tools]
 
+        # The only built-ins ever enabled are Claude's two read-only web
+        # tools: no Read/Write/Edit/Bash, so the harness cannot touch the
+        # host this runs on. Everything else is an MCP tool from this
+        # project. Web activity is reported back to the agent through
+        # ChatResult.builtin_tool_uses so it stays visible in the display
+        # and the session transcript rather than happening silently.
+        builtin = ["WebSearch", "WebFetch"] if self._web_tools else []
+
         options = ClaudeAgentOptions(
             system_prompt=self._system_prompt,
             mcp_servers={SERVER_NAME: server},
-            allowed_tools=allowed,
-            # No Read/Write/Bash/WebSearch: this agent's only tools are
-            # the scoped MCP ones above.
-            tools=[],
+            # `tools` decides which built-ins exist; `allowed_tools` decides
+            # what runs without an interactive prompt. Both are needed.
+            allowed_tools=allowed + builtin,
+            tools=builtin,
             # Nothing to approve interactively in a chat session whose
             # entire tool surface is the list above.
             permission_mode="bypassPermissions",
@@ -313,37 +342,18 @@ class ClaudeCodeBackend(LLMBackend):
                 try:
                     await client.query(prompt)
                     async for msg in client.receive_response():
-                        if isinstance(msg, AssistantMessage):
-                            for block in msg.content:
-                                if isinstance(block, TextBlock):
-                                    buf["text"].append(block.text)
-                                elif isinstance(block, ThinkingBlock):
-                                    buf["thinking"].append(block.thinking)
-                        elif isinstance(msg, ResultMessage):
-                            usage = _usage_of(msg)
-                            if msg.is_error:
-                                detail = (
-                                    getattr(msg, "result", None)
-                                    or msg.subtype
-                                )
-                                buf["text"].append(
-                                    f"\n[claude-code: {detail}]"
-                                )
+                        reported = _absorb_message(msg, buf, pending)
+                        if reported is not None:
+                            usage = reported
                 except Exception as exc:  # noqa: BLE001 - surfaced below
                     self._fail_waiting(exc)
                     self._to_caller.put(("error", _wrap(exc)))
                     continue
 
-                self._to_caller.put((
-                    "end",
-                    (
-                        "".join(buf["text"]).strip(),
-                        "".join(buf["thinking"]).strip(),
-                        usage,
-                    ),
-                ))
-                buf["text"].clear()
-                buf["thinking"].clear()
+                text, thinking, builtin_uses = _flush()
+                self._to_caller.put(
+                    ("end", (text, thinking, usage, builtin_uses))
+                )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -381,6 +391,91 @@ class ClaudeCodeBackend(LLMBackend):
                 self._to_caller.get_nowait()
             except queue.Empty:
                 break
+
+
+def _result_text(content: Any) -> str:
+    """Flatten an SDK tool-result payload (str | list[dict] | None) to text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        if parts:
+            return "\n".join(p for p in parts if p)
+        try:
+            return json.dumps(content)[:_MAX_RESULT_CHARS]
+        except (TypeError, ValueError):  # pragma: no cover - exotic payload
+            return str(content)[:_MAX_RESULT_CHARS]
+    return str(content)
+
+
+def _absorb_message(
+    msg: Any,
+    buf: dict[str, list],
+    pending: dict[str, BuiltinToolUse],
+) -> dict[str, int] | None:
+    """Fold one SDK message into the turn buffers.
+
+    Returns the usage dict when ``msg`` ends the turn, else ``None``.
+
+    Dispatch is on class NAME rather than ``isinstance`` on purpose: the
+    SDK's block set varies by version (``ServerToolUseBlock`` is newer than
+    ``ToolUseBlock``, and a web search may surface as either), and name
+    dispatch keeps this helper importable -- and testable -- on a machine
+    with no SDK installed.  Unknown blocks are ignored.
+    """
+    kind = type(msg).__name__
+
+    if kind == "AssistantMessage":
+        for block in getattr(msg, "content", None) or []:
+            bkind = type(block).__name__
+            if bkind == "TextBlock":
+                buf["text"].append(block.text)
+            elif bkind == "ThinkingBlock":
+                buf["thinking"].append(block.thinking)
+            elif bkind in ("ToolUseBlock", "ServerToolUseBlock"):
+                name = getattr(block, "name", "") or ""
+                # Ours are executed by dd-agent, which displays and logs
+                # them already; only the harness's own tools land here.
+                if name.startswith(f"mcp__{SERVER_NAME}__"):
+                    continue
+                use = BuiltinToolUse(
+                    name=name,
+                    arguments=dict(getattr(block, "input", None) or {}),
+                )
+                buf["builtin"].append(use)
+                block_id = getattr(block, "id", None)
+                if block_id:
+                    pending[block_id] = use
+
+    elif kind == "UserMessage":
+        # Built-in tool RESULTS arrive here, not on the assistant message.
+        content = getattr(msg, "content", None)
+        for block in content if isinstance(content, list) else []:
+            if type(block).__name__ != "ToolResultBlock":
+                continue
+            use = pending.pop(getattr(block, "tool_use_id", "") or "", None)
+            if use is None:
+                continue  # a result for one of our own MCP tools
+            use.result = _result_text(
+                getattr(block, "content", None)
+            )[:_MAX_RESULT_CHARS]
+            use.is_error = bool(getattr(block, "is_error", False))
+
+    elif kind == "ResultMessage":
+        if getattr(msg, "is_error", False):
+            detail = getattr(msg, "result", None) or getattr(
+                msg, "subtype", "error"
+            )
+            buf["text"].append(f"\n[claude-code: {detail}]")
+        return _usage_of(msg)
+
+    return None
 
 
 def _usage_of(msg: Any) -> dict[str, int]:

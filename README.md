@@ -55,7 +55,7 @@ External scoring services run as separate containers, each exposing a uniform `P
 | 6 | ADMET, RetroDMTA, and Interaction Profiler services | Done |
 | 7 | Multi-agent Driver + Reviewer (handoff protocol, `/review`, campaign monitor) | Done |
 | 8 | Apptainer/Singularity stack (AMD + NVIDIA) | Done |
-| 9 | Per-molecule evaluation detail tools for the Reviewer (`get_evaluation_detail`, `read_structure_file`) | Planned |
+| 9 | Per-molecule evaluation detail tools for the Reviewer (`read_structure_file` done; `get_evaluation_detail` planned) | Partial |
 | 10 | OpenTelemetry tracing of agent turns + tool calls | Planned |
 
 ## Prerequisites
@@ -71,7 +71,7 @@ Everything runs inside containers. No local Python environment, venv, or pip ins
 ```
 dd_agentic/
 ├── reinvent4_mcp/                  # MCP server package (dd-mcp)
-│   ├── server.py                   # FastMCP entry point (stdio transport), 24 tools
+│   ├── server.py                   # FastMCP entry point (stdio transport), 28 tools
 │   ├── config.py                   # Process config loading (reinvent4_mcp_config.yaml)
 │   ├── utils.py                    # REINVENT4 path discovery, device detection
 │   ├── scoring_pipeline.py         # PipelineAwareScorer (artifact passing between services)
@@ -84,7 +84,10 @@ dd_agentic/
 │   │   │                           #   predict_retrodmta, profile_interactions
 │   │   ├── ttp.py                  # create/update/get/list/delete TTP
 │   │   ├── uniprot.py              # fetch_target_info (UniProt sequence lookup)
-│   │   └── pubchem.py              # fetch_compound (compound name -> real SMILES)
+│   │   ├── pubchem.py              # fetch_compound (compound name -> real SMILES)
+│   │   ├── chembl.py               # fetch_bioactivity (measured IC50/Ki/Kd from ChEMBL)
+│   │   ├── structures.py           # embed_molecule_3d, read_structure_file
+│   │   └── code_exec.py            # run_python (scratch computation in-container)
 │   ├── _plugins/reinvent_plugins/components/
 │   │   └── comp_external_rest.py   # ExternalRESTScorer plugin (HTTP -> ComponentResults)
 │   ├── jobs/
@@ -670,7 +673,7 @@ A global turn and token budget guarantees termination. The terminal shows per-ag
 
 ## MCP Tools
 
-24 tools are exposed to the Driver. The 10 marked read-only are also available to the Reviewer.
+28 tools are exposed to the Driver. The 16 marked read-only are also available to the Reviewer.
 
 | Tool | Read-only | Description |
 |------|:---------:|-------------|
@@ -678,8 +681,12 @@ A global turn and token budget guarantees termination. The terminal shows per-ag
 | `list_available_models` | ✓ | Check which generative model priors are available |
 | `list_transforms` | ✓ | List score transform types (sigmoid, step, etc.) |
 | `list_external_services` | ✓ | Health-check the five external scoring services |
-| `list_shared_assets` | | List real files on `/shared` (structures, MSAs, cofold outputs) |
-| `fetch_target_info` | | Resolve a UniProt accession or free text to a protein sequence |
+| `list_shared_assets` | ✓ | List real files on `/shared` (structures, MSAs, cofold outputs) |
+| `read_structure_file` | ✓ | Read a PDB/mmCIF/SDF from `/shared` (confined to the volume) |
+| `embed_molecule_3d` | ✓ | Generate a 3D conformer from a SMILES (RDKit ETKDGv3 + MMFF) |
+| `fetch_target_info` | ✓ | Resolve a UniProt accession or free text to a protein sequence |
+| `fetch_bioactivity` | ✓ | Measured IC50/Ki/Kd/EC50 for a compound and/or target (ChEMBL) |
+| `run_python` | | Run a short Python snippet in the container (RDKit, NumPy, pandas) |
 | `fetch_compound` | | Resolve a compound name to a real SMILES via PubChem |
 | `score_molecules` | | Score SMILES with components directly or via a TTP |
 | `predict_admet` | | ADMET consensus predictions with applicability-domain flags |
@@ -698,6 +705,59 @@ A global turn and token budget guarantees termination. The terminal shows per-ag
 | `read_results` | ✓ | Parse a REINVENT4 output CSV into summary statistics |
 | `list_jobs` | ✓ | List all tracked jobs and their states |
 | `get_job_alerts` | | Check running jobs for problems needing intervention |
+| `fetch_compound` | ✓ | Resolve a molecule name to a real SMILES (PubChem) |
+
+---
+
+## Grounding and source precedence
+
+Both agents rank their sources, and the system prompt enforces the ranking:
+
+1. **Tools in this session** — the only numbers presentable as *computed*.
+2. **Curated databases** — PubChem (`fetch_compound`), ChEMBL
+   (`fetch_bioactivity`), UniProt (`fetch_target_info`). The only source for
+   a chemistry fact.
+3. **The open web** (`WebSearch` / `WebFetch`, claude-code backend only) —
+   recency and context. Never a chemistry fact.
+4. **Model memory** — principles and judgement. Never a structure, an
+   identifier, a sequence or a number.
+
+A SMILES must come from `fetch_compound`, from the user, or from a tool in
+this session — never from memory, and never off a web page. A recalled SMILES
+that is subtly wrong still parses and still scores, so it yields confident
+numbers for the wrong molecule. The agent is instructed to look one up *every*
+time a compound is named, including ones it is sure it knows, and to name the
+source in the sentence that uses a number.
+
+### Web search (claude-code backend)
+
+`--backend claude-code` also enables Claude's built-in `WebSearch` and
+`WebFetch` for the "what's new" layer. The harness runs those itself, so they
+never pass through the MCP loop — they are surfaced anyway: a `~ name [web]`
+line in the terminal, a blue card in the browser, and a distinct
+`builtin_tool_use` event in the JSONL transcript, so a post-hoc reader can
+still separate web text from dd-mcp evidence. Disable with `--no-web-tools`
+or `DD_AGENT_WEB_TOOLS=0`.
+
+### Running code in the container (`run_python`)
+
+`run_python` executes a short snippet in a fresh subprocess under
+`/shared/code_runs/<timestamp>_<id>/`, with RDKit, NumPy, pandas and REINVENT4
+importable. Output and code are capped at 20k characters, the default timeout
+is 60s (max 300s) and the whole process group is killed on expiry. A non-zero
+exit is returned as a normal result so the model can read the traceback and
+retry.
+
+**The container is the security boundary and there is no sandbox inside it.**
+A snippet can read and write everything the MCP server can: `/shared`, the job
+working directories and the TTP store, plus outbound network. On the laptop
+path that boundary is real (the agent runs on the host, this in the
+container); under `docker compose` on a cluster `dd-agent` and `dd-mcp` share
+one container, so it grants nothing the agent already lacked. It is therefore
+**not** on the Reviewer's allowlist — "summarise this CSV" and "rewrite this
+CSV" are the same call with different strings, and the Reviewer's read-only
+guarantee is structural, not advisory. Turn it off with
+`code_exec.enabled: false` or `DD_MCP_CODE_EXEC=0`.
 
 ---
 

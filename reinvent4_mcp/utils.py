@@ -93,6 +93,40 @@ def _register_custom_components() -> None:
         logger.info("Added custom plugins path %s", plugins_dir)
 
 
+def subprocess_env() -> dict[str, str]:
+    """Environment for a child process that must import REINVENT4.
+
+    Puts the REINVENT4 root, the custom-plugins dir (the
+    ``reinvent_plugins/components`` namespace layout, so ExternalRESTScorer is
+    discoverable) and this package's own dir on ``PYTHONPATH`` -- stable
+    sys.path entries rather than a fragile runtime ``__path__`` append.
+
+    Used by the RL worker and by ``run_python``.  Note that a child launched
+    with this env must NOT be started with ``python -I``: isolated mode implies
+    ``-E``, which discards the ``PYTHONPATH`` built here.
+    """
+
+    env = os.environ.copy()
+
+    def _prepend(path: str) -> None:
+        if path not in env.get("PYTHONPATH", ""):
+            env["PYTHONPATH"] = path + os.pathsep + env.get("PYTHONPATH", "")
+
+    try:
+        r4_root = str(find_reinvent4_root())
+        env["REINVENT4_ROOT"] = r4_root
+        _prepend(r4_root)
+    except RuntimeError:
+        pass
+
+    plugins_dir = custom_plugins_path()
+    env["DD_MCP_PLUGINS_DIR"] = plugins_dir
+    _prepend(plugins_dir)
+
+    _prepend(str(Path(__file__).resolve().parent.parent))
+    return env
+
+
 def detect_device() -> str:
     """Return the best available torch device string."""
 

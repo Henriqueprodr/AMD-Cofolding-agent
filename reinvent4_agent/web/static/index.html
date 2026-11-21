@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drug Discovery Agent</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.5.5/3Dmol-min.js"
+        integrity="sha384-OsczYbldvrHgslr9fFp/i4GiLSeuw9l+QIlv99ITw8soOwXcoGeflFMLg+CU/X1d"
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/markdown-it/15.0.3/markdown-it.umd.min.js"
+        integrity="sha384-ARStLecQmtLYjBgfD3+w+irhiSoLTnFk/ne6c0gRWQKQtC9791ZLMQ9D3OaBISt3"
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.4.18/purify.min.js"
+        integrity="sha384-lkArbWjiZKuE+bzKbj1vOEF7DKYBDNvgwZMCt5OH8bdRB92zpzyNska9Q/XKPHQD"
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+</head>
+<body>
+
+<header id="topbar">
+  <span id="title">Drug Discovery Agent</span>
+  <span id="session-meta" class="muted">connecting…</span>
+  <span class="spacer"></span>
+  <span id="tokens" class="muted"></span>
+  <button id="viewer-toggle" type="button" title="Show or hide the viewer">3D</button>
+</header>
+
+<main>
+  <section id="chat">
+    <div id="transcript" aria-live="polite"></div>
+    <form id="composer" autocomplete="off">
+      <textarea id="input" rows="2" placeholder="Ask about a target, score some molecules, or type /help"></textarea>
+      <button id="send" type="submit">Send</button>
+      <button id="stop" type="button" hidden>Stop</button>
+    </form>
+    <div id="statusbar" class="muted"></div>
+  </section>
+
+  <section id="viewer-pane">
+    <div id="viewer-head">
+      <input id="pdb-input" type="text" maxlength="4" placeholder="PDB ID"
+             aria-label="Load a PDB entry by ID">
+      <button id="pdb-load" type="button">Load</button>
+      <span class="spacer"></span>
+      <button id="viewer-reset" type="button" title="Reset the view">Reset</button>
+      <button id="viewer-spin" type="button" title="Spin">Spin</button>
+      <button id="viewer-download" type="button" title="Download these coordinates">Save</button>
+    </div>
+    <div id="viewer-provenance" class="muted">Nothing loaded.</div>
+    <div id="viewer-reps">
+      <label><input type="checkbox" id="rep-protein" checked> Protein</label>
+      <label><input type="checkbox" id="rep-ligand" checked> Ligand</label>
+      <label><input type="checkbox" id="rep-water"> Water + ions</label>
+    </div>
+    <div id="viewer"></div>
+  </section>
+</main>
+
+<script src="/static/viewer.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

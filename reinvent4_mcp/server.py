@@ -1072,6 +1072,275 @@ def fetch_compound(
 
 
 # ---------------------------------------------------------------------------
+# Tool: fetch_bioactivity
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def fetch_bioactivity(
+    compound: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Compound name, synonym, or ChEMBL id (e.g. 'JQ1', "
+                "'imatinib', 'CHEMBL1957266')."
+            ),
+        ),
+    ] = None,
+    target: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Target to look up. STRONGLY prefer the UniProt accession "
+                "returned by fetch_target_info (e.g. 'O60885'); a gene or "
+                "protein name (e.g. 'BRD4') is ambiguous and matches other "
+                "organisms and protein complexes. A ChEMBL target id "
+                "(e.g. 'CHEMBL1163125') also works."
+            ),
+        ),
+    ] = None,
+    activity_types: Annotated[
+        list[str] | None,
+        Field(
+            default=None,
+            description=(
+                "Assay endpoints to include. Defaults to "
+                "['IC50', 'Ki', 'Kd', 'EC50']."
+            ),
+        ),
+    ] = None,
+    organism: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Preferred organism when a target NAME is ambiguous "
+                "(e.g. 'Homo sapiens'). Ignored for accessions and ChEMBL ids."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(
+            default=20,
+            description=(
+                "Maximum activity rows to return, ordered by pChEMBL "
+                "(best first). Capped at 50."
+            ),
+        ),
+    ] = 20,
+) -> str:
+    """Look up MEASURED bioactivity (IC50/Ki/Kd/EC50) for a compound and/or target.
+
+    Call this whenever potency, selectivity, or "is this a known binder" comes
+    up, and BEFORE quoting any affinity number that did not come from a tool in
+    this session. ChEMBL is curated experimental data and is the ONLY acceptable
+    source for a measured activity. NEVER recall an IC50/Ki from memory, take
+    one from a web page, or present a Boltz2 ``affinity_pred_value`` as a
+    measurement -- that is a PREDICTION on a different scale.
+
+    Three modes:
+    - ``compound`` only -- that molecule's strongest measured activities across
+      all targets (a selectivity / off-target picture).
+    - ``target`` only -- the best-measured known actives for that target (real
+      chemical starting points, with ChEMBL ids you can resolve further).
+    - both -- the measured activity of that exact pair.
+
+    Returns ``molecule``, ``target``, ``target_candidates`` (when the target was
+    ambiguous), ``activities`` (rows carry ``standard_type``,
+    ``standard_value``, ``standard_units``, ``pchembl_value``, ``assay_type``
+    B=binding/F=functional/A=ADME, and the assay description),
+    ``total_available`` and a ``summary``. Rows are the top ``limit`` by
+    pChEMBL, so they are the OPTIMISTIC end -- quote the range and the number of
+    assays, not the single best value. An empty ``activities`` list means no
+    curated measurement exists; it does NOT mean the compound is inactive.
+
+    Do NOT use this for structures -- a SMILES comes from ``fetch_compound``.
+    Do NOT use it for sequences -- those come from ``fetch_target_info``.
+    """
+
+    from reinvent4_mcp.tools.chembl import fetch_bioactivity as _impl
+
+    return json.dumps(
+        _impl(
+            compound=compound,
+            target=target,
+            activity_types=activity_types,
+            organism=organism,
+            limit=limit,
+        ),
+        indent=2,
+        default=_json_default,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: embed_molecule_3d
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def embed_molecule_3d(
+    smiles: Annotated[
+        str,
+        Field(
+            description=(
+                "SMILES to embed. Must come from fetch_compound, the user, "
+                "or another tool in this session -- never from memory."
+            ),
+        ),
+    ],
+    include_hydrogens: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Keep explicit hydrogens in the returned molblock.",
+        ),
+    ] = False,
+) -> str:
+    """Generate 3D coordinates for a SMILES with RDKit (ETKDGv3 + MMFF).
+
+    Use this to let the user SEE a molecule -- its shape, stereochemistry and
+    conformation -- when no cofolded structure exists. Returns an SDF molblock
+    in ``data`` (bond orders and aromaticity preserved, which a PDB block
+    loses), plus ``meta`` with the formula, weight, atom counts and the method.
+
+    This is a COMPUTED conformer: it is NOT an experimental structure and NOT
+    a predicted binding pose. Say so when you present it. For how a ligand
+    actually binds a target you need a Boltz2 cofold (``score_molecules`` with
+    a structure-based TTP), and for the resulting file ``read_structure_file``.
+
+    Fails cleanly on an unparseable SMILES rather than guessing -- if that
+    happens, re-resolve the molecule with ``fetch_compound``.
+    """
+
+    from reinvent4_mcp.tools.structures import embed_molecule_3d as _impl
+
+    return json.dumps(
+        _impl(smiles=smiles, include_hydrogens=include_hydrogens),
+        indent=2,
+        default=_json_default,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: read_structure_file
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def read_structure_file(
+    path: Annotated[
+        str,
+        Field(
+            description=(
+                "/shared-relative path as list_shared_assets returns it "
+                "(e.g. 'predictions/out_ab12/.../mol_0_model_0.pdb')."
+            ),
+        ),
+    ],
+    max_bytes: Annotated[
+        int,
+        Field(
+            default=8 * 1024 * 1024,
+            description="Refuse files larger than this (default 8 MiB).",
+        ),
+    ] = 8 * 1024 * 1024,
+) -> str:
+    """Read a structure file (PDB/mmCIF/SDF) from the shared volume.
+
+    Use this to inspect what a run actually produced -- a Boltz cofold
+    complex, a PoseBusters pose, a file the user placed on the volume. GROUND
+    the path with ``list_shared_assets`` first; never invent one.
+
+    Returns ``format``, the file text in ``data``, and ``meta`` with
+    ``has_protein``, ``has_ligand``, ``ligand_resnames``, ``chains`` and
+    ``n_models`` so you can describe the contents without parsing it yourself.
+
+    Oversized files are refused rather than truncated -- a partial structure
+    renders as nonsense. For a molecule with no structure file yet, use
+    ``embed_molecule_3d`` instead.
+    """
+
+    from reinvent4_mcp.tools.structures import read_structure_file as _impl
+
+    return json.dumps(
+        _impl(path=path, max_bytes=max_bytes), indent=2, default=_json_default
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: run_python
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def run_python(
+    code: Annotated[
+        str,
+        Field(
+            description=(
+                "Python snippet to execute. print() whatever you need back; "
+                "nothing is returned implicitly."
+            ),
+        ),
+    ],
+    timeout_s: Annotated[
+        int,
+        Field(
+            default=60,
+            description=(
+                "Wall-clock limit in seconds (default 60, maximum 300). The "
+                "process group is killed when it expires."
+            ),
+        ),
+    ] = 60,
+    work_dir: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "A ``work_dir`` returned by an earlier run_python call, to "
+                "reuse the files it wrote. Omit for a fresh directory."
+            ),
+        ),
+    ] = None,
+) -> str:
+    """Run a short Python snippet in this container (RDKit, NumPy, pandas, REINVENT4).
+
+    Use this for the small computations between the big tools: unit
+    conversions (nM <-> pIC50), aggregating a results CSV, Murcko scaffolds,
+    enumerating an R-group series, checking that a SMILES parses, quick
+    descriptor maths. ALWAYS use it instead of doing arithmetic or
+    cheminformatics in your head -- a number you computed here is evidence, a
+    number you recalled is not.
+
+    Each call runs a FRESH process in a FRESH directory under
+    ``/shared/code_runs`` and returns ``stdout``, ``stderr``, ``exit_code`` and
+    the ``files`` it wrote. State does NOT carry over between calls: ``print``
+    what you need, or write a file and pass the returned ``work_dir`` back on
+    the next call. Returned paths are real ``/shared`` paths, usable directly
+    by ``profile_interactions``.
+
+    A non-zero ``exit_code`` is a NORMAL result, not a tool failure -- read
+    ``stderr``, fix the snippet, and call again.
+
+    Do NOT use it to fetch chemistry facts: a SMILES comes from
+    ``fetch_compound``, a sequence from ``fetch_target_info``, a measured IC50
+    from ``fetch_bioactivity``, and scoring from ``score_molecules``. Do NOT
+    run ``pip install`` -- that mutates the container for every later call. Do
+    NOT write into job directories or the TTP store; create files only in your
+    ``work_dir``.
+    """
+
+    from reinvent4_mcp.tools.code_exec import run_python as _impl
+
+    return json.dumps(
+        _impl(code=code, timeout_s=timeout_s, work_dir=work_dir),
+        indent=2,
+        default=_json_default,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

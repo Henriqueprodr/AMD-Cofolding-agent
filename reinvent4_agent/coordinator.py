@@ -40,6 +40,14 @@ _ACTIVE_JOB_STATES = frozenset({"running", "queued"})
 # Tools the read-only Reviewer is allowed to call. Everything that creates,
 # updates, deletes, runs, or stops state is intentionally excluded so the
 # Reviewer physically cannot mutate the campaign.
+#
+# The lookup tools below are network/CPU reads that touch no job, TTP or file,
+# so they keep that guarantee intact. They are here because a Reviewer that
+# cannot re-resolve the structure, sequence or measured potency the Driver
+# claims to have used is reviewing the Driver's arithmetic, not its science.
+# `run_python` is deliberately NOT here: "summarise this CSV" and "rewrite
+# this CSV" are the same tool call with different strings, so admitting it
+# would turn a structural guarantee into a prompt-level promise.
 REVIEWER_READ_ONLY_TOOLS: frozenset[str] = frozenset(
     {
         "read_results",
@@ -52,6 +60,14 @@ REVIEWER_READ_ONLY_TOOLS: frozenset[str] = frozenset(
         "list_available_models",
         "list_transforms",
         "list_external_services",
+        # Independent re-grounding of the Driver's claims.
+        "fetch_compound",
+        "fetch_target_info",
+        "fetch_bioactivity",
+        # Inspect what was produced, without producing anything.
+        "list_shared_assets",
+        "read_structure_file",
+        "embed_molecule_3d",
     }
 )
 
@@ -461,6 +477,39 @@ class _NullCoordinatorEvents(CoordinatorEvents):
 # ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
+
+
+def build_manual_review_prompt(job_id: str | None) -> str:
+    """Build the prompt for an on-demand Reviewer critique (``/review``).
+
+    Public and UI-free: the terminal CLI and the web front end both ask for
+    the same review, so the wording lives here with the rest of the review
+    protocol rather than in either front end.
+    """
+    lines = [
+        "[MANUAL REVIEW REQUESTED] The user has asked for an independent, "
+        "read-only review of the current drug-design candidates.",
+        "",
+    ]
+    if job_id:
+        lines.append(
+            f"Focus on optimization job '{job_id}'. Pull the real scored "
+            f"molecules with get_optimization_status(job_id='{job_id}') and "
+            f"get_top_candidates(job_id='{job_id}')."
+        )
+    else:
+        lines.append(
+            "Use list_jobs to find the most recent optimization job, then "
+            "get_top_candidates / read_results to pull its scored molecules. "
+            "If no job or results exist yet, say so plainly."
+        )
+    lines += [
+        "",
+        "Apply the Boltz2 confidence gate and PoseBusters thresholds, "
+        "red-team medchem liabilities, rank the survivors, and return your "
+        "verdict as the JSON handoff block.",
+    ]
+    return "\n".join(lines)
 
 
 def _initial_driver_prompt(goal: str) -> str:

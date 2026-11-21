@@ -1,0 +1,229 @@
+/* Copyright Advanced Micro Devices, Inc.
+   SPDX-License-Identifier: MIT
+
+   Agent colours deliberately match the terminal's Rich theme
+   (driver=cyan, reviewer=magenta, coordinator=blue) and the score bands use
+   the same >=0.7 / >=0.4 thresholds, so the two front ends agree. */
+
+:root {
+  --bg: #11141a;
+  --panel: #171b23;
+  --panel-2: #1d222c;
+  --line: #2a3140;
+  --text: #dfe4ee;
+  --muted: #8a94a8;
+  --driver: #35c8d8;
+  --reviewer: #d980e8;
+  --coordinator: #6ea8ff;
+  --web: #6ea8ff;
+  --good: #46c17e;
+  --ok: #d9b03a;
+  --bad: #e0695f;
+  --error: #ff6b6b;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f7fa; --panel: #fff; --panel-2: #f0f2f7; --line: #d9dee8;
+    --text: #1b2130; --muted: #5e6880; --driver: #0f7f8c; --reviewer: #9333a8;
+    --coordinator: #2b5fd0; --web: #2b5fd0; --good: #1d8a52; --ok: #8a6d12;
+    --bad: #b03b31;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.muted { color: var(--muted); font-size: 13px; }
+.spacer { flex: 1; }
+
+/* ---------- top bar ---------- */
+
+#topbar {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+#title { font-weight: 650; letter-spacing: .2px; }
+
+button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 11px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+button:hover { border-color: var(--driver); }
+button:disabled { opacity: .5; cursor: default; }
+
+/* ---------- layout ---------- */
+
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 440px;
+  min-height: 0;
+}
+main.viewer-hidden { grid-template-columns: 1fr 0; }
+main.viewer-hidden #viewer-pane { display: none; }
+
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+}
+
+#chat {
+  display: flex; flex-direction: column; min-height: 0;
+  border-right: 1px solid var(--line);
+}
+
+#transcript {
+  flex: 1; overflow-y: auto; padding: 18px 20px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+
+/* ---------- messages ---------- */
+
+.msg { max-width: 54rem; }
+.msg.user {
+  align-self: flex-end;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 12px;
+  white-space: pre-wrap;
+}
+.msg.assistant { border-left: 3px solid var(--driver); padding-left: 12px; }
+.msg.assistant[data-agent="reviewer"] { border-left-color: var(--reviewer); }
+.msg.assistant[data-agent="coordinator"] { border-left-color: var(--coordinator); }
+
+.agent-badge {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--driver); font-weight: 650;
+}
+.msg.assistant[data-agent="reviewer"] .agent-badge { color: var(--reviewer); }
+
+.msg.assistant :is(p, ul, ol) { margin: .5em 0; }
+.msg.assistant code {
+  font-family: var(--mono); font-size: 13px;
+  background: var(--panel-2); padding: 1px 4px; border-radius: 4px;
+}
+.msg.assistant pre {
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px; overflow-x: auto;
+}
+.msg.assistant table { border-collapse: collapse; }
+.msg.assistant th, .msg.assistant td {
+  border: 1px solid var(--line); padding: 4px 8px; text-align: left;
+}
+
+.status { color: var(--muted); font-size: 13px; white-space: pre-wrap; }
+.status.warn { color: var(--ok); }
+.status.error, .error-msg { color: var(--error); }
+
+.thinking {
+  color: var(--muted); font-size: 13px; font-style: italic;
+  border-left: 2px dotted var(--line); padding-left: 10px;
+}
+
+/* ---------- tool cards ---------- */
+
+details.tool {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 10px; font-size: 13px;
+}
+details.tool > summary { cursor: pointer; font-family: var(--mono); }
+details.tool .tool-name { color: var(--driver); font-weight: 650; }
+details.tool[data-error="true"] .tool-name { color: var(--error); }
+details.tool pre {
+  margin: 8px 0 2px; max-height: 320px; overflow: auto;
+  background: var(--panel-2); border-radius: 6px; padding: 8px;
+  font-size: 12px; white-space: pre-wrap; word-break: break-word;
+}
+.tool-summary { color: var(--muted); }
+
+/* A harness tool (web search), marked apart from the chemistry tools on
+   purpose: these results come off the open web. */
+details.tool.builtin { border-color: var(--web); }
+details.tool.builtin .tool-name { color: var(--web); }
+.web-tag {
+  font-size: 10px; border: 1px solid var(--web); color: var(--web);
+  border-radius: 4px; padding: 0 4px; margin-left: 6px; vertical-align: 1px;
+}
+
+/* ---------- score table ---------- */
+
+.score-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+table.score-table { border-collapse: collapse; font-size: 13px; width: 100%; }
+table.score-table th, table.score-table td {
+  padding: 5px 10px; border-bottom: 1px solid var(--line); text-align: right;
+  white-space: nowrap;
+}
+table.score-table th { cursor: pointer; user-select: none; color: var(--muted); font-weight: 600; }
+table.score-table th:first-child, table.score-table td:first-child {
+  text-align: left; position: sticky; left: 0; background: var(--panel);
+  font-family: var(--mono); font-size: 12px; max-width: 22rem;
+  overflow: hidden; text-overflow: ellipsis;
+}
+table.score-table tbody tr:hover td { background: var(--panel-2); }
+.raw { color: var(--muted); font-size: 11px; }
+.score-good { color: var(--good); }
+.score-ok { color: var(--ok); }
+.score-bad { color: var(--bad); }
+.btn-3d { padding: 1px 7px; font-size: 11px; }
+caption.score-caption {
+  caption-side: bottom; text-align: left; color: var(--muted);
+  font-size: 12px; padding: 6px 10px;
+}
+.structure-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.structure-strip button { font-size: 11px; font-family: var(--mono); }
+
+/* ---------- composer ---------- */
+
+#composer {
+  display: flex; gap: 8px; padding: 12px 16px;
+  border-top: 1px solid var(--line); background: var(--panel);
+}
+#input {
+  flex: 1; resize: vertical; min-height: 44px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 9px 11px; font: inherit;
+}
+#input:focus { outline: 2px solid var(--driver); outline-offset: -1px; }
+#statusbar { padding: 0 16px 10px; min-height: 18px; }
+
+/* ---------- viewer ---------- */
+
+#viewer-pane {
+  display: flex; flex-direction: column; min-height: 0; background: var(--panel);
+}
+#viewer-head {
+  display: flex; gap: 6px; align-items: center;
+  padding: 10px 12px; border-bottom: 1px solid var(--line);
+}
+#pdb-input {
+  width: 92px; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px;
+  font: inherit; font-size: 13px; text-transform: uppercase;
+}
+#viewer-provenance { padding: 7px 12px; border-bottom: 1px solid var(--line); }
+#viewer-reps {
+  display: flex; gap: 14px; padding: 7px 12px; font-size: 12px;
+  color: var(--muted); border-bottom: 1px solid var(--line);
+}
+#viewer-reps label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+#viewer { flex: 1; position: relative; min-height: 260px; }

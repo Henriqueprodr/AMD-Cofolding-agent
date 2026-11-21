@@ -105,6 +105,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         in ("1", "true", "yes"),
         help="Disable TLS certificate verification",
     )
+    parser.add_argument(
+        "--no-web-tools",
+        action="store_true",
+        default=os.environ.get("DD_AGENT_WEB_TOOLS", "1") == "0",
+        help=(
+            "Disable Claude's built-in WebSearch/WebFetch (claude-code "
+            "backend only). They are the general 'what's new' layer; "
+            "chemistry facts always come from PubChem/ChEMBL/UniProt "
+            "(default: enabled, or DD_AGENT_WEB_TOOLS=0 env var)"
+        ),
+    )
 
     # -- Thinking / reasoning ------------------------------------------
     parser.add_argument(
@@ -273,6 +284,9 @@ async def run_agent(args: argparse.Namespace) -> None:
     )
 
     api_key = _resolve_api_key(args)
+    SYSTEM_PROMPT, REVIEWER_SYSTEM_PROMPT = _apply_web_addendum(
+        args, SYSTEM_PROMPT, REVIEWER_SYSTEM_PROMPT
+    )
 
     print_welcome()
 
@@ -280,6 +294,11 @@ async def run_agent(args: argparse.Namespace) -> None:
     if args.backend == "claude-code":
         endpoint_label = "local claude CLI (subscription)"
         thinking_label = "CLI default"
+        # Say up front what the agent can reach.
+        print_status(
+            "Web tools: "
+            + ("off" if args.no_web_tools else "on (WebSearch, WebFetch)")
+        )
     elif args.backend == "openai":
         thinking_label = args.reasoning_effort or "off"
     else:
@@ -546,7 +565,9 @@ async def _run_manual_review(
         + (f" on job {job_id}" if job_id else " on the latest candidates")
         + "..."
     )
-    prompt = _build_manual_review_prompt(job_id)
+    from reinvent4_agent.coordinator import build_manual_review_prompt
+
+    prompt = build_manual_review_prompt(job_id)
     try:
         async with agent._chat_lock:
             response = await reviewer.chat(prompt)
@@ -556,34 +577,6 @@ async def _run_manual_review(
     except Exception as exc:
         print_error(f"Reviewer error: {exc}")
         console.print("[dim]  Run with --verbose for the full traceback.[/dim]")
-
-
-def _build_manual_review_prompt(job_id: str | None) -> str:
-    """Build the prompt for an on-demand Reviewer critique."""
-    lines = [
-        "[MANUAL REVIEW REQUESTED] The user has asked for an independent, "
-        "read-only review of the current drug-design candidates.",
-        "",
-    ]
-    if job_id:
-        lines.append(
-            f"Focus on optimization job '{job_id}'. Pull the real scored "
-            f"molecules with get_optimization_status(job_id='{job_id}') and "
-            f"get_top_candidates(job_id='{job_id}')."
-        )
-    else:
-        lines.append(
-            "Use list_jobs to find the most recent optimization job, then "
-            "get_top_candidates / read_results to pull its scored molecules. "
-            "If no job or results exist yet, say so plainly."
-        )
-    lines += [
-        "",
-        "Apply the Boltz2 confidence gate and PoseBusters thresholds, "
-        "red-team medchem liabilities, rank the survivors, and return your "
-        "verdict as the JSON handoff block.",
-    ]
-    return "\n".join(lines)
 
 
 def _make_prompt_reader():
@@ -728,6 +721,9 @@ async def run_coscientist(args: argparse.Namespace) -> None:
     )
 
     api_key = _resolve_api_key(args)
+    DRIVER_SYSTEM_PROMPT, REVIEWER_SYSTEM_PROMPT = _apply_web_addendum(
+        args, DRIVER_SYSTEM_PROMPT, REVIEWER_SYSTEM_PROMPT
+    )
 
     goal = args.goal
     if not goal:
@@ -914,9 +910,32 @@ def _print_monitor_summary(result: Any) -> None:
     )
 
 
+def _apply_web_tools_env(args: argparse.Namespace) -> None:
+    """Publish --no-web-tools where the backend factory reads it."""
+    if getattr(args, "no_web_tools", False):
+        os.environ["DD_AGENT_WEB_TOOLS"] = "0"
+
+
+def _apply_web_addendum(
+    args: argparse.Namespace, *prompts: str
+) -> tuple[str, ...]:
+    """Tell the agents about the web tools only when they actually have them.
+
+    Only the claude-code backend carries Claude's built-ins. A model told it
+    has a tool it lacks will claim to have searched, so the capability
+    paragraph is gated even though the precedence rules themselves are not.
+    """
+    from reinvent4_agent.system_prompt import WEB_TOOLS_ADDENDUM
+
+    if args.backend != "claude-code" or getattr(args, "no_web_tools", False):
+        return prompts
+    return tuple(p + WEB_TOOLS_ADDENDUM for p in prompts)
+
+
 def main() -> None:
     """CLI entry point (single-agent interactive chat)."""
     args = parse_args()
+    _apply_web_tools_env(args)
 
     log_file = _configure_logging(args)
     if log_file:
@@ -928,6 +947,7 @@ def main() -> None:
 def coscientist_main() -> None:
     """CLI entry point for the two-agent co-scientist runner."""
     args = parse_args()
+    _apply_web_tools_env(args)
 
     log_file = _configure_logging(args)
     if log_file:

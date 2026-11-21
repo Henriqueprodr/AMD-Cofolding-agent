@@ -55,6 +55,23 @@ class ToolResult:
 
 
 @dataclass
+class BuiltinToolUse:
+    """A tool the LLM harness executed itself, outside the agent's MCP loop.
+
+    The claude-code backend lets Claude Code run its own built-in tools
+    (WebSearch, WebFetch).  Those never reach ``Agent._handle_tool_calls``,
+    so without this record they would be invisible in the display and in the
+    JSONL transcript -- and the user could not tell a retrieved answer from a
+    recalled one.  Backends with no such tools leave the list empty.
+    """
+
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    result: str = ""
+    is_error: bool = False
+
+
+@dataclass
 class ChatResult:
     """Unified response from any LLM backend."""
 
@@ -67,6 +84,10 @@ class ChatResult:
     #: Part of ``output_tokens`` spent on hidden reasoning, when the
     #: endpoint reports it.  Billed and capped as output, but invisible.
     reasoning_tokens: int = 0
+    #: Tools the harness ran itself during this turn (claude-code
+    #: built-ins).  Always empty for the anthropic and openai backends,
+    #: which have no equivalent.
+    builtin_tool_uses: list[BuiltinToolUse] = field(default_factory=list)
 
 
 class LLMBackend(ABC):
@@ -367,6 +388,7 @@ def create_backend(
             # --api-key doubles as the `claude setup-token` token here.
             oauth_token=api_key or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"),
             cli_path=os.environ.get("CLAUDE_CODE_CLI_PATH"),
+            web_tools=os.environ.get("DD_AGENT_WEB_TOOLS", "1") != "0",
         )
 
     if backend_type == "openai":

@@ -25,6 +25,7 @@ _THEME = Theme(
         "user": "bold green",
         "tool_name": "bold yellow",
         "tool_result": "dim",
+        "builtin_tool": "bold blue",
         "error": "bold red",
         "score_good": "green",
         "score_ok": "yellow",
@@ -141,6 +142,42 @@ def print_tool_call(tool_name: str, arguments: dict[str, Any]) -> None:
         f"({args_summary})",
         highlight=False,
     )
+
+
+def print_builtin_tool(
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: str,
+    is_error: bool,
+    agent_label: str | None = None,
+) -> None:
+    """Display a tool the LLM harness ran itself (Claude's WebSearch etc.).
+
+    Marked differently from the project's own tools on purpose -- a ``~``
+    and a ``[web]`` tag rather than the MCP tools' ``>`` -- because these
+    results come off the open web, not out of the chemistry stack. At a
+    glance the user can see which claims are grounded in which.
+    """
+    args_summary = _summarize_args(arguments)
+    prefix = ""
+    if agent_label:
+        style = _agent_style(agent_label)
+        prefix = f"[{style}]{agent_label}[/{style}] "
+
+    console.print(
+        f"  {prefix}[builtin_tool]~ {tool_name}[web][/builtin_tool]"
+        f"({args_summary})",
+        highlight=False,
+    )
+
+    if is_error:
+        print_error(result or f"{tool_name} failed")
+        return
+    if result:
+        summary = result[:200].replace("\n", " ")
+        if len(result) > 200:
+            summary += "..."
+        console.print(f"  [tool_result]{summary}[/tool_result]")
 
 
 def print_tool_result_brief(tool_name: str, result: str) -> None:
@@ -364,6 +401,17 @@ class RichEventHandler:
         else:
             print_tool_result_brief(name, result)
             self._maybe_render_score_table(name, result)
+
+    def on_builtin_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        result: str,
+        is_error: bool,
+    ) -> None:
+        print_builtin_tool(
+            name, arguments, result, is_error, agent_label=self._label
+        )
 
     def on_error(self, message: str) -> None:
         print_error(message)

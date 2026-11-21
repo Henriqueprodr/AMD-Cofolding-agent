@@ -24,10 +24,20 @@ dependencies = [
 claude-code = [
     "claude-agent-sdk>=0.1",
 ]
+# `dd-web`: the browser front end. starlette/pydantic/httpx already come
+# in via mcp[cli] and anthropic, so this is two small wheels.
+web = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
 
 [project.scripts]
 dd-agent = "reinvent4_agent.cli:main"
 dd-coscientist = "reinvent4_agent.cli:coscientist_main"
+dd-web = "reinvent4_agent.web.cli:main"
+
+[tool.setuptools.package-data]
+reinvent4_agent = ["web/static/*"]
 
 [build-system]
 # >=77 understands the PEP 639 SPDX string form of `project.license`.

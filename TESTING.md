@@ -564,13 +564,101 @@ Tests for Phase 4: background job manager, TOML config generation, score traject
 | 251 | CSV with components | Per-component transformed + raw scores in output | `pytest tests/test_optimization.py::TestGetTopCandidatesComponentBreakdown -v` |
 | 252 | CSV without raw columns | Transformed scores only, no raw key | same class |
 
+### ChEMBL Bioactivity Lookup (`tests/test_chembl.py`)
+
+**Dependencies**: none (HTTP mocked).
+
+| # | Test | What it verifies | Command |
+|---|------|------------------|---------|
+| 253 | ChEMBL id resolves directly | `GET molecule/<id>.json`, no search fallback | `pytest tests/test_chembl.py::TestResolveMolecule -v` |
+| 254 | Exact name hit | `pref_name__iexact` short-circuits the cascade | same class |
+| 255 | Synonym fallback | Falls through to `molecule_synonyms__...` (e.g. JQ1) | same class |
+| 256 | Fuzzy fallback warns | Text search sets a confirm-the-identity note | same class |
+| 257 | Molfile stripped | `only=` does not prune nested objects; ~4 KB dropped | same class |
+| 258 | Accession prefers SINGLE PROTEIN | Complexes/PPIs rank below the protein | `pytest tests/test_chembl.py::TestResolveTarget -v` |
+| 259 | Free text warns + ranks human | `BRD4` matches zebrafish; note + candidates returned | same class |
+| 260 | Explicit organism overrides | `organism=` beats the human default | same class |
+| 261 | No input, no HTTP | Error dict before any request | `pytest tests/test_chembl.py::TestFetchBioactivity -v` |
+| 262 | Numeric casting | `"3.9"` -> `3.9`, `"8.41"` -> `8.41` | same class |
+| 263 | Censored values excluded | `standard_relation==`, `pchembl_value__isnull=false` | same class |
+| 264 | Limit clamped | Above `_MAX_LIMIT` is capped | same class |
+| 265 | Summary statistics | best/median pChEMBL, type counts, distinct targets | same class |
+| 266 | Empty result is not "inactive" | Note says no curated measurement exists | same class |
+| 267 | Network failure | Do-not-fabricate error dict, never raises | same class |
+
+### Container Code Execution (`tests/test_code_exec.py`)
+
+**Dependencies**: none (spawns `sys.executable`; run root patched to tmp_path).
+
+| # | Test | What it verifies | Command |
+|---|------|------------------|---------|
+| 268 | stdout captured | Snippet output returned | `pytest tests/test_code_exec.py::TestRunPython -v` |
+| 269 | Files listed | Written files reported; `snippet.py` excluded | same class |
+| 270 | work_dir round-trips | A second call sees the first call's files | same class |
+| 271 | Fresh dir per call | No state leaks between calls | same class |
+| 272 | Traceback is a result | `ok=False` + stderr, NOT a raised tool error | `pytest tests/test_code_exec.py::TestFailureIsAResult -v` |
+| 273 | Timeout kills the group | `timed_out=True` within the limit | same class |
+| 274 | Output truncated | Over 20k chars flagged and cut | `pytest tests/test_code_exec.py::TestCaps -v` |
+| 275 | Oversized code refused | No process spawned | same class |
+| 276 | Empty code refused | No process spawned | `pytest tests/test_code_exec.py::TestRefusals -v` |
+| 277 | work_dir escape rejected | `/etc` and `../../etc` both refused | same class |
+| 278 | Disabled tool refuses | Kill switch honoured | same class |
+
+### Built-in Tool Visibility (`tests/test_builtin_tool_visibility.py`)
+
+**Dependencies**: none (SDK message classes stubbed by name).
+
+| # | Test | What it verifies | Command |
+|---|------|------------------|---------|
+| 279 | ChatResult default | `builtin_tool_uses` defaults empty; other backends unaffected | `pytest tests/test_builtin_tool_visibility.py::TestChatResultDefaults -v` |
+| 280 | Our MCP tools skipped | `mcp__dd__*` not recorded as harness tools | `pytest tests/test_builtin_tool_visibility.py::TestAbsorbMessage -v` |
+| 281 | Both block shapes | `ToolUseBlock` and `ServerToolUseBlock` captured | same class |
+| 282 | Results pair from UserMessage | Paired by `tool_use_id`, not AssistantMessage | same class |
+| 283 | Distinct transcript event | JSONL records `builtin_tool_use`, never `tool_call` | `pytest tests/test_builtin_tool_visibility.py::TestAgentSurfacesBuiltinTools -v` |
+| 284 | Legacy handler fallback | Handlers without the method still get told | same class |
+
+### Structure Tools (`tests/test_structures.py`)
+
+**Dependencies**: RDKit (skipped when absent).
+
+| # | Test | What it verifies | Command |
+|---|------|------------------|---------|
+| 285 | Aspirin embeds | Molblock with real 3D coordinates and formula | `pytest tests/test_structures.py::TestEmbedMolecule3D -v` |
+| 286 | Coordinates are 3D | Not a flat z=0 structure | same class |
+| 287 | Declares it is computed | Meta says conformer, not a predicted pose | same class |
+| 288 | Seed reproducible | Same SMILES + seed -> identical molblock | same class |
+| 289 | Unparseable SMILES | Error points at `fetch_compound`, no guess | same class |
+| 290 | Oversized molecule refused | Heavy-atom cap enforced | same class |
+| 291 | PDB scanned | protein/ligand/chains detected, water excluded | `pytest tests/test_structures.py::TestReadStructureFile -v` |
+| 292 | Host-style path normalised | `.../data/shared/x.pdb` re-rooted | same class |
+| 293 | Traversal rejected | `../../etc/passwd` refused | same class |
+| 294 | Oversized file refused | Never truncated; size reported | same class |
+
+### Web Front End (`tests/test_web_protocol.py`)
+
+**Dependencies**: none (no FastAPI import).
+
+| # | Test | What it verifies | Command |
+|---|------|------------------|---------|
+| 295 | Messages self-describing | Every constructor carries type + ts, JSON-safe | `pytest tests/test_web_protocol.py::TestProtocol -v` |
+| 296 | No credentials in session | Session message leaks no key/token | same class |
+| 297 | Hub fan-out | Every subscriber receives a publish | `pytest tests/test_web_protocol.py::TestSessionHub -v` |
+| 298 | Replay bounded | Oldest messages dropped past the limit | same class |
+| 299 | Large results referenced | Over 16 KiB gets a payload_ref, not inline | `pytest tests/test_web_protocol.py::TestWebEventHandler -v` |
+| 300 | Stop raises at next tool call | `TurnCancelled` from `on_tool_call` | same class |
+| 301 | Score table gate + cap | Only `score_molecules`; 200-row cap | `pytest tests/test_web_protocol.py::TestScoreTable -v` |
+
 ### Run All Unit Tests
 
 ```bash
 python -m pytest tests/ -v
 ```
 
-Expected: all 280+ tests pass in ~2 seconds.
+Expected: all 380+ tests pass in a few seconds.
+
+Two service-wrapper modules (`test_boltz_wrapper.py`,
+`test_posebusters_wrapper.py`) need FastAPI, which the dd-agent image
+does not carry; skip them with `--ignore` when running inside it.
 
 ---
 

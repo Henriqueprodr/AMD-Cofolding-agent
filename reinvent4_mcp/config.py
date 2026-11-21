@@ -381,6 +381,42 @@ class TTPStorageConfig(BaseModel):
         return _expand_path(v)
 
 
+class CodeExecConfig(BaseModel):
+    """Settings for the ``run_python`` scratch-computation tool.
+
+    The tool runs model-written Python inside this container, which is the
+    security boundary -- snippets can read and write everything the MCP
+    server can. Operators who do not want that can turn it off here or with
+    ``DD_MCP_CODE_EXEC=0``.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    enabled: bool = Field(
+        default=True,
+        description="Allow the agent to run Python in this container",
+    )
+    run_dir: str = Field(
+        default="/shared/code_runs",
+        description=(
+            "Root for per-call working directories. Under /shared so files "
+            "written there are reachable by the other services and visible "
+            "on the host."
+        ),
+    )
+    default_timeout_s: int = Field(
+        default=60, ge=1, description="Default per-call wall-clock limit"
+    )
+    max_timeout_s: int = Field(
+        default=300, ge=1, description="Ceiling the agent cannot exceed"
+    )
+
+    @field_validator("run_dir")
+    @classmethod
+    def _expand_run_dir(cls, v: str) -> str:
+        return _expand_path(v)
+
+
 class LoggingConfig(BaseModel):
     """Logging and TensorBoard configuration."""
 
@@ -446,6 +482,7 @@ class ProcessConfig(BaseModel):
     jobs: JobsConfig = Field(default_factory=JobsConfig)
     ttp: TTPStorageConfig = Field(default_factory=TTPStorageConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    code_exec: CodeExecConfig = Field(default_factory=CodeExecConfig)
 
     def ensure_directories(self) -> None:
         """Create storage, job, and log directories if they don't exist."""

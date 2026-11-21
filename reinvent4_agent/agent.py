@@ -45,6 +45,22 @@ class AgentEventHandler(Protocol):
     def on_monitor_alert(self, alert: dict[str, Any]) -> None: ...
     def on_monitor_response(self, text: str) -> None: ...
 
+    def on_builtin_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        result: str,
+        is_error: bool,
+    ) -> None:
+        """A tool the LLM harness ran itself, outside this agent's MCP loop.
+
+        Currently only the claude-code backend has these (Claude's own
+        WebSearch / WebFetch).  Kept distinct from ``on_tool_call`` so the
+        display and the transcript can show at a glance which statements
+        came off the open web and which came from this project's tools.
+        """
+        ...
+
 
 class _NullEventHandler:
     """No-op event handler used when no handler is provided."""
@@ -55,6 +71,14 @@ class _NullEventHandler:
     def on_error(self, message: str) -> None: pass
     def on_monitor_alert(self, alert: dict[str, Any]) -> None: pass
     def on_monitor_response(self, text: str) -> None: pass
+
+    def on_builtin_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        result: str,
+        is_error: bool,
+    ) -> None: pass
 
 
 class Agent:
@@ -126,7 +150,13 @@ class Agent:
 
         for round_idx in range(MAX_TOOL_ROUNDS):
             t0 = time.monotonic()
-            result = self.backend.complete(tools, self.max_tokens)
+            # Backends are synchronous and a turn can take minutes.  Off the
+            # event loop, so queued display events still flush, the background
+            # job monitor stays punctual, and a WebSocket front end can keep
+            # its connection alive while the model thinks.
+            result = await asyncio.to_thread(
+                self.backend.complete, tools, self.max_tokens
+            )
             elapsed = time.monotonic() - t0
 
             self.total_input_tokens += result.input_tokens
@@ -145,6 +175,37 @@ class Agent:
                 result.output_tokens,
                 result.reasoning_tokens,
             )
+
+            # Tools the harness ran on its own (Claude's WebSearch /
+            # WebFetch).  They never pass through _handle_tool_calls, so
+            # without this they would be invisible -- and the whole point
+            # of having them is that the user can see when an answer came
+            # off the open web instead of out of the chemistry tools.
+            for use in result.builtin_tool_uses:
+                logger.info(
+                    "Turn %d round %d — harness tool %s(%s)",
+                    self._turn,
+                    round_idx,
+                    use.name,
+                    _summarize_dict(use.arguments),
+                )
+                self._write_event("builtin_tool_use", {
+                    "name": use.name,
+                    "arguments": use.arguments,
+                    "content_length": len(use.result),
+                    "is_error": use.is_error,
+                    "round": round_idx,
+                })
+                # Handlers written before this event existed still get told,
+                # via the generic pair, rather than silently dropping it.
+                handler = getattr(self._events, "on_builtin_tool", None)
+                if handler is not None:
+                    handler(use.name, use.arguments, use.result, use.is_error)
+                else:  # pragma: no cover - third-party handler
+                    self._events.on_tool_call(use.name, use.arguments)
+                    self._events.on_tool_result(
+                        use.name, use.result, use.is_error
+                    )
 
             if result.thinking:
                 logger.debug("Thinking: %s", result.thinking[:500])

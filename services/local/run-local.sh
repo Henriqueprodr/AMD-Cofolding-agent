@@ -9,10 +9,21 @@
 # The agent talks to the MCP server over stdio through `docker exec`,
 # exactly as it would to a local subprocess.
 #
-#   bash services/local/run-local.sh              # chat
+#   bash services/local/run-local.sh              # terminal chat
+#   bash services/local/run-local.sh --web        # browser UI + 3D viewer
 #   bash services/local/run-local.sh --multi-agent
 #   echo "score aspirin" | bash services/local/run-local.sh
 set -euo pipefail
+
+WEB=0
+ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --web) WEB=1 ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -40,7 +51,17 @@ mkdir -p "$DATA_DIR"/{shared,ttps,jobs,logs,tb_logs,agent_logs}
 if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     say "starting $CONTAINER"
+    # DD_MCP_DEV_MOUNT=1 shadows the image's installed reinvent4_mcp with the
+    # source tree, so MCP-server edits take effect on the next `docker exec`
+    # instead of needing an image rebuild. Read-only: the container writes
+    # only under /shared.
+    dev_mount=()
+    if [ "${DD_MCP_DEV_MOUNT:-0}" = "1" ]; then
+        say "dev mount: $ROOT -> /src (MCP source shadows the image)"
+        dev_mount=(-v "$ROOT:/src:ro" -e "PYTHONPATH=/src")
+    fi
     docker run -d --name "$CONTAINER" \
+        "${dev_mount[@]}" \
         -v "$DATA_DIR/shared:/shared" \
         -v "$DATA_DIR/ttps:/root/.reinvent4_mcp/ttps" \
         -v "$DATA_DIR/jobs:/data/reinvent4_mcp/jobs" \
@@ -51,7 +72,12 @@ if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER"; then
 fi
 
 # --- host-side agent --------------------------------------------------
-if [ ! -x "$VENV/bin/dd-agent" ]; then
+need_install=0
+[ -x "$VENV/bin/dd-agent" ] || need_install=1
+# An existing venv from before --web existed has no dd-web / FastAPI.
+[ "$WEB" = "1" ] && [ ! -x "$VENV/bin/dd-web" ] && need_install=1
+
+if [ "$need_install" = "1" ]; then
     say "creating agent venv at $VENV"
     # A pyenv shim can exist on PATH without the version being enabled,
     # so test each candidate by running it.
@@ -64,9 +90,12 @@ if [ ! -x "$VENV/bin/dd-agent" ]; then
     done
     [ -n "$PY" ] || die "no Python >= 3.10 found on PATH"
     say "using $("$PY" -V 2>&1)"
-    "$PY" -m venv "$VENV"
+    [ -d "$VENV" ] || "$PY" -m venv "$VENV"
     "$VENV/bin/pip" install -q --upgrade pip
-    "$VENV/bin/pip" install -q "$ROOT/reinvent4_agent" claude-agent-sdk
+    # Editable: this is a working checkout, so agent edits should take
+    # effect without a reinstall. The [web] extra is two small wheels, so
+    # install it either way and `--web` always works.
+    "$VENV/bin/pip" install -q -e "$ROOT/reinvent4_agent[web]" claude-agent-sdk
 fi
 
 # `claude-code` drives the Claude CLI this machine is logged in to.  In a
@@ -78,4 +107,7 @@ export REINVENT4_MCP_COMMAND="$HERE/dd-mcp-docker.sh"
 export REINVENT4_AGENT_LOG_DIR="${REINVENT4_AGENT_LOG_DIR:-$DATA_DIR/agent_logs}"
 export DD_MCP_CONTAINER="$CONTAINER"
 
+if [ "$WEB" = "1" ]; then
+    exec "$VENV/bin/dd-web" "$@"
+fi
 exec "$VENV/bin/dd-agent" "$@"
