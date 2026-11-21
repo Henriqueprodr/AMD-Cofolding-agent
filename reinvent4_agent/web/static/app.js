@@ -400,6 +400,15 @@
 
   // ---------------------------------------------------------- connection
 
+  function renderSessionMeta(model) {
+    if (!session) return;
+    el("session-meta").textContent =
+      `${session.backend} · ${model || session.model} · ` +
+      `${session.tools.length} tools` +
+      (session.multi_agent ? " · driver+reviewer" : "") +
+      (session.web_tools ? " · web" : "");
+  }
+
   function setBusy(value) {
     busy = value;
     el("send").disabled = value;
@@ -410,10 +419,7 @@
     switch (msg.type) {
       case "session":
         session = msg;
-        el("session-meta").textContent =
-          `${msg.backend} · ${msg.model} · ${msg.tools.length} tools` +
-          (msg.multi_agent ? " · driver+reviewer" : "") +
-          (msg.web_tools ? " · web" : "");
+        renderSessionMeta(msg.model);
         break;
       case "replay_start":
         transcript.replaceChildren();
@@ -455,6 +461,9 @@
         statusbar.textContent = msg.busy ? "working…" : "";
         break;
       case "turn_end":
+        // With the claude-code backend the CLI picks the model, so the
+        // header can only name it once a reply has come back.
+        if (msg.model) renderSessionMeta(msg.model);
         if (msg.tokens) {
           el("tokens").textContent =
             `${msg.tokens.total} tokens (${msg.tokens.input} in / ${msg.tokens.output} out)`;

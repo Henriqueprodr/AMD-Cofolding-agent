@@ -133,7 +133,14 @@ def turn_end(
     ok: bool,
     elapsed_ms: int,
     tokens: dict[str, int],
+    model: str | None = None,
 ) -> dict[str, Any]:
+    """End of a turn. ``model`` is what actually answered it.
+
+    Carried here rather than only in the opening ``session`` message
+    because with the claude-code backend the CLI picks the model, so it is
+    not knowable until a reply has arrived.
+    """
     return _msg(
         S_TURN_END,
         turn_id=turn_id,
@@ -141,6 +148,7 @@ def turn_end(
         ok=ok,
         elapsed_ms=elapsed_ms,
         tokens=tokens,
+        model=model,
     )
 
 

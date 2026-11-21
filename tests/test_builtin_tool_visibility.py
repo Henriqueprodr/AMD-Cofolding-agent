@@ -65,8 +65,10 @@ class ToolResultBlock:
 
 
 class AssistantMessage:
-    def __init__(self, content: list) -> None:
+    def __init__(self, content: list, model: str | None = None) -> None:
         self.content = content
+        if model is not None:
+            self.model = model
 
 
 class UserMessage:
@@ -82,7 +84,7 @@ class ResultMessage:
 
 @pytest.fixture
 def buf():
-    return {"text": [], "thinking": [], "builtin": []}
+    return {"text": [], "thinking": [], "builtin": [], "model": []}
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +213,23 @@ class TestAbsorbMessage:
         _absorb_message(ResultMessage(is_error=True, result="limit"), buf, {})
 
         assert "claude-code: limit" in "".join(buf["text"])
+
+    def test_the_answering_model_is_captured(self, buf):
+        # The CLI picks the model when we send none, so the reply is the
+        # only honest source for what actually answered. Reporting the
+        # --model default instead names a model nobody used.
+        _absorb_message(
+            AssistantMessage([TextBlock("hi")], model="claude-opus-5-5"),
+            buf,
+            {},
+        )
+
+        assert buf["model"] == ["claude-opus-5-5"]
+
+    def test_missing_model_attribute_is_tolerated(self, buf):
+        _absorb_message(AssistantMessage([TextBlock("hi")]), buf, {})
+
+        assert buf["model"] == []
 
     def test_unknown_blocks_are_ignored(self, buf):
         class MysteryBlock:

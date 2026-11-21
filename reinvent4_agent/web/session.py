@@ -194,11 +194,23 @@ class AgentSession:
     # Session description
     # ------------------------------------------------------------------
 
+    def active_model(self) -> str:
+        """What is actually answering, once we know it.
+
+        With the claude-code backend the CLI chooses the model, so until a
+        reply arrives the only honest answer is that we do not know yet.
+        """
+        from reinvent4_agent.cli import _model_label
+
+        backend = getattr(self.driver, "backend", None)
+        observed = getattr(backend, "active_model", None)
+        return observed or _model_label(self.args)
+
     def describe(self) -> dict[str, Any]:
         return protocol.session(
             session_id=self.session_id,
             backend=self.args.backend,
-            model=self.args.model,
+            model=self.active_model(),
             multi_agent=self.reviewer is not None,
             web_tools=(
                 self.args.backend == "claude-code"
@@ -328,6 +340,7 @@ class AgentSession:
                             "output": agent.total_output_tokens,
                             "total": agent.total_tokens,
                         },
+                        model=self.active_model(),
                     )
                 )
                 self.hub.publish(protocol.busy(False))

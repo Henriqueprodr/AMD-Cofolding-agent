@@ -93,6 +93,10 @@ class ClaudeCodeBackend(LLMBackend):
         web_tools: bool = True,
     ) -> None:
         self.model = model
+        #: What the CLI actually answered with, learned from the first
+        #: reply. ``self.model`` is only our request -- when it is None the
+        #: CLI chooses, so reporting it would name a model nobody used.
+        self.active_model: str | None = None
         self._web_tools = web_tools
         self.base_url = None  # for CLI reporting parity with the others
         self._system_prompt = system_prompt
@@ -247,11 +251,18 @@ class ClaudeCodeBackend(LLMBackend):
         # Text / thinking / built-in tool uses seen so far in the current
         # assistant message, flushed to the caller with the next tool call
         # or at turn end.
-        buf: dict[str, list] = {"text": [], "thinking": [], "builtin": []}
+        buf: dict[str, list] = {
+            "text": [],
+            "thinking": [],
+            "builtin": [],
+            "model": [],
+        }
         # Built-in tool_use id -> the record awaiting its result.
         pending: dict[str, BuiltinToolUse] = {}
 
         def _flush() -> tuple[str, str, list[BuiltinToolUse]]:
+            if buf["model"]:
+                self.active_model = buf["model"][-1]
             out = (
                 "".join(buf["text"]).strip(),
                 "".join(buf["thinking"]).strip(),
@@ -432,6 +443,11 @@ def _absorb_message(
     kind = type(msg).__name__
 
     if kind == "AssistantMessage":
+        # The CLI picks the model when we pass none, so the only honest
+        # source for "what is actually answering" is the reply itself.
+        model = getattr(msg, "model", None)
+        if model:
+            buf["model"] = [model]
         for block in getattr(msg, "content", None) or []:
             bkind = type(block).__name__
             if bkind == "TextBlock":

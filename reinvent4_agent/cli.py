@@ -291,6 +291,7 @@ async def run_agent(args: argparse.Namespace) -> None:
     print_welcome()
 
     endpoint_label = args.base_url or "default"
+    model_label = _model_label(args)
     if args.backend == "claude-code":
         endpoint_label = "local claude CLI (subscription)"
         thinking_label = "CLI default"
@@ -308,7 +309,7 @@ async def run_agent(args: argparse.Namespace) -> None:
             else "off"
         )
     print_status(
-        f"Backend: {args.backend} | Model: {args.model} | "
+        f"Backend: {args.backend} | Model: {model_label} | "
         f"Endpoint: {endpoint_label} | Thinking: {thinking_label}"
     )
     if args.log_dir:
@@ -743,7 +744,7 @@ async def run_coscientist(args: argparse.Namespace) -> None:
 
     print_welcome()
     print_status(
-        f"Backend: {args.backend} | Model: {args.model} | "
+        f"Backend: {args.backend} | Model: {_model_label(args)} | "
         f"Co-scientist: Driver + Reviewer | "
         f"Budget: {args.max_turns} turns"
         + (f", {args.token_budget:,} tokens" if args.token_budget else "")
@@ -914,6 +915,21 @@ def _apply_web_tools_env(args: argparse.Namespace) -> None:
     """Publish --no-web-tools where the backend factory reads it."""
     if getattr(args, "no_web_tools", False):
         os.environ["DD_AGENT_WEB_TOOLS"] = "0"
+
+
+def _model_label(args: argparse.Namespace) -> str:
+    """How to describe the model before the first reply arrives.
+
+    The claude-code backend forwards no model unless one was asked for, so
+    the `claude` CLI chooses. Printing ``--model``'s default there would
+    name a model that is explicitly NOT answering; say so instead, and let
+    the first reply replace this with the real name.
+    """
+    from reinvent4_agent.backends import _DEFAULT_MODEL
+
+    if args.backend == "claude-code" and args.model == _DEFAULT_MODEL:
+        return "chosen by the claude CLI"
+    return args.model
 
 
 def _apply_web_addendum(
